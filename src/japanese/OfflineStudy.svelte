@@ -3,10 +3,10 @@
   import JapaneseStudy from './JapaneseStudy.svelte';
   import SeriesDownloads from './SeriesDownloads.svelte';
   import { parseCaptionResponse } from './captions';
-  import { castEpisode, findCastDevices, stopDirectCast, type CastDevice, type CastSession } from './direct-cast';
+  import { castEpisode, findCastDevices, openSafariAirPlay, stopDirectCast, stopSafariAirPlay, type CastDevice, type CastSession } from './direct-cast';
   import type { Cue } from './study';
   import { overlapsRecap, type VideoThemes } from './video-themes';
-  import { VideoThemeQueue, type ScanStatus } from './video-theme-queue';
+  import { forgetFrameChecks, VideoThemeQueue, type ScanStatus } from './video-theme-queue';
   import { DesktopVideoStream } from '../video/desktop-stream';
   import { directoryPicker, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, type DownloadFolder, type EpisodeFolder } from './offline-library';
 
@@ -36,8 +36,10 @@
   let scanQueue = $state<VideoThemeQueue>();
   let scanStatus = $state<ScanStatus>();
   let scanPaused = $state(false);
+  let rescanPreparing = $state(false);
   let scanFolder = $state<DownloadFolder>();
   let scanSeries: string | undefined;
+  let scanPreferredId = '';
   let localBody = $state('');
   let localSource = $state('');
   let currentVideoFile: File | undefined;
@@ -51,6 +53,7 @@
   let resumePosition = 0;
   let player = $state<HTMLDivElement>();
   let video = $state<HTMLVideoElement>();
+  let studyPlayer: ReturnType<typeof JapaneseStudy> | undefined = $state();
   let fullscreen = $state(false);
   let fullscreenError = $state(false);
   const desktopPipAvailable = /Mac/i.test(navigator.platform);
@@ -75,13 +78,26 @@
   let castSession = $state<CastSession>();
   let castBusy = $state('');
   let castStatus = $state('');
+  let airPlayBusy = $state(false);
+  let airPlayStatus = $state('');
+  let safariAirPlayId = $state('');
   let progressRevision = $state(0);
   let downloadsOpen = $state(!!preferredParams);
-  const seriesName = $derived((episodeFolders.find(entry => entry.key === selectedFolder)?.name
+  // Download folders are named "Смотреть аниме <title> онлайн - <id> - <translation>".
+  function folderTitle(name: string) {
+    const plain = name.replace(/^Смотреть аниме\s+/i, '');
+    const parts = plain.match(/^(.*?) - \d+(?: - (.+))?$/);
+    // Without an id, drop a trailing translation credit such as "- NDA Studio Дубляж".
+    const credit = parts ? parts[2] || '' : plain.match(/\s+-\s+([^-]*(?:дубляж|озвучка|субтитр|войсовер|dub|sub)[^-]*)$/i)?.[1] || '';
+    const title = (parts ? parts[1] : credit ? plain.slice(0, plain.lastIndexOf(credit)).replace(/\s+-\s*$/, '') : plain)
+      .replace(/\s+онлайн$/i, '').trim();
+    return { title, credit: credit.trim() };
+  }
+  const seriesFolderName = $derived(episodeFolders.find(entry => entry.key === selectedFolder)?.name
     || episodes[0]?.video.webkitRelativePath.split('/').at(-2)
-    || '').replace(/^Смотреть аниме\s+/i, '').replace(/ - \d+(?= - |$)/, ''));
-  // Drop the trailing translation credit (for example "- NDA Studio Дубляж") to get the plain anime title.
-  const animeName = $derived(seriesName.replace(/\s+-\s+[^-]*(?:дубляж|озвучка|субтитр|войсовер|dub|sub)[^-]*$/i, '').trim());
+    || '');
+  const animeName = $derived(folderTitle(seriesFolderName).title);
+  const translationCredit = $derived(folderTitle(seriesFolderName).credit);
   const episodeIndex = $derived(episodes.findIndex(item => item.path === selected));
 
   $effect(() => {
@@ -141,7 +157,7 @@
   function rememberScanQueue() {
     try {
       if (scanQueue && scanFolder) {
-        sessionStorage.setItem('arc-theme-queue', JSON.stringify({ folder: scanFolder.name, series: scanSeries, paused: scanPaused }));
+        sessionStorage.setItem('arc-theme-queue', JSON.stringify({ folder: scanFolder.name, series: scanSeries, paused: scanPaused, preferredId: scanPreferredId }));
       } else sessionStorage.removeItem('arc-theme-queue');
     } catch { /* The open tab can still run the queue. */ }
   }
@@ -152,10 +168,11 @@
     scanQueue?.update(ordered.map(file => ({ file, id: fileIdentity(file) })));
   }
 
-  function startScanQueue(series = selectedFolder, paused = false) {
+  function startScanQueue(series = selectedFolder, paused = false, fresh = false, preferredId = '') {
     if (scanQueue) return;
     scanFolder = folderGranted ? folder : undefined;
     scanSeries = series;
+    scanPreferredId = preferredId;
     scanPaused = paused;
     const queue = new VideoThemeQueue(status => {
       if (scanQueue === queue) scanStatus = status;
@@ -171,7 +188,7 @@
         recap
       };
       try { localStorage.setItem(themeStorageKey(id), JSON.stringify(found)); } catch { /* Playback still uses the current match. */ }
-    }, id => storedThemes(id, false));
+    }, id => storedThemes(id, false), fresh, preferredId);
     scanQueue = queue;
     queue.setPaused(paused);
     queueFiles(scanFolder ? episodeFolders.find(entry => entry.key === scanSeries)?.files || [] : episodes.map(episode => episode.video));
@@ -193,11 +210,31 @@
     rememberScanQueue();
   }
 
+  async function rescanFrames() {
+    if (rescanPreparing) return;
+    rescanPreparing = true;
+    stopScanQueue();
+    const series = selectedFolder;
+    const sourceFolder = folder;
+    const preferredId = localSource;
+    const files = folderGranted ? episodeFolders.find(entry => entry.key === series)?.files : episodes.map(episode => episode.video);
+    const ids = new Set((files ?? []).filter(file => isEpisodeVideo(file.name)).map(fileIdentity));
+    const cleared = await forgetFrameChecks(ids).then(() => true, () => false);
+    for (const id of ids) {
+      for (const version of [1, 2, 3]) {
+        try { localStorage.removeItem(themeStorageKey(id, version)); } catch { /* Storage may be unavailable. */ }
+      }
+    }
+    if (ids.has(localSource)) videoThemes = {};
+    if (series === selectedFolder && sourceFolder === folder) startScanQueue(series, false, !cleared, preferredId);
+    rescanPreparing = false;
+  }
+
   function restoreScanQueue(handle: DownloadFolder) {
     if (scanQueue) return;
     try {
       const saved = JSON.parse(sessionStorage.getItem('arc-theme-queue') || 'null');
-      if (saved?.folder === handle.name) startScanQueue(saved.series, saved.paused === true);
+      if (saved?.folder === handle.name) startScanQueue(saved.series, saved.paused === true, false, typeof saved.preferredId === 'string' ? saved.preferredId : '');
     } catch { /* The queue can be started again from the library. */ }
   }
 
@@ -208,6 +245,30 @@
       const saved = localStorage.getItem(progressKey(file)) || localStorage.getItem(`${fileIdentity(file)}:progress`);
       if (saved) return JSON.parse(saved);
     } catch { /* Playback can still work without storage. */ }
+  }
+
+  function exportTvPlaybackData() {
+    saveProgress(true);
+    const legacy = localStorage.getItem('arc-offline-auto-skip') !== 'off';
+    const autoSkip = Object.fromEntries((['recap', 'op', 'ed'] as const).map(part => {
+      const setting = localStorage.getItem(`arc-offline-auto-skip-${part}`);
+      return [part, setting === null ? part === 'recap' || legacy : setting === 'on'];
+    }));
+    const data = {
+      version: 1,
+      title: animeName,
+      endingAction: localStorage.getItem('arc-offline-ending-action') || 'auto',
+      autoSkip,
+      episodes: Object.fromEntries(episodes.map(({ video }) => [
+        video.name, { themes: storedThemes(fileIdentity(video)), progress: episodeProgress(video) }
+      ]))
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'anime-study-tv.json';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
 
   function writeEpisodeProgress(file: File | string, progress: Progress) {
@@ -295,20 +356,23 @@
     const found = await readEpisodeFolders(handle);
     if (folder !== handle) return;
     episodeFolders = found;
-    const matchingSeries = usePreferredEpisode && preferredSeriesId
-      ? found.filter(entry => new RegExp(` - ${preferredSeriesId}(?: - |$)`).test(entry.name))
-      : [];
-    const available = matchingSeries.length ? matchingSeries : found;
     const videos = (entry: EpisodeFolder) => entry.files.filter(file => isEpisodeVideo(file.name));
-    const chosen = found.find(entry => entry.key === selectedFolder)
-      || (usePreferredEpisode && found.find(entry => videos(entry).some(matchesPreferredTranslation)))
+    const scoped = usePreferredEpisode && !!preferredSeriesId;
+    const exact = scoped ? found.find(entry => videos(entry).some(matchesPreferredTranslation)) : undefined;
+    const available = scoped
+      ? found.filter(entry => entry === exact || new RegExp(` - ${preferredSeriesId}(?: - |$)`).test(entry.name))
+      : found;
+    const chosen = available.find(entry => entry.key === selectedFolder)
+      || exact
       || latestWatched(available, videos)
       || available.find(entry => videos(entry).some(matchesPreferredEpisode))
       || available[0];
     if (chosen?.key !== selectedFolder) selected = '';
     selectedFolder = chosen?.key;
     setEpisodeFiles(chosen?.files || []);
-    folderStatus = episodes.length ? '' : 'No finished videos in this folder yet.';
+    folderStatus = episodes.length ? '' : scoped
+      ? 'This series is not downloaded in the connected folder.'
+      : 'No finished videos in this folder yet.';
     if (scanQueue && scanFolder === handle) {
       if (scanSeries === undefined && chosen) {
         scanSeries = chosen.key;
@@ -321,6 +385,8 @@
   function switchEpisodeFolder() {
     const chosen = episodeFolders.find(entry => entry.key === selectedFolder);
     if (!chosen) return;
+    usePreferredEpisode = false;
+    folderStatus = '';
     selected = '';
     setEpisodeFiles(chosen.files);
     if (videoUrl) selectEpisode(true);
@@ -490,8 +556,51 @@
   }
 
   function openCast() {
+    airPlayStatus = '';
     if (!castHelp?.open) castHelp?.showModal();
     void searchForTv();
+  }
+
+  async function openQuickTime() {
+    const file = currentVideoFile;
+    if (!file || airPlayBusy) return;
+    airPlayBusy = true;
+    airPlayStatus = '';
+    try {
+      const granted = await chrome.permissions.request({ permissions: ['downloads'] });
+      if (!granted) throw new Error('Open the downloaded episode from Finder in QuickTime, or use Screen Mirroring.');
+      const result = await chrome.runtime.sendMessage({
+        type: 'ANIME_OPEN_QUICKTIME', name: file.name, size: file.size, modified: file.lastModified
+      });
+      if (!result?.ok) throw new Error(result?.error || 'Could not open the episode in QuickTime.');
+      if (file === currentVideoFile) video?.pause();
+      airPlayStatus = 'In QuickTime, open the AirPlay menu and select your TV.';
+    } catch (error) {
+      airPlayStatus = error instanceof Error ? error.message : 'Could not open the episode in QuickTime.';
+    } finally { airPlayBusy = false; }
+  }
+
+  async function toggleSafariAirPlay() {
+    const file = currentVideoFile;
+    if (!video || !file || airPlayBusy) return;
+    airPlayBusy = true;
+    airPlayStatus = safariAirPlayId ? 'Stopping AirPlay…' : 'Preparing the AirPlay MP4…';
+    try {
+      if (safariAirPlayId) {
+        await stopSafariAirPlay(safariAirPlayId);
+        safariAirPlayId = '';
+        airPlayStatus = '';
+      } else {
+        const title = [animeName, episodeLabel(file.name)].filter(Boolean).join(' · ');
+        const themes = studyPlayer?.playbackSkipRanges() ?? { ...videoThemes };
+        if (overlapsRecap(themes.op, themes.recap)) delete themes.op;
+        safariAirPlayId = await openSafariAirPlay(file, title, video.currentTime, localCues, themes);
+        if (file === currentVideoFile) video?.pause();
+        airPlayStatus = 'In Safari, click AirPlay and choose your TV.';
+      }
+    } catch (error) {
+      airPlayStatus = error instanceof Error ? error.message : 'Could not prepare AirPlay.';
+    } finally { airPlayBusy = false; }
   }
 
   async function startDirectCast(device: CastDevice) {
@@ -565,6 +674,65 @@
     if (overlayHidden && performance.now() >= revealOverlayAfter) overlayHidden = false;
   }
 
+  // Touch gestures on the video: tap plays or pauses, double-tap a side skips 10 seconds,
+  // double-tap the middle toggles fullscreen. On touch, a tap on hidden controls only reveals them.
+  let videoPaused = $state(true);
+  let seekFlash = $state<{ forward: boolean; total: number; key: number }>();
+  let playFlash = $state<{ playing: boolean; key: number }>();
+  let lastTapAt = 0;
+  let tapTimer: ReturnType<typeof setTimeout> | undefined;
+  let seekFlashTimer: ReturnType<typeof setTimeout> | undefined;
+  let seekChainUntil = 0;
+  let controlsWereHidden = false;
+
+  function tapZone(event: PointerEvent) {
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const x = (event.clientX - rect.left) / rect.width;
+    return x < 0.35 ? 'back' : x > 0.65 ? 'forward' : 'middle';
+  }
+
+  function gestureSeek(forward: boolean) {
+    if (!studyPlayer?.seekBy(forward ? 10 : -10)) return;
+    navigator.vibrate?.(8);
+    const total = seekFlash && seekFlash.forward === forward && performance.now() < seekChainUntil ? seekFlash.total + 10 : 10;
+    seekFlash = { forward, total, key: performance.now() };
+    seekChainUntil = performance.now() + 650;
+    clearTimeout(seekFlashTimer);
+    seekFlashTimer = setTimeout(() => { seekFlash = undefined; }, 650);
+  }
+
+  function gesturePlay() {
+    if (!studyPlayer?.togglePlay()) return;
+    playFlash = { playing: !!video?.paused, key: performance.now() };
+  }
+
+  function handleTapStart() {
+    controlsWereHidden = overlayHidden || !!player?.querySelector('.player-controls.controls-hidden');
+  }
+
+  function handleTap(event: PointerEvent) {
+    if (event.button !== 0 || !videoReady) return;
+    const zone = tapZone(event);
+    const now = performance.now();
+    // Keep skipping while the viewer keeps tapping the same side.
+    if (zone !== 'middle' && now < seekChainUntil && seekFlash?.forward === (zone === 'forward')) {
+      lastTapAt = 0;
+      gestureSeek(zone === 'forward');
+      return;
+    }
+    if (now - lastTapAt < 300) {
+      clearTimeout(tapTimer);
+      lastTapAt = 0;
+      if (zone === 'middle') void toggleFullscreen();
+      else gestureSeek(zone === 'forward');
+      return;
+    }
+    lastTapAt = now;
+    const revealOnly = event.pointerType !== 'mouse' && controlsWereHidden;
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(() => { if (!revealOnly) gesturePlay(); }, 260);
+  }
+
   function handleFullscreenChange() {
     fullscreen = document.fullscreenElement === player;
     if (overlayHidden) revealOverlayAfter = Math.max(revealOverlayAfter, performance.now() + 500);
@@ -579,7 +747,7 @@
 </script>
 
 <svelte:document onfullscreenchange={handleFullscreenChange} />
-<svelte:window onpagehide={() => saveProgress(true)} onpointermove={revealOverlayOnPointerMove} />
+<svelte:window onpagehide={() => saveProgress(true)} onpointermove={revealOverlayOnPointerMove} onpointerdown={revealOverlayOnPointerMove} />
 
 <header class="masthead">
   <div class="app-name">
@@ -596,17 +764,35 @@
   <div class="watch-main">
 {#if videoUrl}
   <div class="player" bind:this={player}>
+    <div class="video-frame">
     <video bind:this={video} src={videoUrl} playsinline tabindex="-1" onloadedmetadata={restoreProgress}
       onloadeddata={() => { videoReady = true; }}
-      onplaying={() => saveProgress(true, true)} ontimeupdate={() => saveProgress()} onpause={() => saveProgress(true)} onseeked={() => saveProgress(true)}
+      onplaying={() => saveProgress(true, true)} ontimeupdate={() => saveProgress()} onpause={() => { videoPaused = true; saveProgress(true); }} onseeked={() => saveProgress(true)}
+      onplay={() => { videoPaused = false; }}
       onended={advanceAfterEnding} onerror={() => { mediaError = true; }}>
       <track kind="captions" />
     </video>
+    <div class="gesture-layer" aria-hidden="true" onpointerdown={handleTapStart} onpointerup={handleTap}>
+      {#if seekFlash}
+        {#key seekFlash.key}
+          <div class="seek-ripple" class:forward={seekFlash.forward}>
+            <span>{seekFlash.forward ? '››' : '‹‹'}</span>{seekFlash.total} sec
+          </div>
+        {/key}
+      {/if}
+      {#if playFlash}
+        {#key playFlash.key}<div class="play-flash">{playFlash.playing ? '▶' : '❚❚'}</div>{/key}
+      {/if}
+    </div>
+    {#if videoPaused && videoReady && !studying && !overlayHidden}
+      <button class="big-play" aria-label="Play episode" onclick={gesturePlay}><span aria-hidden="true">▶</span></button>
+    {/if}
+    </div>
     {#if mediaError}<p role="alert">Chrome could not play this file. Try an MP4 or WebM file.</p>{/if}
     {#if fullscreenError}<p role="alert">Fullscreen could not open.</p>{/if}
     {#key videoUrl}
       <div class="offline-controls">
-        <JapaneseStudy inline {overlayHidden} {localCues} {localBody} {localSource} {referenceCues} {videoThemes} title={fileName} bind:learning bind:studying onResumeAtEnd={() => stepEpisode(1, true)} onNextEpisode={episodeIndex >= 0 && episodeIndex < episodes.length - 1 ? () => stepEpisode(1, true) : undefined} onToggleFullscreen={() => toggleFullscreen(true)}>
+        <JapaneseStudy bind:this={studyPlayer} inline {overlayHidden} {localCues} {localBody} {localSource} {referenceCues} {videoThemes} title={fileName} bind:learning bind:studying onResumeAtEnd={() => stepEpisode(1, true)} onNextEpisode={episodeIndex >= 0 && episodeIndex < episodes.length - 1 ? () => stepEpisode(1, true) : undefined} onToggleFullscreen={() => toggleFullscreen(true)}>
           {#snippet playerOptions()}
             {#if desktopPipAvailable}
               <button class="theme-scan" disabled={desktopPipStarting || !videoReady} onclick={toggleDesktopPip}>
@@ -625,7 +811,7 @@
                 <button aria-label="Previous" title="Previous episode" disabled={episodeIndex <= 0} onclick={() => stepEpisode(-1)}>‹</button>
                 <select aria-label="Episode" bind:value={selected} onchange={() => selectEpisode()}>
                   {#each episodes as episode (episode.path)}
-                    <option value={episode.path}>{episode.video.name}</option>
+                    <option value={episode.path} title={episode.video.name}>{episodeLabel(episode.video.name)}</option>
                   {/each}
                 </select>
                 <button aria-label="Next" title="Next episode" disabled={episodeIndex >= episodes.length - 1} onclick={() => stepEpisode(1)}>›</button>
@@ -640,7 +826,7 @@
   </div>
   <div class="episode-heading">
     <div class="episode-identity">
-      {#if seriesName}<p class="series-name">{seriesName}</p>{/if}
+      {#if animeName}<p class="series-name">{animeName}{#if translationCredit}<span class="translation-credit">{' · '}{translationCredit}</span>{/if}</p>{/if}
       <h2 title={fileName}>{episodeLabel(fileName)}</h2>
     </div>
     <div class="watch-actions">
@@ -693,7 +879,7 @@
               <span class="episode-entry-copy">
                 <strong>{episodeLabel(episode.video.name)}</strong>
                 {#if progress?.finished}<small>Watched</small>
-                {:else if progress && progress.position > 0}<small>{predictionTime(progress.position)} watched</small>
+                {:else if progress && progress.position >= 1}<small>{predictionTime(progress.position)} watched</small>
                 {:else if episode.subtitle}<small>Subtitles available</small>{/if}
               </span>
               {#if episode.path === selected}<span class="current-episode">Current</span>
@@ -708,6 +894,22 @@
 
 <dialog bind:this={castHelp} aria-labelledby="cast-title">
   <h2 id="cast-title">Cast to TV</h2>
+  {#if desktopPipAvailable}
+    <section aria-labelledby="airplay-title">
+      <h3 id="airplay-title">AirPlay</h3>
+      <button disabled={airPlayBusy || (!safariAirPlayId && !videoReady)} onclick={toggleSafariAirPlay}>{safariAirPlayId ? 'Stop Safari AirPlay' : 'Open AirPlay in Safari'}</button>
+      {#if airPlayStatus}<p role="status">{airPlayStatus}</p>{/if}
+      <details>
+        <summary>QuickTime</summary>
+        <button disabled={airPlayBusy || !videoReady} onclick={openQuickTime}>Open in QuickTime</button>
+      </details>
+      <details>
+        <summary>Screen Mirroring with subtitles</summary>
+        <p>On your Mac, open <strong>Control Center → Screen Mirroring</strong> and select your Apple TV or AirPlay-compatible TV. Then return here and play the episode.</p>
+      </details>
+    </section>
+    <h3>Google Cast</h3>
+  {/if}
   {#if castBusy || castStatus}<p role="status">{castBusy || castStatus}</p>{/if}
   {#if castSession}
     <p>{castSession.title} is on the TV. Use the TV remote to pause or seek.</p>
@@ -736,14 +938,18 @@
   <div class="episode-bar library">
     <button disabled={folderBusy} onclick={() => chooseFolder()}>{folder ? 'Change download folder' : 'Connect download folder'}</button>
     {#if folder && !folderGranted}<button disabled={folderBusy} onclick={() => chooseFolder(true)}>Reconnect {folder.name}</button>{/if}
-    {#if folderGranted && episodeFolders.length > 1}
-      <select aria-label="Series folder" bind:value={selectedFolder} onchange={switchEpisodeFolder}>
-        {#each episodeFolders as entry (entry.key)}<option value={entry.key}>{entry.name}</option>{/each}
+    {#if folderGranted && (episodeFolders.length > 1 || (episodeFolders.length && selectedFolder === undefined))}
+      <select aria-label="Series folder" value={selectedFolder ?? null} onchange={event => {
+        selectedFolder = event.currentTarget.value;
+        switchEpisodeFolder();
+      }}>
+        {#if selectedFolder === undefined}<option value={null} disabled>Choose a downloaded series</option>{/if}
+        {#each episodeFolders as entry (entry.key)}{@const name = folderTitle(entry.name)}<option value={entry.key} title={entry.name}>{[name.title, name.credit].filter(Boolean).join(' · ')}</option>{/each}
       </select>
     {/if}
     {#if !videoUrl && episodes.length}
       <select aria-label="Saved episode" bind:value={selected}>
-        {#each episodes as episode (episode.path)}<option value={episode.path}>{episode.video.name}</option>{/each}
+        {#each episodes as episode (episode.path)}<option value={episode.path} title={episode.video.name}>{episodeLabel(episode.video.name)}</option>{/each}
       </select>
       <button onclick={() => selectEpisode(true)}>{savedPosition ? 'Resume episode' : 'Play saved episode'}</button>
     {/if}
@@ -751,9 +957,15 @@
   {#if folderStatus}<p role="status">{folderStatus}</p>
   {:else if !folder}<p>Choose Arc Anime or a series folder inside it.</p>{/if}
 {/if}
+  {#if episodes.length}
+    <button class="export-tv" onclick={exportTvPlaybackData} title="Save the selected series’ skip predictions and watch progress for Anime Study TV">Export TV playback data</button>
+  {/if}
   {#if folderGranted || episodes.length || scanQueue}
   <div class="episode-bar scan-queue" aria-label="Frame checking queue">
-    <button onclick={toggleScanQueue}>{scanQueue ? (scanPaused ? 'Resume frame checking' : 'Pause frame checking') : 'Queue frame checking'}</button>
+    <button disabled={rescanPreparing} onclick={toggleScanQueue}>{scanQueue ? (scanPaused ? 'Resume frame checking' : 'Pause frame checking') : 'Queue frame checking'}</button>
+    {#if episodes.length}
+      <button disabled={rescanPreparing || (!!scanStatus?.active && !scanPaused)} onclick={rescanFrames}>{rescanPreparing ? 'Preparing rescan…' : 'Rescan frames'}</button>
+    {/if}
     {#if scanQueue && scanStatus}
       <button onclick={stopScanQueue}>Stop frame checking</button>
       <span role="status">
@@ -842,6 +1054,62 @@
   }
   video:focus { outline: none; }
   .offline-controls { position: absolute; inset: auto 8px 8px; pointer-events: none; }
+  .video-frame { position: relative; border-radius: inherit; }
+  .gesture-layer { position: absolute; inset: 0; overflow: hidden; border-radius: inherit; touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none; }
+  .seek-ripple {
+    position: absolute; top: -20%; bottom: -20%; left: -12%; width: 42%;
+    display: grid; place-content: center; justify-items: center; gap: 2px;
+    border-radius: 0 50% 50% 0 / 0 50% 50% 0;
+    background: #ffffff1f; color: #fff; font-size: 14px; font-weight: 650;
+    animation: ripple .65s ease-out forwards; pointer-events: none;
+  }
+  .seek-ripple.forward { left: auto; right: -12%; border-radius: 50% 0 0 50% / 50% 0 0 50%; }
+  .seek-ripple span { font-size: 26px; line-height: 1; letter-spacing: -4px; animation: nudge .4s ease-out; }
+  .seek-ripple:not(.forward) span { --nudge: -6px; }
+  @keyframes ripple { 0% { opacity: 0; } 15% { opacity: 1; } 70% { opacity: 1; } 100% { opacity: 0; } }
+  @keyframes nudge { from { transform: translateX(var(--nudge, 6px)); } to { transform: none; } }
+  .play-flash {
+    position: absolute; left: 50%; top: 50%; width: 76px; height: 76px; margin: -38px 0 0 -38px;
+    display: grid; place-items: center; border-radius: 50%;
+    background: #000000a0; color: #fff; font-size: 26px; pointer-events: none;
+    animation: flash .55s ease-out forwards;
+  }
+  @keyframes flash { from { opacity: 1; transform: scale(.8); } to { opacity: 0; transform: scale(1.35); } }
+  .big-play {
+    position: absolute; left: 50%; top: 50%; width: 84px; height: 84px; margin: -42px 0 0 -42px;
+    display: grid; place-items: center; border: 0; border-radius: 50%;
+    background: var(--accent); color: #21130c; font-size: 30px;
+    box-shadow: 0 10px 40px #0009, 0 0 0 0 #ff824866;
+    animation: pop-in .28s cubic-bezier(.2, 1.4, .4, 1), pulse 2.4s ease-out .3s infinite;
+    transition: transform .12s ease;
+  }
+  .big-play span { margin-left: 5px; }
+  .big-play:hover { background: #ffa273; }
+  .big-play:active { transform: scale(.9); }
+  @keyframes pop-in { from { opacity: 0; transform: scale(.6); } }
+  @keyframes pulse { 0% { box-shadow: 0 10px 40px #0009, 0 0 0 0 #ff824866; } 70%, 100% { box-shadow: 0 10px 40px #0009, 0 0 0 22px #ff824800; } }
+  /* A chunkier seek bar with a filled track and a thumb that grows while dragging. */
+  .offline-controls :global(.study.inline .seek) {
+    -webkit-appearance: none; appearance: none; height: 22px; background: transparent; cursor: pointer;
+  }
+  .offline-controls :global(.study.inline .seek::-webkit-slider-runnable-track) {
+    height: 5px; border-radius: 3px;
+    background: linear-gradient(to right, var(--accent) var(--progress, 0%), #ffffff38 var(--progress, 0%));
+    transition: height .15s ease;
+  }
+  .offline-controls :global(.study.inline .seek::-webkit-slider-thumb) {
+    -webkit-appearance: none; width: 14px; height: 14px; margin-top: -4.5px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 0 0 #ff824855; transition: transform .15s ease, box-shadow .15s ease;
+  }
+  .offline-controls :global(.study.inline .seek:hover::-webkit-slider-runnable-track) { height: 7px; }
+  .offline-controls :global(.study.inline .seek:hover::-webkit-slider-thumb) { margin-top: -3.5px; }
+  .offline-controls :global(.study.inline .seek:active::-webkit-slider-thumb) { transform: scale(1.45); box-shadow: 0 0 0 7px #ff824840; }
+  .offline-controls :global(.study.inline .seek::-moz-range-track) { height: 5px; border-radius: 3px; background: #ffffff38; }
+  .offline-controls :global(.study.inline .seek::-moz-range-progress) { height: 5px; border-radius: 3px; background: var(--accent); }
+  .offline-controls :global(.study.inline .seek::-moz-range-thumb) { width: 14px; height: 14px; border: 0; border-radius: 50%; background: var(--accent); }
+  @media (prefers-reduced-motion: reduce) {
+    .seek-ripple, .seek-ripple span, .play-flash, .big-play { animation-duration: .01s; animation-iteration-count: 1; }
+  }
   .offline-controls :global(.study.inline .player-controls) {
     background: #111113ed;
     border-color: #ffffff26;
@@ -874,6 +1142,7 @@
   .episode-identity { min-width: 0; overflow-wrap: anywhere; flex: 1 1 230px; }
   .episode-identity h2 { font-size: clamp(22px, 3vw, 34px); letter-spacing: -.035em; }
   .series-name { color: var(--accent); font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+  .translation-credit { color: var(--muted); font-weight: 400; }
   .watch-actions { display: flex; flex-wrap: wrap; gap: 8px; }
   .watch-actions button, .empty-player a, dialog button {
     display: inline-flex;
@@ -914,7 +1183,8 @@
     border-radius: 6px;
     padding: 5px 9px;
   }
-  .episode-bar select { max-width: 100%; }
+  .episode-bar select { max-width: 100%; min-width: 0; text-overflow: ellipsis; }
+  .scan-queue span { min-width: 0; overflow-wrap: anywhere; }
   .prediction:hover:not(:disabled) { background: #302624; border-color: #a45230; }
   .prediction-time, .no-predictions { color: var(--muted); }
   .prediction-time { margin-inline-start: 4px; font-variant-numeric: tabular-nums; }
@@ -977,9 +1247,20 @@
     gap: 18px;
     margin-top: 26px;
   }
-  .library-tools { display: grid; gap: 10px; padding: 15px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+  .library-tools { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 15px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
   .library-tools p, .scan-queue span, .local-files { color: var(--muted); font-size: 13px; }
   .library-tools label { display: block; margin-bottom: 5px; }
+  .export-tv {
+    justify-self: start;
+    font: inherit;
+    font-size: 13px;
+    color: inherit;
+    background: #201f22;
+    border: 1px solid #ffffff26;
+    border-radius: 6px;
+    padding: 5px 9px;
+  }
+  .export-tv:hover, .episode-bar button:hover:not(:disabled) { background: #2a292c; }
   .files { display: grid; gap: 10px; margin-top: 10px; }
   .files input { max-width: 100%; }
   button, summary { cursor: pointer; }
@@ -987,8 +1268,26 @@
   :is(a, button, select, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .episode-entry:focus-visible { outline-offset: -3px; }
   .player:fullscreen { display: flex; flex-direction: column; border-radius: 0; }
+  .player:fullscreen .video-frame { display: flex; flex: 1 1 0; min-height: 0; }
   .player:fullscreen video { flex: 1 1 0; min-height: 0; max-height: none; aspect-ratio: auto; border-radius: 0; }
   .player:fullscreen :global(.study.inline .panel) { max-height: 35dvh; }
+  /* Touch screens such as iPad: finger-sized targets. */
+  @media (pointer: coarse) {
+    .offline-controls :global(.study.inline :is(button, select)),
+    .episode-controls :is(button, select),
+    .episode-bar :is(button, select), .export-tv, .watch-actions button, dialog button {
+      min-height: 44px;
+      min-width: 44px;
+    }
+    .offline-controls :global(.study.inline .toolbar) { gap: 8px; }
+    .offline-controls :global(.study.inline .seek) { height: 36px; }
+    .offline-controls :global(.study.inline .seek::-webkit-slider-runnable-track) { height: 8px; border-radius: 4px; }
+    .offline-controls :global(.study.inline .seek::-webkit-slider-thumb) { width: 22px; height: 22px; margin-top: -7px; }
+    .episode-controls select { padding-inline: 10px; }
+    .episode-entry { min-height: 56px; }
+    .masthead nav a { padding: 12px 8px; }
+    summary { padding-block: 8px; }
+  }
   @media (max-width: 860px) {
     .watch-layout.with-episodes, .watch-tools { grid-template-columns: minmax(0, 1fr); }
     .episode-rail ul { max-height: 250px; }
@@ -997,7 +1296,10 @@
     .masthead { gap: 8px; }
     .app-name, .masthead nav { gap: 6px; }
     .watch-layout { margin-top: 15px; gap: 16px; }
-    .offline-controls { inset: auto 3px 3px; }
+    /* The controls are taller than a phone-width video, so place them below it. */
+    .player { padding-bottom: 3px; }
+    .offline-controls { position: relative; inset: auto; margin: 3px 3px 0; }
+    .big-play { width: 64px; height: 64px; margin: -32px 0 0 -32px; font-size: 24px; }
     .episode-controls { margin-inline-start: 0; }
   }
 </style>

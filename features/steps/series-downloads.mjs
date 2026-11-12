@@ -117,7 +117,7 @@ When('I open a downloaded series folder', async function () {
     await expect(this.videoPage.locator('.caption')).toHaveText('一つ目の字幕です。');
     await this.videoPage.getByRole('button', { name: 'Fullscreen', exact: true }).click();
     await expect(this.videoPage.getByRole('button', { name: 'Exit fullscreen' })).toBeVisible();
-    await this.videoPage.getByLabel('Episode', { exact: true }).selectOption({ label: 'Episode 2.mp4' });
+    await this.videoPage.getByLabel('Episode', { exact: true }).selectOption({ label: 'Episode 2' });
     await expect(this.videoPage.locator('.caption')).toHaveText('二つ目の字幕です。');
     await this.videoPage.getByRole('button', { name: 'Previous', exact: true }).click();
     await expect(this.videoPage.locator('.caption')).toHaveText('一つ目の字幕です。');
@@ -125,7 +125,7 @@ When('I open a downloaded series folder', async function () {
     if (await video.evaluate(element => element.paused)) await this.videoPage.getByRole('button', { name: 'Play', exact: true }).click();
     await expect(video).toHaveJSProperty('paused', false);
     await this.videoPage.clock.install();
-    await video.hover();
+    await this.videoPage.locator('.video-frame').hover();
     const fullscreen = this.videoPage.getByRole('button', { name: 'Exit fullscreen' });
     const pause = this.videoPage.getByRole('button', { name: 'Pause', exact: true });
     await this.videoPage.clock.fastForward(9000);
@@ -135,7 +135,7 @@ When('I open a downloaded series folder', async function () {
     await expect(fullscreen).toBeHidden();
     await expect(pause).toBeHidden();
     await expect(this.videoPage.locator('.caption')).toHaveText('一つ目の字幕です。');
-    await video.hover({ position: { x: 24, y: 80 } });
+    await this.videoPage.locator('.video-frame').hover({ position: { x: 24, y: 80 } });
     await expect(fullscreen).toBeVisible();
     await expect(pause).toBeVisible();
     await this.videoPage.clock.fastForward(10200);
@@ -174,7 +174,7 @@ When('I connect a folder with a saved episode', async function () {
   }, { media, subtitles: ass('保存した字幕です。') });
   await this.videoPage.reload();
   await this.videoPage.getByRole('button', { name: 'Connect download folder' }).click();
-  await this.videoPage.getByLabel('Episode', { exact: true }).selectOption({ label: 'Episode 003 - 50003.mp4' });
+  await this.videoPage.getByLabel('Episode', { exact: true }).selectOption({ label: 'Episode 3' });
   await expect(this.videoPage.locator('.caption')).toHaveText('保存した字幕です。');
 });
 
@@ -184,7 +184,7 @@ Then('Offline Study loads the saved episode and position when I reopen it', asyn
   await olderTab.goto(url);
   const olderVideo = olderTab.locator('video');
   const previousSrc = await olderVideo.evaluate(element => element.src);
-  await olderTab.getByRole('combobox', { name: 'Episode', exact: true }).selectOption('Episode 002 - 50002.mp4');
+  await olderTab.getByRole('combobox', { name: 'Episode', exact: true }).selectOption({ label: 'Episode 2' });
   await expect.poll(() => olderVideo.evaluate((element, previous) => element.readyState > 0 && element.currentSrc !== previous, previousSrc)).toBe(true);
   await olderVideo.evaluate(async element => {
     element.pause();
@@ -374,7 +374,7 @@ Then('I can keep watching the opening and choose between skipping the ending or 
   const video = page.locator('video');
   // Start on episode 2 so episode 3 is available as the next episode.
   const previousSrc = await video.evaluate(element => element.currentSrc);
-  await page.getByLabel('Episode', { exact: true }).selectOption({ label: 'Episode 002 - 50002.mp4' });
+  await page.getByLabel('Episode', { exact: true }).selectOption({ label: 'Episode 2' });
   await expect.poll(() => video.evaluate((element, prev) => element.currentSrc !== '' && element.currentSrc !== prev && element.readyState >= 1, previousSrc), { timeout: 5000 }).toBe(true);
   await video.evaluate(element => {
     const track = element.addTextTrack('chapters', 'Episode chapters');
@@ -418,4 +418,48 @@ Then('I can keep watching the opening and choose between skipping the ending or 
   await page.getByRole('button', { name: 'Next episode', exact: true }).click({ timeout: 5000 });
   await expect(page.getByLabel('Episode', { exact: true })).toHaveValue(/Episode 003 - 50003\.mp4$/);
   await expect(page.locator('.caption')).toHaveText('保存した字幕です。');
+});
+
+Then('opening an undownloaded series never resumes another anime', async function () {
+  const page = this.videoPage;
+  const url = new URL(page.url());
+  const requested = 'https://smotret-anime.com/catalog/new-series-20002/3-seriya-80003/ozvuchka-90003';
+  url.searchParams.set('series', requested);
+  await page.goto(url.href);
+  await expect(page.getByText('This series is not downloaded in the connected folder.', { exact: true })).toBeVisible({ timeout: 4000 });
+  await expect(page.locator('video')).toHaveCount(0);
+  await expect(page.getByLabel('Anime365 series or episode link')).toHaveValue(requested);
+  const seriesFolder = page.getByLabel('Series folder', { exact: true });
+  await expect(seriesFolder.getByRole('option', { name: 'Choose a downloaded series' })).toHaveJSProperty('selected', true);
+  await seriesFolder.selectOption({ label: 'Fixture episodes' });
+  await page.getByRole('button', { name: 'Play saved episode' }).or(page.getByRole('button', { name: 'Resume episode' })).click();
+  await expect(page.locator('.caption')).toHaveText('保存した字幕です。');
+});
+
+Then("Safari AirPlay receives the episode's ending chapter", async function () {
+  if (process.platform !== 'darwin') return 'skipped';
+  const page = this.videoPage;
+  await this.context.setOffline(false);
+  const companion = 'http://127.0.0.1:46157';
+  let skips;
+  await page.route(`${companion}/**`, async route => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/airplay') {
+      skips = route.request().postDataJSON().skips;
+      await route.fulfill({ json: { id: 'fixture' } });
+    } else {
+      await route.fulfill({ json: path === '/devices' ? { devices: [] } : {} });
+    }
+  });
+  await page.locator('video').evaluate(element => {
+    const track = element.addTextTrack('chapters', 'Episode chapters');
+    track.mode = 'hidden';
+    track.addCue(new VTTCue(7.5, 14.5, 'Ending'));
+    element.currentTime = 8;
+    element.pause();
+  });
+  await expect(page.getByRole('button', { name: 'Skip ending', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Cast to TV' }).click();
+  await page.getByRole('button', { name: 'Open AirPlay in Safari' }).click();
+  await expect.poll(() => skips?.ed).toEqual({ start: 7.5, end: 14.5, auto: true });
 });
