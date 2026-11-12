@@ -1,5 +1,5 @@
 import { translateText } from './translate';
-import { desktopPipRequest } from './desktop-pip';
+import { desktopPipRequest, openDownloadedVideoInQuickTime } from './desktop-pip';
 import { studyRequest } from '../japanese/storage';
 import { subtitleUrl } from '../japanese/captions';
 import { isAnimeSubtitleSite } from '../japanese/page-captions';
@@ -58,6 +58,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         throw new Error('That episode is not part of this series.');
       }
       await chrome.tabs.update(tab.id, { url: url.href });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (message?.type === 'ANIME_OPEN_QUICKTIME') {
+      if (sender.url?.split(/[?#]/, 1)[0] !== chrome.runtime.getURL('offline.html')) {
+        throw new Error('Open the episode from Offline Study.');
+      }
+      const { name, size, modified } = message;
+      if (typeof name !== 'string' || !/^[^/\\]{1,255}\.(mp4|m4v|mov)$/i.test(name)
+          || !Number.isSafeInteger(size) || size <= 0 || !Number.isFinite(modified)) {
+        throw new Error('Choose a downloaded MP4, M4V, or MOV episode.');
+      }
+      if (!chrome.downloads) throw new Error('Allow Chrome downloads access or open the episode in QuickTime manually.');
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const downloads = await chrome.downloads.search({ filenameRegex: `/${escaped}$`, state: 'complete', fileSize: size });
+      const paths = [...new Set(downloads.filter(item => item.exists).map(item => item.filename))];
+      if (paths.length !== 1) throw new Error('Open this file from Finder in QuickTime, or use Screen Mirroring below.');
+      await openDownloadedVideoInQuickTime(paths[0], size, modified);
       sendResponse({ ok: true });
       return;
     }

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'">
+  <title>Anime Study</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #101012; color: #f7f4f2; }
+    body { margin: 24px auto; padding: 0 16px; max-width: 1100px; }
+    h1 { font-size: clamp(20px, 4vw, 28px); }
+    video { width: 100%; max-height: 73vh; aspect-ratio: 16 / 9; background: black; border-radius: 8px; display: block; }
+    .actions, .skip { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 14px 0; }
+    button, a { font: inherit; }
+    button { padding: 8px 12px; border-radius: 6px; border: 1px solid #444; background: #252528; color: inherit; cursor: pointer; }
+    #airplay { background: #ff8454; color: #1e130e; border-color: transparent; }
+    a { color: #ffad89; }
+    p { color: #d1ccca; }
+    .chapter-track { position: relative; height: 10px; background: #333; border-radius: 6px; overflow: hidden; margin: 12px 0; }
+    .chapter-track span { position: absolute; height: 100%; background: #ff8454; }
+    #chapters { display: flex; gap: 10px; flex-wrap: wrap; }
+    .timing { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 12px 0; }
+    .timing input[type="text"] { width: 7ch; font: inherit; padding: 6px; }
+    #timing-message { min-height: 1.5em; }
+    [hidden] { display: none !important; }
+  </style>
+  <script src="player.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Anime Study</h1>
+    <video controls playsinline x-webkit-airplay="allow"></video>
+    <div class="actions">
+      <button id="airplay" hidden>AirPlay</button>
+      <a href="episode.mp4" download>Save AirPlay MP4</a>
+    </div>
+    <div class="skip" hidden>
+      <button id="skip"></button>
+      <span id="countdown"></span>
+      <button id="keep" hidden>Keep watching</button>
+    </div>
+    <section aria-labelledby="timings-title">
+      <h2 id="timings-title">Skip timings</h2>
+      <div class="chapter-track" id="chapter-track" aria-hidden="true"></div>
+      <div id="chapters"></div>
+      <div class="actions">
+        <button id="restart" type="button">Restart episode</button>
+        <button id="undo" type="button" hidden>Undo jump</button>
+      </div>
+      <p>Times are minutes:seconds. Clear both times to remove a skip. Changes apply until this page is refreshed.</p>
+      <form id="timings">
+        <div id="timing-fields"></div>
+        <button type="submit">Save timings</button>
+      </form>
+      <p id="timing-message" role="status"></p>
+    </section>
+    <p id="status" role="status"></p>
+  </main>
+</body>
+</html>

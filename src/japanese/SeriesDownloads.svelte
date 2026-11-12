@@ -19,6 +19,10 @@
   const failed = $derived(queue?.files.filter(file => file.state === 'failed') || []);
   const activeFile = $derived(queue?.files.find(file => file.state === 'downloading'));
   const remaining = $derived(queue?.files.some(file => file.state === 'queued' || file.state === 'downloading') || false);
+  const queueMatchesSeries = $derived.by(() => {
+    const seriesId = (plan?.series || url).match(/\/catalog\/[^/]+-(\d+)(?:\/|[?#]|$)/)?.[1];
+    return !seriesId || !!queue?.folder.match(new RegExp(` - ${seriesId}(?: - |$)`));
+  });
 
   async function refresh() {
     try { queue = (await requestArc({ type: 'SERIES_DOWNLOAD_STATUS' })).queue; } catch { /* Wait for the next refresh. */ }
@@ -47,6 +51,7 @@
 
   async function start() {
     if (busy || !plan || !selectedPages.length) return;
+    if (remaining && !queueMatchesSeries) return;
     const type = remaining ? 'SERIES_DOWNLOAD_APPLY' : 'SERIES_DOWNLOAD_START';
     const selection = [...selectedPages];
     busy = true;
@@ -94,8 +99,8 @@
       <div class="row">
         <button type="button" disabled={busy || selectedPages.length === ready.length} onclick={() => { selectedPages = ready.map(episode => episode.page); }}>Select all</button>
         <button type="button" disabled={busy || !selectedPages.length} onclick={() => { selectedPages = []; }}>Clear selection</button>
-        <button type="button" disabled={busy || !selectedPages.length} onclick={start}>
-          {remaining ? 'Apply selection to queue' : selectedPages.length ? `Download ${selectedPages.length} ${selectedPages.length === 1 ? 'episode' : 'episodes'}` : 'Download selected'}
+        <button type="button" disabled={busy || !selectedPages.length || (remaining && !queueMatchesSeries)} onclick={start}>
+          {remaining && queueMatchesSeries ? 'Apply selection to queue' : selectedPages.length ? `Download ${selectedPages.length} ${selectedPages.length === 1 ? 'episode' : 'episodes'}` : 'Download selected'}
         </button>
       </div>
     {/if}
@@ -114,7 +119,8 @@
       {/each}
     </ul>
   {/if}
-  {#if queue}
+  {#if queue && (queueMatchesSeries || remaining)}
+    {#if !queueMatchesSeries}<p>Another series has an active download queue. Finish or stop it to download this series.</p>{/if}
     <p><strong>{queue.title}</strong> · {completed} / {queue.files.length} files saved{remaining && queue.paused ? ' · Paused' : ''}</p>
     <p>Downloads / {queue.folder}</p>
     {#if activeFile}<p>Downloading {activeFile.filename.split('/').at(-1)}</p>{/if}

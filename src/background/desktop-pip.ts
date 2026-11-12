@@ -3,6 +3,29 @@ let port: chrome.runtime.Port | undefined;
 let active: { sessionId: string; tabId: number; frameId: number; offline: boolean; ready?: (value: any) => void; timer?: ReturnType<typeof setTimeout> } | undefined;
 const statusRequests = new Map<string, { resolve: (value: any) => void; timer: ReturnType<typeof setTimeout> }>();
 
+export function openDownloadedVideoInQuickTime(path: string, size: number, modified: number) {
+  const install = 'Install or update the macOS companion with npm run install:desktop-pip, or open the file in QuickTime manually.';
+  return new Promise<void>((resolve, reject) => {
+    const connection = chrome.runtime.connectNative(HOST);
+    const timeout = setTimeout(() => {
+      connection.disconnect();
+      reject(new Error(install));
+    }, 8000);
+    connection.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      clearTimeout(timeout);
+      reject(new Error(install));
+    });
+    connection.onMessage.addListener(result => {
+      clearTimeout(timeout);
+      connection.disconnect();
+      if (result?.ok) resolve();
+      else reject(new Error(result?.error || install));
+    });
+    connection.postMessage({ type: 'open-quicktime', path, size, modified });
+  });
+}
+
 function sendToSource(source: NonNullable<typeof active>, message: Record<string, unknown>) {
   const payload = { ...message, sessionId: source.sessionId };
   return source.offline ? chrome.runtime.sendMessage(payload)
