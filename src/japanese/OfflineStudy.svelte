@@ -9,7 +9,9 @@
   import { DesktopVideoStream } from '../video/desktop-stream';
   import { directoryPicker, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, type DownloadFolder, type EpisodeFolder } from './offline-library';
 
-  const preferredId = new URLSearchParams(location.search).get('series')?.match(/\/catalog\/[^/]+\/[^/]+\/[^/]+-(\d+)\/?$/)?.[1];
+  const preferredParams = new URLSearchParams(location.search).get('series');
+  const preferredId = preferredParams?.match(/\/catalog\/[^/]+\/[^/]+\/[^/]+-(\d+)\/?$/)?.[1];
+  const preferredEpisodeNumber = Number(preferredParams?.match(/\/catalog\/[^/]+\/(\d+)-seriya-\d+(?:\/|$)/)?.[1] || 0);
 
   let videoUrl = $state('');
   let fileName = $state('');
@@ -185,13 +187,27 @@
   }
 
   function matchesPreferredEpisode(file: File) {
-    return !!preferredId && file.name.match(/ - (\d+)(?: \(\d+\))?\.[^.]+$/)?.[1] === preferredId;
+    if (preferredId && file.name.match(/ - (\d+)(?: \(\d+\))?\.[^.]+$/)?.[1] === preferredId) return true;
+    const episodeNumber = Number(file.name.match(/^Episode\s+(\d+)\b/i)?.[1] || 0);
+    return preferredEpisodeNumber > 0 && episodeNumber === preferredEpisodeNumber;
+  }
+
+  function rememberSelectedEpisode(file: File) {
+    try {
+      const existing = episodeProgress(file);
+      const progress: Progress = {
+        position: existing?.finished ? 0 : (existing?.position || 0),
+        watchedAt: Date.now(),
+        finished: false
+      };
+      localStorage.setItem(`${fileIdentity(file)}:progress`, JSON.stringify(progress));
+    } catch { /* Playback can still work without storage. */ }
   }
 
   function resumeRememberedEpisode() {
     const episode = episodes[episodeIndex];
     if (!episode) return false;
-    if (preferredId) {
+    if (preferredId || preferredEpisodeNumber) {
       if (!matchesPreferredEpisode(episode.video)) return false;
     } else {
       const latest = latestWatched(episodes, item => [item.video]);
@@ -245,7 +261,7 @@
       if (reconnect) restoreScanQueue(handle);
       void rememberFolder(handle).catch(() => { folderStatus = 'This folder could not be remembered for next time.'; });
       if (reconnect && resumeRememberedEpisode()) return;
-      if (preferredId ? episodes.some(item => matchesPreferredEpisode(item.video)) : episodeFolders.length === 1) selectEpisode(true);
+      if ((preferredId || preferredEpisodeNumber) ? episodes.some(item => matchesPreferredEpisode(item.video)) : episodeFolders.length === 1) selectEpisode(true);
     } catch (error) {
       if (!(error instanceof DOMException) || error.name !== 'AbortError') folderStatus = 'Could not open that folder. Choose the downloaded series folder.';
     } finally { folderBusy = false; }
@@ -290,6 +306,7 @@
     progressReady = false;
     lastProgressSave = 0;
     resumePosition = episodeProgress(file)?.position || 0;
+    rememberSelectedEpisode(file);
     const previousUrl = videoUrl;
     mediaError = false;
     localCues = parseCaptionResponse(body);
