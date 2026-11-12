@@ -47,13 +47,15 @@
   let skipUndo = $state<{ time: number; expiresAt: number } | null>(null);
   type SkipPart = keyof VideoThemes;
   type EndingAction = 'auto' | 'next' | 'skip';
-  const skipLabels = { op: 'Skip opening', ed: 'Skip ending' };
+  const skipLabels = { recap: 'Skip recap', op: 'Skip opening', ed: 'Skip ending' };
+  const skipParts = ['recap', 'op', 'ed'] as const;
+  const skipSettings = { recap: 'Auto-skip recap', op: 'Auto-skip opening', ed: 'Auto-skip ending' };
   const autoSkipKey = 'arc-offline-auto-skip';
   const endingActionKey = 'arc-offline-ending-action';
   const siteAutoSkipKey = 'animeAutoSkip';
   const siteEndingActionKey = 'animeEndingAction';
   const replaceSitePlayerKey = 'animeReplaceSitePlayer';
-  let autoSkip = $state(true);
+  let autoSkip = $state<Record<SkipPart, boolean>>({ recap: true, op: true, ed: true });
   let endingAction = $state<EndingAction>('auto');
   // On the anime site, open the Arc player in place of the site's player unless the user turned it off.
   let replaceSitePlayer = $state(true);
@@ -128,7 +130,9 @@
   const fallbackOpening = $derived(playbackReady && !skipRange('op') && !canSkip('recap') && playbackTime < 360
     && playbackTime + 85 < playbackDuration && !captured && !challenge);
   const idlePlayback = $derived(showPlayback && !playbackPaused && !captured && !challenge && mode !== 'review');
-  const hideControls = $derived(idlePlayback && !showTranscript && now - lastActivity >= 10000);
+  // Never hide the controls while the pointer rests on them: the next click would miss its button.
+  let pointerOnControls = $state(false);
+  const hideControls = $derived(idlePlayback && !showTranscript && !pointerOnControls && now - lastActivity >= 10000);
   const clock = (time: number) => `${Math.floor(time / 60)}:${String(Math.floor(time % 60)).padStart(2, '0')}`;
 
   $effect(() => {
@@ -400,13 +404,20 @@
   onMount(() => {
     if (inline) {
       try {
-        autoSkip = localStorage.getItem(autoSkipKey) !== 'off';
+        const legacy = localStorage.getItem(autoSkipKey) !== 'off';
+        for (const part of skipParts) {
+          const saved = localStorage.getItem(`${autoSkipKey}-${part}`);
+          autoSkip[part] = saved === null ? (part === 'recap' || legacy) : saved === 'on';
+        }
         const savedAction = localStorage.getItem(endingActionKey);
         if (savedAction === 'auto' || savedAction === 'next' || savedAction === 'skip') endingAction = savedAction;
       } catch { /* Use the default. */ }
     } else if (loadEpisodeCaptions) {
-      void siteStorage()?.get([siteAutoSkipKey, siteEndingActionKey, replaceSitePlayerKey]).then(saved => {
-        autoSkip = saved[siteAutoSkipKey] !== false;
+      void siteStorage()?.get([siteAutoSkipKey, ...skipParts.map(part => `${siteAutoSkipKey}-${part}`), siteEndingActionKey, replaceSitePlayerKey]).then(saved => {
+        for (const part of skipParts) {
+          const preference = saved[`${siteAutoSkipKey}-${part}`];
+          autoSkip[part] = typeof preference === 'boolean' ? preference : (part === 'recap' || saved[siteAutoSkipKey] !== false);
+        }
         const savedAction = saved[siteEndingActionKey];
         if (savedAction === 'auto' || savedAction === 'next' || savedAction === 'skip') endingAction = savedAction;
         replaceSitePlayer = saved[replaceSitePlayerKey] !== false;
@@ -479,14 +490,14 @@
     return globalThis.chrome?.storage?.local;
   }
 
-  function setAutoSkip(enabled: boolean) {
-    autoSkip = enabled;
-    if (!enabled) countdown = null;
+  function setAutoSkip(part: SkipPart, enabled: boolean) {
+    autoSkip[part] = enabled;
+    if (!enabled && countdown?.part === part) countdown = null;
     if (!inline) {
-      void siteStorage()?.set({ [siteAutoSkipKey]: enabled }).catch(() => {});
+      void siteStorage()?.set({ [`${siteAutoSkipKey}-${part}`]: enabled }).catch(() => {});
       return;
     }
-    try { localStorage.setItem(autoSkipKey, enabled ? 'on' : 'off'); } catch { /* Keep the current preference. */ }
+    try { localStorage.setItem(`${autoSkipKey}-${part}`, enabled ? 'on' : 'off'); } catch { /* Keep the current preference. */ }
   }
 
   function setReplaceSitePlayer(enabled: boolean) {
@@ -546,11 +557,11 @@
   }
 
   function updateSkipCountdown() {
-    if (!autoSkip || !video || video.seeking || mode === 'review' || stopAfter) {
+    if (!video || video.seeking || mode === 'review' || stopAfter) {
       countdown = null;
       return;
     }
-    const part = (['op', 'ed'] as const).find(part => !dismissedSkips.has(part) && canSkip(part)
+    const part = skipParts.find(part => autoSkip[part] && !dismissedSkips.has(part) && canSkip(part)
       && playbackTime >= (skipRange(part)?.start ?? Infinity));
     const range = part && skipRange(part);
     if (!part || !range) {
@@ -603,6 +614,29 @@
     const range = frames && (!subtitleRange || (frames.start < subtitleRange.end && frames.end > subtitleRange.start))
       ? frames : (segment?.source !== 'dialogue-gap' && subtitleRange) || frames || subtitleRange;
     return part === 'op' && overlapsRecap(range || undefined, videoThemes.recap) ? undefined : range;
+  }
+
+  /** Used by touch gestures on the offline player. Returns false while a phrase or quiz holds playback. */
+  export function seekBy(seconds: number) {
+    if (!video || video.readyState < 1 || captured || challenge || mode === 'review') return false;
+    seek(video.currentTime + seconds);
+    lastActivity = Date.now();
+    return true;
+  }
+
+  export function togglePlay() {
+    if (!video || captured || challenge) return false;
+    void togglePlayback();
+    return true;
+  }
+
+  export function playbackSkipRanges(): VideoThemes {
+    const ranges: VideoThemes = {};
+    for (const part of skipParts) {
+      const range = skipRange(part);
+      if (range) ranges[part] = { start: Math.max(0, range.start), end: range.end };
+    }
+    return ranges;
   }
 
   function canSkip(part: SkipPart) {
@@ -762,7 +796,7 @@
 <svelte:window onpointermove={revealControls} onpointerdown={revealControls} onkeydown={handlePlayerKey} />
 
 {#snippet timelineControls()}
-  <input aria-label="Playback position" class="seek" type="range" min="0" max={playbackDuration || 1} step="0.1" value={playbackTime} disabled={!playbackDuration || !!captured || !!challenge} oninput={event => seek(event.currentTarget.valueAsNumber)} />
+  <input aria-label="Playback position" class="seek" style:--progress={`${playbackDuration ? Math.min(100, playbackTime / playbackDuration * 100) : 0}%`} type="range" min="0" max={playbackDuration || 1} step="0.1" value={playbackTime} disabled={!playbackDuration || !!captured || !!challenge} oninput={event => seek(event.currentTarget.valueAsNumber)} />
   <span class="clock">{clock(playbackTime)} / {clock(playbackDuration)}</span>
 {/snippet}
 
@@ -802,7 +836,9 @@
           {/if}
         </div>
       {/if}
-      <div class="player-controls" class:controls-hidden={hideControls}>
+      <div class="player-controls" class:controls-hidden={hideControls} role="group" aria-label="Player controls"
+        onpointerenter={event => { if (event.pointerType === 'mouse') pointerOnControls = true; }}
+        onpointerleave={() => { pointerOnControls = false; lastActivity = Date.now(); }}>
       {#if inline}<div class="playback-timeline">{@render timelineControls()}</div>{/if}
       <div class="toolbar">
         {#if showPlayback || studyPlayer}
@@ -835,7 +871,11 @@
         <div class="extras" aria-label="Player options">
           {@render playerOptions?.()}
           {#if inline || loadEpisodeCaptions}
-            <label><input type="checkbox" checked={autoSkip} onchange={event => setAutoSkip(event.currentTarget.checked)} /> Auto-skip openings and endings</label>
+            {#each skipParts as part}
+              {#if inline || part !== 'recap'}
+                <label><input type="checkbox" checked={autoSkip[part]} onchange={event => setAutoSkip(part, event.currentTarget.checked)} /> {skipSettings[part]}</label>
+              {/if}
+            {/each}
             <label>Ending skip <select aria-label="Ending skip action" value={endingAction} onchange={event => setEndingAction(event.currentTarget.value as EndingAction)}>
               <option value="auto">Auto (next episode or post-credits)</option>
               <option value="next">Next episode</option>
@@ -946,7 +986,16 @@
   .combined .player-controls, .inline .player-controls {
     background: #18171fed; border: 1px solid #393642; border-radius: 9px; padding: 4px 7px; pointer-events: auto;
   }
-  .player-controls.controls-hidden { visibility: hidden; pointer-events: none; }
+  .player-controls { transition: opacity .22s ease, transform .22s ease, visibility 0s; }
+  .player-controls.controls-hidden {
+    visibility: hidden; pointer-events: none; opacity: 0; transform: translateY(8px);
+    transition: opacity .4s ease, transform .4s ease, visibility 0s .4s;
+  }
+  button { transition: background-color .15s ease, filter .12s ease; }
+  button:active:not(:disabled) { filter: brightness(.8); }
+  @media (prefers-reduced-motion: reduce) {
+    .player-controls, .player-controls.controls-hidden, button { transition: none; transform: none; }
+  }
   .skip-suggestion {
     display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 8px;
     width: fit-content; max-width: 100%; margin: 0 0 6px auto; padding: 5px 7px;
@@ -955,6 +1004,7 @@
   .skip-suggestion span { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .toolbar, .extras, .learn-bar, .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
   .toolbar { min-height: 32px; }
+  .inline .toolbar :is(button, select) { min-height: 32px; min-width: 32px; padding: 4px 10px; font-size: 14px; }
   .playback-timeline { display: flex; align-items: center; gap: 8px; min-height: 24px; padding-bottom: 3px; }
   .seek { flex: 1 1 72px; width: 0; accent-color: #ceb9f7; }
   .clock { font-variant-numeric: tabular-nums; color: #c2bdce; white-space: nowrap; }

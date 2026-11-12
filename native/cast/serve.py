@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 
 import pychromecast
 from pychromecast.const import CAST_TYPE_AUDIO, CAST_TYPE_GROUP
+from airplay import AirPlaySession, ASSETS
 
 PORT = 46157
 BUFFER_SIZE = 1024 * 1024
@@ -46,6 +47,8 @@ class MediaHandler(BaseHTTPRequestHandler):
 
     def access(self):
         session = self.server.session
+        if isinstance(session, AirPlaySession):
+            return self.path in (f"/{session.id}/episode.mp4", f"/{session.id}/subtitles.vtt")
         return self.client_address[0] == session.device.host and self.path in (
             f"/{session.id}/video", f"/{session.id}/subtitles.vtt"
         )
@@ -68,6 +71,25 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.serve_media()
 
     def do_GET(self):
+        session = self.server.session
+        if isinstance(session, AirPlaySession):
+            assets = {
+                f"/{session.id}/": ("text/html; charset=utf-8", lambda: (ASSETS / "airplay.html").read_bytes()),
+                f"/{session.id}/player.js": ("text/javascript; charset=utf-8", lambda: (ASSETS / "airplay-player.js").read_bytes()),
+                f"/{session.id}/episode.json": ("application/json", lambda: json.dumps(session.metadata).encode())
+            }
+            if self.path in assets:
+                content_type, read = assets[self.path]
+                data = read()
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+                return
         self.serve_media()
 
     def serve_media(self):
@@ -75,7 +97,13 @@ class MediaHandler(BaseHTTPRequestHandler):
             return self.send_error(404)
         session = self.server.session
         subtitles = self.path.endswith(".vtt")
-        path = Path(session.directory.name) / ("subtitles.vtt" if subtitles else "video")
+        if isinstance(session, AirPlaySession):
+            requested_name = self.path.rsplit("/", 1)[-1]
+            default_name = session.metadata.get("subtitlesFile" if subtitles else "video", "subtitles.vtt" if subtitles else "episode.mp4")
+            allowed_name = requested_name if re.fullmatch(r"(?:episode\.\d+\.mp4|subtitles\.\d+\.vtt)", requested_name) else default_name
+            path = Path(session.directory.name) / allowed_name
+        else:
+            path = Path(session.directory.name) / ("subtitles.vtt" if subtitles else "video")
         try:
             source = path.open("rb")
         except FileNotFoundError:
@@ -95,7 +123,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.send_response(206 if requested else 200)
             self.cors()
             self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Type", "text/vtt; charset=utf-8" if subtitles else session.content_type)
+            self.send_header("Content-Type", "text/vtt; charset=utf-8" if subtitles else getattr(session, "content_type", "video/mp4"))
             self.send_header("Content-Length", str(remaining))
             if requested:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
@@ -219,6 +247,15 @@ class ControlHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def read_metadata(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        if not 0 < size <= 2 * BUFFER_SIZE:
+            raise ValueError("Invalid episode metadata.")
+        metadata = json.loads(self.rfile.read(size))
+        if not isinstance(metadata, dict):
+            raise ValueError("Invalid episode metadata.")
+        return metadata
+
     def do_POST(self):
         if not self.authorized():
             return self.send_error(403)
@@ -247,16 +284,44 @@ class ControlHandler(BaseHTTPRequestHandler):
             except Exception as error:
                 print(f"Cast discovery failed: {error}", flush=True)
                 return self.reply({"error": "Could not search for TVs on this network."}, 502)
+        if self.path.startswith("/airplay/") and self.path.endswith("/episode"):
+            try:
+                data = self.read_metadata()
+                title, position, subtitles = data["title"], data["position"], data.get("subtitles", "")
+                if not isinstance(title, str) or not math.isfinite(position) or position < 0 or not isinstance(subtitles, str):
+                    raise ValueError("Invalid episode metadata.")
+                with self.server.airplay_lock:
+                    session = self.server.airplay
+                    if not session or self.path != f"/airplay/{session.id}/episode" or not session.server:
+                        return self.reply({"error": "AirPlay session expired. Try again."}, 404)
+                    session.pending_metadata = {
+                        "title": title[:250], "position": position, "subtitles": subtitles,
+                        "hasSubtitles": bool(subtitles), "skips": data.get("skips", {})
+                    }
+                    return self.reply({"ok": True})
+            except (KeyError, ValueError, TypeError, OSError):
+                return self.reply({"error": "Could not prepare this episode for AirPlay."}, 400)
+        if self.path == "/airplay":
+            try:
+                data = self.read_metadata()
+                title, position, subtitles = data["title"], data["position"], data.get("subtitles", "")
+                if not isinstance(title, str) or not math.isfinite(position) or position < 0 or not isinstance(subtitles, str):
+                    raise ValueError("Invalid episode metadata.")
+                with self.server.airplay_lock:
+                    if self.server.airplay:
+                        self.server.airplay.close()
+                    self.server.airplay = AirPlaySession({
+                        "title": title[:250], "position": position, "subtitles": subtitles,
+                        "hasSubtitles": bool(subtitles), "skips": data.get("skips", {})
+                    })
+                    return self.reply({"id": self.server.airplay.id})
+            except (KeyError, ValueError, TypeError, OSError):
+                return self.reply({"error": "Could not prepare this episode for AirPlay."}, 400)
         if self.path != "/session":
             return self.reply({"error": "Unknown cast request."}, 404)
 
         try:
-            size = int(self.headers.get("Content-Length", "0"))
-            if not 0 < size <= 2 * BUFFER_SIZE:
-                raise ValueError()
-            metadata = json.loads(self.rfile.read(size))
-            if not isinstance(metadata, dict):
-                raise ValueError()
+            metadata = self.read_metadata()
             if (metadata["type"] not in MEDIA_TYPES or not isinstance(metadata["title"], str)
                     or not math.isfinite(metadata["position"]) or metadata["position"] < 0
                     or not isinstance(metadata.get("subtitles", ""), str)):
@@ -291,24 +356,49 @@ class ControlHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         if not self.authorized():
             return self.send_error(403)
+        if self.path.startswith("/airplay/") and self.path.endswith("/episode"):
+            with self.server.airplay_lock:
+                session = self.server.airplay
+                if not session or self.path != f"/airplay/{session.id}/episode" or not session.server:
+                    return self.reply({"error": "AirPlay session expired. Try again."}, 404)
+                try:
+                    self.connection.settimeout(30)
+                    self.receive_video(Path(session.directory.name) / "source")
+                    revision = session.update_episode(lambda: self.clear_airplay(session))
+                    return self.reply({"revision": revision})
+                except FileNotFoundError:
+                    error = "Install FFmpeg (ffmpeg and ffprobe) on the Mac, then try again."
+                except Exception as failure:
+                    print(f"AirPlay episode switch failed: {failure}", flush=True)
+                    error = "Could not switch the AirPlay episode. Check the file and your local network."
+                return self.reply({"error": error}, 502)
+        if self.path.startswith("/airplay/"):
+            with self.server.airplay_lock:
+                session = self.server.airplay
+                if not session or self.path != f"/airplay/{session.id}" or session.server:
+                    return self.reply({"error": "AirPlay session expired. Try again."}, 404)
+                try:
+                    self.connection.settimeout(30)
+                    self.receive_video(Path(session.directory.name) / "source")
+                    url = session.start(MediaHandler, lambda: self.clear_airplay(session))
+                    return self.reply({"url": url})
+                except FileNotFoundError:
+                    error = "Install FFmpeg (ffmpeg and ffprobe) on the Mac, then try again."
+                except Exception as failure:
+                    print(f"AirPlay preparation failed: {failure}", flush=True)
+                    error = "Could not prepare the AirPlay MP4 or open Safari. Check the file and your local network."
+                self.server.airplay = None
+                session.close()
+                return self.reply({"error": error}, 502)
         session = self.find_session()
         if not session:
             return self.reply({"error": "Cast session expired. Try again."}, 404)
         self.connection.settimeout(30)
         try:
-            remaining = int(self.headers.get("Content-Length", "0"))
-            if remaining <= 0:
-                raise ValueError("The episode file is empty.")
             with session.lock:
                 if session.closed or session.receiver:
                     return self.reply({"error": "This cast session is already in use."}, 409)
-                with (Path(session.directory.name) / "video").open("wb") as target:
-                    while remaining:
-                        chunk = self.rfile.read(min(BUFFER_SIZE, remaining))
-                        if not chunk:
-                            raise ValueError("The episode transfer was interrupted.")
-                        target.write(chunk)
-                        remaining -= len(chunk)
+                self.receive_video(Path(session.directory.name) / "video")
                 session.play()
             self.reply({"playing": True})
         except Exception as error:
@@ -316,9 +406,33 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.clear_session(session)
             self.reply({"error": "The TV could not start this episode. Check its connection and media format."}, 502)
 
+    def receive_video(self, path):
+        remaining = int(self.headers.get("Content-Length", "0"))
+        if remaining <= 0:
+            raise ValueError("The episode file is empty.")
+        with path.open("wb") as target:
+            while remaining:
+                chunk = self.rfile.read(min(BUFFER_SIZE, remaining))
+                if not chunk:
+                    raise ValueError("The episode transfer was interrupted.")
+                target.write(chunk)
+                remaining -= len(chunk)
+
+    def clear_airplay(self, session):
+        with self.server.airplay_lock:
+            if self.server.airplay is session:
+                self.server.airplay = None
+                session.close()
+
     def do_DELETE(self):
         if not self.authorized():
             return self.send_error(403)
+        if self.path.startswith("/airplay/"):
+            with self.server.airplay_lock:
+                session = self.server.airplay
+            if session and self.path == f"/airplay/{session.id}":
+                self.clear_airplay(session)
+            return self.reply({"stopped": True})
         session = self.find_session()
         if session:
             self.clear_session(session)
@@ -330,12 +444,16 @@ def main():
         server.lock = threading.Lock()
         server.devices = {}
         server.session = None
+        server.airplay = None
+        server.airplay_lock = threading.Lock()
         print(f"Anime Study Cast is ready on port {PORT}. Press Ctrl+C to stop.", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             if server.session:
                 server.session.close()
+            if server.airplay:
+                server.airplay.close()
 
 
 if __name__ == "__main__":

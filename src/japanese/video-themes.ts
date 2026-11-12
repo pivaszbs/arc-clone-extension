@@ -1,3 +1,5 @@
+export const THEME_DETECTOR_VERSION = 3;
+
 export type VideoThemes = Partial<Record<'op' | 'ed' | 'recap', { start: number; end: number }>>;
 type Sample = { time: number; pixels: Uint8ClampedArray };
 type Fingerprint = { op: Sample[]; ed: Sample[]; openingScanEnd?: number };
@@ -185,6 +187,40 @@ export function matchEarlySparseOpening(current: Fingerprint, reference: Fingerp
   const early = current.op.filter(sample => sample.time < earlyOpeningEnd + 110);
   const best = matchWindow(early.filter((_, index) => index % 2 === 0), reference.op, 70, true);
   return best && best.start < earlyOpeningEnd ? refineWindow(early, reference.op, best) : undefined;
+}
+
+export function matchKnownOpening(current: Fingerprint, reference: Fingerprint, opening: NonNullable<VideoThemes['op']>, recap?: VideoThemes['recap']): VideoThemes['op'] {
+  const length = opening.end - opening.start;
+  if (length < 70 || length > 110) return undefined;
+  const first = reference.op.findIndex(sample => sample.time >= opening.start);
+  if (first < 0 || reference.op.at(-1)!.time < opening.end - 1) return undefined;
+  const samples = reference.op.slice(first).filter((sample, index) => sample.time < opening.end && index % interval === 0);
+  const phase = reference.op[first].time - opening.start;
+  let best: { range: NonNullable<VideoThemes['op']>; hits: number; mean: number } | undefined;
+  for (const [index, sample] of current.op.entries()) {
+    const start = Math.max(0, sample.time - phase);
+    const range = { start, end: start + length };
+    if (range.end > current.op.at(-1)!.time + 0.5) break;
+    if (overlapsRecap(range, recap)) continue;
+    let hits = 0, total = 0, changes = 0, firstHit = Infinity, lastHit = -Infinity;
+    for (const [offset, ref] of samples.entries()) {
+      const frame = current.op[index + offset * interval];
+      if (!frame) break;
+      const difference = alignedDistance(frame, reference.op, first + offset * interval);
+      if (difference > 30) continue;
+      const time = ref.time - opening.start;
+      if (hits) changes += Number(distance(frame, current.op[index + lastHit * interval]) > 14);
+      firstHit = Math.min(firstHit, time);
+      lastHit = offset;
+      hits++;
+      total += difference;
+    }
+    const mean = total / hits;
+    if (hits < Math.ceil(samples.length / 5) || mean > 19 || changes < 5
+      || firstHit > 16 || lastHit * interval + phase < length - 12) continue;
+    if (!best || hits > best.hits || hits === best.hits && mean < best.mean) best = { range, hits, mean };
+  }
+  return best?.range;
 }
 
 export function confirmLateOpening(candidate: NonNullable<VideoThemes['op']>, others: NonNullable<VideoThemes['op']>[]): VideoThemes['op'] {
