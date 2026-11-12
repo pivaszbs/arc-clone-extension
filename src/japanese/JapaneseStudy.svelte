@@ -46,11 +46,15 @@
   let status = $state('');
   let skipUndo = $state<{ time: number; expiresAt: number } | null>(null);
   type SkipPart = 'op' | 'ed';
+  type EndingAction = 'auto' | 'next' | 'skip';
   const skipLabels = { op: 'Skip opening', ed: 'Skip ending' };
   const autoSkipKey = 'arc-offline-auto-skip';
+  const endingActionKey = 'arc-offline-ending-action';
   const siteAutoSkipKey = 'animeAutoSkip';
+  const siteEndingActionKey = 'animeEndingAction';
   const replaceSitePlayerKey = 'animeReplaceSitePlayer';
   let autoSkip = $state(true);
+  let endingAction = $state<EndingAction>('auto');
   // On the anime site, open the Arc player in place of the site's player unless the user turned it off.
   let replaceSitePlayer = $state(true);
   let sitePreferencesLoaded = false;
@@ -394,10 +398,16 @@
   }
   onMount(() => {
     if (inline) {
-      try { autoSkip = localStorage.getItem(autoSkipKey) !== 'off'; } catch { /* Use the default. */ }
+      try {
+        autoSkip = localStorage.getItem(autoSkipKey) !== 'off';
+        const savedAction = localStorage.getItem(endingActionKey);
+        if (savedAction === 'auto' || savedAction === 'next' || savedAction === 'skip') endingAction = savedAction;
+      } catch { /* Use the default. */ }
     } else if (loadEpisodeCaptions) {
-      void siteStorage()?.get([siteAutoSkipKey, replaceSitePlayerKey]).then(saved => {
+      void siteStorage()?.get([siteAutoSkipKey, siteEndingActionKey, replaceSitePlayerKey]).then(saved => {
         autoSkip = saved[siteAutoSkipKey] !== false;
+        const savedAction = saved[siteEndingActionKey];
+        if (savedAction === 'auto' || savedAction === 'next' || savedAction === 'skip') endingAction = savedAction;
         replaceSitePlayer = saved[replaceSitePlayerKey] !== false;
       }).catch(() => {}).finally(() => { sitePreferencesLoaded = true; });
       if (!siteStorage()) sitePreferencesLoaded = true;
@@ -505,8 +515,20 @@
     }).catch(() => { status = 'Could not open the next episode.'; });
   }
 
+  function setEndingAction(next: EndingAction) {
+    endingAction = next;
+    if (!inline) {
+      void siteStorage()?.set({ [siteEndingActionKey]: next }).catch(() => {});
+      return;
+    }
+    try { localStorage.setItem(endingActionKey, next); } catch { /* Keep the current preference. */ }
+  }
+
   function endingGoesNext(end: number) {
-    return !!nextEpisode && playbackDuration - end <= endingTail;
+    if (!nextEpisode) return false;
+    if (endingAction === 'next') return true;
+    if (endingAction === 'skip') return false;
+    return playbackDuration - end <= endingTail;
   }
 
   function playNextEpisode() {
@@ -802,7 +824,14 @@
       {#if showSettings}
         <div class="extras" aria-label="Player options">
           {@render playerOptions?.()}
-          {#if inline || loadEpisodeCaptions}<label><input type="checkbox" checked={autoSkip} onchange={event => setAutoSkip(event.currentTarget.checked)} /> Auto-skip openings and endings</label>{/if}
+          {#if inline || loadEpisodeCaptions}
+            <label><input type="checkbox" checked={autoSkip} onchange={event => setAutoSkip(event.currentTarget.checked)} /> Auto-skip openings and endings</label>
+            <label>Ending skip <select aria-label="Ending skip action" value={endingAction} onchange={event => setEndingAction(event.currentTarget.value as EndingAction)}>
+              <option value="auto">Auto (next episode or post-credits)</option>
+              <option value="next">Next episode</option>
+              <option value="skip">Skip ending only</option>
+            </select></label>
+          {/if}
           {#if loadEpisodeCaptions}<label><input type="checkbox" checked={replaceSitePlayer} onchange={event => setReplaceSitePlayer(event.currentTarget.checked)} /> Always use the Arc player on this site</label>{/if}
           {#if video}<button onclick={() => { if (video) { video.muted = !video.muted; tick(); } }}>{playbackMuted ? 'Unmute' : 'Mute'}</button>{/if}
           {#if showPlayback && document.pictureInPictureEnabled}<button disabled={!playbackReady} onclick={pictureInPicture}>Picture in picture</button>{/if}

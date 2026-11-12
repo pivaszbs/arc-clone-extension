@@ -335,6 +335,15 @@ Then('I can keep watching the opening and choose between skipping the ending or 
   await expect(ending.getByRole('button', { name: 'Next episode' })).toBeVisible({ timeout: 5000 });
   await expect(ending.getByRole('button', { name: 'Skip ending' })).toBeVisible({ timeout: 5000 });
   await expect(ending.getByText('Next episode in 5 s')).toBeVisible({ timeout: 5000 });
+  // Switching the default ending skip action in Player options updates the countdown action.
+  await page.waitForTimeout(550);
+  await page.mouse.move(100, 100);
+  await page.mouse.move(200, 200);
+  await page.getByRole('button', { name: 'Player options' }).click();
+  await page.getByLabel('Ending skip action').selectOption('skip');
+  await expect(ending.getByText(/Skipping in \d+ s/)).toBeVisible();
+  await page.getByLabel('Ending skip action').selectOption('next');
+  await expect(ending.getByText(/Next episode in \d+ s/)).toBeVisible();
   // Choose "Skip ending" first to stay in the current episode, then undo and let "Next episode" advance.
   await ending.getByRole('button', { name: 'Skip ending' }).click();
   await expect.poll(() => video.evaluate(element => element.currentTime), { timeout: 6000 }).toBeGreaterThanOrEqual(14.5);
