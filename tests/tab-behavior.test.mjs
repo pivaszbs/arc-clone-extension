@@ -29,7 +29,7 @@ function tab(id, url, extra = {}) {
   return { id, url, title: url, windowId: 1, index: id, active: false, pinned: false, ...extra };
 }
 
-function harness(state = fixture(), initialTabs = []) {
+function harness(state = fixture(), initialTabs = [], configureChrome = () => {}) {
   let tabs = structuredClone(initialTabs);
   let listener;
   const removed = [];
@@ -69,6 +69,7 @@ function harness(state = fixture(), initialTabs = []) {
     windows: { update: async () => {}, get: async () => ({ type: 'normal' }) },
     contextMenus: { onClicked: event() }, commands: { onCommand: event() }
   };
+  configureChrome(chrome);
   vm.runInNewContext(compiled.outputFiles[0].text, { chrome, URL, structuredClone, console, setTimeout, crypto });
   const message = (message, sender = {}) => new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error(`No response for ${message.type}`)), 1000);
@@ -76,6 +77,36 @@ function harness(state = fixture(), initialTabs = []) {
   });
   return { message, removed, updated, created };
 }
+
+test('overlapping install and startup leave each context menu registered once', async () => {
+  let install;
+  let startup;
+  const items = new Set(['obsolete-menu']);
+  const errors = [];
+  harness(fixture(), [], chrome => {
+    chrome.runtime.onInstalled.addListener = listener => { install = listener; };
+    chrome.runtime.onStartup.addListener = listener => { startup = listener; };
+    chrome.sidePanel = { setPanelBehavior: async () => {} };
+    chrome.contextMenus.removeAll = callback => {
+      items.clear();
+      queueMicrotask(callback);
+    };
+    chrome.contextMenus.create = ({ id }, callback) => {
+      if (items.has(id)) errors.push(`Cannot create item with duplicate id ${id}`);
+      items.add(id);
+      queueMicrotask(() => callback?.());
+    };
+  });
+
+  install({ reason: 'chrome_update' });
+  await startup();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(errors, []);
+  assert.deepEqual([...items], [
+    'arc-ask-chatgpt', 'arc-send-antigravity', 'arc-peek-link', 'arc-pin-page', 'arc-translate-selection'
+  ]);
+});
 
 test('saved hover mode and removed default Favorites survive loading', async () => {
   const state = fixture(); state.favorites = [];
