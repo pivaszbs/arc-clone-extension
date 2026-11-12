@@ -1,5 +1,6 @@
 import { translateText } from './translate';
 import { desktopPipRequest } from './desktop-pip';
+import { findFolder, pinnedLinks, pinnedRows, removePin } from '../shared/pins';
 import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
 import { canPreviewInPeek, isBrowserPageUrl } from '../shared/interaction';
 import {
@@ -302,7 +303,7 @@ if (chrome.alarms) {
 async function resetSpace(spaceId: string) {
   const { state, tabs } = await getFullSnapshot();
   const space = state.spaces.find((space) => space.id === spaceId);
-  for (const link of space?.pinnedItems.flatMap((item) => item.type === 'folder' ? item.children : [item]) || []) {
+  for (const link of pinnedLinks(space?.pinnedItems || [])) {
     const tab = tabs.find((tab) => tab.id === link.tabId && tab.spaceId === spaceId);
     if (tab) await chrome.tabs.update(tab.id, { url: link.url });
   }
@@ -388,7 +389,7 @@ chrome.runtime.onStartup.addListener(async () => {
   // A restored browser session can assign different live tab IDs.
   const state = await loadState();
   for (const space of state.spaces) {
-    for (const link of space.pinnedItems.flatMap((item) => item.type === 'folder' ? item.children : [item])) {
+    for (const link of pinnedLinks(space.pinnedItems)) {
       delete link.tabId;
     }
   }
@@ -532,10 +533,10 @@ async function pinUrlToSpace(spaceId: string, title: string, url: string, favIco
   if (!space) return;
 
   const folder = folderId
-    ? space.pinnedItems.find((item): item is PinnedFolder => item.type === 'folder' && item.id === folderId)
+    ? findFolder(space.pinnedItems, folderId)
     : undefined;
   if (folderId && !folder) return;
-  const links = space.pinnedItems.flatMap((item) => item.type === 'folder' ? item.children : [item]);
+  const links = pinnedLinks(space.pinnedItems);
   const matchingTab = (await chrome.tabs.query({})).find((tab) => tab.id !== undefined
     && state.tabSpaceMap[tab.id] === spaceId && urlKey(tab.url || '') === urlKey(url));
   const existing = links.find((link) => urlKey(link.url) === urlKey(url));
@@ -550,14 +551,9 @@ async function pinUrlToSpace(spaceId: string, title: string, url: string, favIco
     favIconUrl,
     tabId: matchingTab?.id
   };
-  if (existing) {
-    space.pinnedItems = space.pinnedItems.filter((item) => item.id !== existing.id);
-    for (const item of space.pinnedItems) {
-      if (item.type === 'folder') item.children = item.children.filter((child) => child.id !== existing.id);
-    }
-  }
-  if (folder) folder.children.push(newPin);
-  else space.pinnedItems.push(newPin);
+  if (existing) space.pinnedItems = removePin(space.pinnedItems, existing.id);
+  const destination = folderId ? findFolder(space.pinnedItems, folderId)?.children : space.pinnedItems;
+  destination?.push(newPin);
   await saveState(state);
 }
 
@@ -690,37 +686,15 @@ async function searchOmnibox(query: string): Promise<OmniboxResultItem[]> {
   }
 
   for (const space of state.spaces) {
-    for (const item of space.pinnedItems) {
-      if (item.type === 'link') {
-        if (results.some((result) => result.kind === 'tab' && result.spaceId === space.id && urlKey(result.url || '') === urlKey(item.url))) continue;
-        if (!q || item.title.toLowerCase().includes(q) || item.url.toLowerCase().includes(q)) {
-          results.push({
-            id: `pin-${item.id}`,
-            kind: 'pinned',
-            title: item.title,
-            subtitle: `Pinned in ${space.icon} ${space.name} · ${formatHostname(item.url)}`,
-            url: item.url,
-            spaceId: space.id,
-            favIconUrl: item.favIconUrl,
-            shortcut: 'Pinned'
-          });
-        }
-      } else if (item.type === 'folder') {
-        for (const child of item.children) {
-          if (results.some((result) => result.kind === 'tab' && result.spaceId === space.id && urlKey(result.url || '') === urlKey(child.url))) continue;
-          if (!q || child.title.toLowerCase().includes(q) || child.url.toLowerCase().includes(q)) {
-            results.push({
-              id: `pin-${child.id}`,
-              kind: 'pinned',
-              title: child.title,
-              subtitle: `${space.icon} ${space.name} / 📁 ${item.title} · ${formatHostname(child.url)}`,
-              url: child.url,
-              spaceId: space.id,
-              favIconUrl: child.favIconUrl,
-              shortcut: 'Pinned'
-            });
-          }
-        }
+    for (const { item, folder } of pinnedRows(space.pinnedItems)) {
+      if (item.type !== 'link') continue;
+      if (results.some(result => result.kind === 'tab' && result.spaceId === space.id && urlKey(result.url || '') === urlKey(item.url))) continue;
+      if (!q || item.title.toLowerCase().includes(q) || item.url.toLowerCase().includes(q) || folder?.title.toLowerCase().includes(q)) {
+        results.push({
+          id: `pin-${item.id}`, kind: 'pinned', title: item.title,
+          subtitle: `${space.icon} ${space.name}${folder ? ' / ' + folder.title : ''} · ${formatHostname(item.url)}`,
+          url: item.url, spaceId: space.id, favIconUrl: item.favIconUrl, shortcut: 'Pinned'
+        });
       }
     }
   }
@@ -949,7 +923,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case 'RENAME_PINNED_ITEM': {
         const space = state.spaces.find((space) => space.id === (message.spaceId || state.activeSpaceId));
-        const items = space?.pinnedItems.flatMap((item) => item.type === 'folder' ? [item, ...item.children] : [item]) || [];
+        const items = pinnedRows(space?.pinnedItems || []).map(({ item }) => item);
         const item = items.find((item) => item.id === message.itemId);
         if (!item || typeof message.title !== 'string' || !message.title.trim()) throw new Error('Enter a name for the pinned item');
         item.title = message.title.trim();
@@ -1136,8 +1110,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const snapshot = await getFullSnapshot();
         const spaceFavs = getSpaceFavorites(state, targetSpaceId);
         const sharedFavorite = spaceFavs.some((favorite) => urlKey(favorite.url) === urlKey(url));
-        const links = state.spaces.find((space) => space.id === targetSpaceId)?.pinnedItems
-          .flatMap((item) => item.type === 'folder' ? item.children : [item]) || [];
+        const links = pinnedLinks(state.spaces.find((space) => space.id === targetSpaceId)?.pinnedItems || []);
         const pin = links.find((link) => urlKey(link.url) === urlKey(url));
         const rootMatch = (sharedFavorite || Boolean(pin)) && isRootDomainUrl(url);
         const existing = snapshot.tabs
@@ -1197,17 +1170,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const { spaceId, itemId } = message;
         const space = state.spaces.find((s) => s.id === (spaceId || state.activeSpaceId));
         if (space) {
-          space.pinnedItems = space.pinnedItems
-            .filter((item) => item.id !== itemId)
-            .map((item) => {
-              if (item.type === 'folder') {
-                return {
-                  ...item,
-                  children: item.children.filter((c) => c.id !== itemId)
-                };
-              }
-              return item;
-            });
+          space.pinnedItems = removePin(space.pinnedItems, itemId);
           await saveState(state);
         }
         sendResponse(await getFullSnapshot());
@@ -1215,17 +1178,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       case 'CREATE_FOLDER': {
-        const { spaceId, title } = message;
+        const { spaceId, title, parentId } = message;
         const space = state.spaces.find((s) => s.id === (spaceId || state.activeSpaceId));
         if (space) {
           const folder: PinnedFolder = {
-            id: `folder-${Date.now()}`,
+            id: crypto.randomUUID(),
             type: 'folder',
             title: title?.trim() || 'New Folder',
             collapsed: false,
             children: []
           };
-          space.pinnedItems.push(folder);
+          const parent = parentId ? findFolder(space.pinnedItems, parentId) : undefined;
+          if (parentId && !parent) throw new Error('Folder no longer exists.');
+          if (parent) {
+            parent.collapsed = false;
+            parent.children.push(folder);
+          } else space.pinnedItems.push(folder);
           await saveState(state);
         }
         sendResponse(await getFullSnapshot());
@@ -1236,9 +1204,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const { spaceId, folderId } = message;
         const space = state.spaces.find((s) => s.id === (spaceId || state.activeSpaceId));
         if (space) {
-          const folder = space.pinnedItems.find(
-            (i): i is PinnedFolder => i.type === 'folder' && i.id === folderId
-          );
+          const folder = findFolder(space.pinnedItems, folderId);
           if (folder) {
             folder.collapsed = !folder.collapsed;
             await saveState(state);

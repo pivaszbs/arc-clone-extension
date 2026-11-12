@@ -147,6 +147,39 @@ test('pinning repeatedly and moving into a folder keeps one saved item and its i
   assert.equal(items[0].children[1].title, 'Saved');
 });
 
+test('folders nest inside folders and pins can be saved into the nested folder', async () => {
+  const app = harness();
+  await app.message({ type: 'TOGGLE_FOLDER', folderId: 'folder' });
+  let { state } = await app.message({ type: 'CREATE_FOLDER', title: 'Nested', parentId: 'folder' });
+  const parent = state.spaces[0].pinnedItems[1];
+  const nested = parent.children[1];
+  assert.equal(parent.collapsed, false, 'creating a subfolder expands its parent');
+  assert.equal(nested.type, 'folder');
+  assert.equal(nested.title, 'Nested');
+  ({ state } = await app.message({ type: 'PIN_TAB_TO_SPACE', title: 'Deep', url: 'https://deep.test/', folderId: nested.id }));
+  assert.equal(state.spaces[0].pinnedItems[1].children[1].children[0].url, 'https://deep.test/');
+  ({ state } = await app.message({ type: 'TOGGLE_FOLDER', folderId: nested.id }));
+  assert.equal(state.spaces[0].pinnedItems[1].children[1].collapsed, true);
+  ({ state } = await app.message({ type: 'REMOVE_PINNED_ITEM', itemId: nested.id }));
+  assert.equal(state.spaces[0].pinnedItems[1].children.length, 1);
+});
+
+test('creating a folder inside a missing folder reports an error', async () => {
+  const result = await harness().message({ type: 'CREATE_FOLDER', title: 'Lost', parentId: 'missing' });
+  assert.match(String(result?.error || ''), /Folder no longer exists/);
+});
+
+test('search finds pins inside nested folders by folder name', async () => {
+  const state = fixture();
+  state.spaces[0].pinnedItems[1].children.push({ id: 'docs', type: 'folder', title: 'Docs', children: [
+    { id: 'deep', type: 'link', title: 'Deep page', url: 'https://deep.test' }
+  ] });
+  const { items } = await harness(state).message({ type: 'SEARCH_OMNIBOX', query: 'docs' });
+  const match = Array.from(items).find((item) => item.id === 'pin-deep');
+  assert.ok(match);
+  assert.match(match.subtitle, /Docs/);
+});
+
 test('opening a URL uses its Space instead of stealing another Space tab', async () => {
   const app = harness(fixture(), [tab(7, 'https://saved.test/')]);
   await app.message({ type: 'OPEN_OR_SWITCH_URL', url: 'https://saved.test', spaceId: 'personal' });

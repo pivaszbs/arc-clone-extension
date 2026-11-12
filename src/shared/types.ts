@@ -82,7 +82,7 @@ export interface PinnedFolder {
   type: 'folder';
   title: string;
   collapsed?: boolean;
-  children: PinnedLink[];
+  children: PinnedItem[];
 }
 
 export type PinnedItem = PinnedLink | PinnedFolder;

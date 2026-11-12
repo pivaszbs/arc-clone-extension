@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import CommandPalette from '../shared/CommandPalette.svelte';
   import Icon from '../shared/Icon.svelte';
+  import { pinnedRows } from '../shared/pins';
   import { getSpaceFavorites, getTodayTabs } from '../shared/tabs';
   import {
     type ArcState,
@@ -276,30 +277,17 @@
     <div class="ls-scroll">
       {#if activeSpace?.pinnedItems?.length}
         <div class="section-label">Pinned</div>
-        {#each activeSpace.pinnedItems as item (item.id)}
+        {#each pinnedRows(activeSpace.pinnedItems, true) as { item, depth } (item.id)}
           {#if item.type === 'folder'}
-            <button class="ls-row folder" aria-expanded={!item.collapsed} onclick={() => toggleFolder(item.id)}>
+            <button class="ls-row folder" class:child={depth > 0} style:padding-left={depth ? `${9 + depth * 16}px` : null} aria-expanded={!item.collapsed} onclick={() => toggleFolder(item.id)}>
               <span>{item.collapsed ? '▸' : '▾'}</span>
               <span class="ls-title">{item.title}</span>
             </button>
-            {#if !item.collapsed}
-            {#each item.children as child (child.id)}
-              <button
-                class="ls-row child"
-                onclick={() => openSavedUrl(child.url)}
-              >
-                {#if getFaviconUrl(child.url, child.favIconUrl)}
-                  <img src={getFaviconUrl(child.url, child.favIconUrl)} alt="" />
-                {:else}
-                  <span><Icon name="globe" /></span>
-                {/if}
-                <span class="ls-title">{child.title}</span>
-              </button>
-            {/each}
-            {/if}
           {:else}
             <button
               class="ls-row"
+              class:child={depth > 0}
+              style:padding-left={depth ? `${9 + depth * 16}px` : null}
               onclick={() => openSavedUrl(item.url)}
             >
               {#if getFaviconUrl(item.url, item.favIconUrl)}
