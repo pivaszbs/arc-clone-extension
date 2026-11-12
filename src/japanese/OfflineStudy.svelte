@@ -80,7 +80,13 @@
   const seriesName = $derived((episodeFolders.find(entry => entry.key === selectedFolder)?.name
     || episodes[0]?.video.webkitRelativePath.split('/').at(-2)
     || '').replace(/^Смотреть аниме\s+/i, '').replace(/ - \d+(?= - |$)/, ''));
+  // Drop the trailing translation credit (for example "- NDA Studio Дубляж") to get the plain anime title.
+  const animeName = $derived(seriesName.replace(/\s+-\s+[^-]*(?:дубляж|озвучка|субтитр|войсовер|dub|sub)[^-]*$/i, '').trim());
   const episodeIndex = $derived(episodes.findIndex(item => item.path === selected));
+
+  $effect(() => {
+    document.title = animeName ? `${animeName} · Anime Study` : 'Offline study · Anime Study';
+  });
   const railProgress = $derived.by(() => {
     // Reading the revision refreshes the rail after progress is saved.
     void progressRevision;
@@ -578,7 +584,7 @@
 <header class="masthead">
   <div class="app-name">
     <span class="app-mark" aria-hidden="true"></span>
-    <h1>Offline Study</h1>
+    <h1 title={animeName || undefined}>{animeName || 'Offline Study'}</h1>
   </div>
   <nav aria-label="Offline Study">
     <a href="#library">Library</a>
@@ -802,7 +808,8 @@
     border-bottom: 1px solid var(--line);
   }
   .app-name, .masthead nav { display: flex; align-items: center; gap: 12px; }
-  .masthead h1 { font-size: clamp(17px, 2.4vw, 22px); letter-spacing: -.035em; }
+  .app-name { min-width: 0; }
+  .masthead h1 { font-size: clamp(17px, 2.4vw, 22px); letter-spacing: -.035em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .app-mark {
     display: grid;
     place-items: center;
