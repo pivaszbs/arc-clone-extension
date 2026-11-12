@@ -5,7 +5,9 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const iconsDir = resolve(__dirname, '../public/icons');
+const animeIconsDir = resolve(__dirname, '../public/anime-icons');
 mkdirSync(iconsDir, { recursive: true });
+mkdirSync(animeIconsDir, { recursive: true });
 
 function crc32(buf) {
   let c = -1;
@@ -34,7 +36,7 @@ function makeChunk(type, data) {
   return Buffer.concat([len, combined, crcBuf]);
 }
 
-function generateArcIconPng(size) {
+function generateIconPng(size, anime = false) {
   const raw = Buffer.alloc(size * (size * 4 + 1));
   const center = (size - 1) / 2;
   const radius = size * 0.45;
@@ -78,6 +80,19 @@ function generateArcIconPng(size) {
           b = 255;
         }
 
+        if (anime) {
+          r = Math.round(105 + tx * 45);
+          g = Math.round(31 + (1 - ty) * 35);
+          b = Math.round(79 + (1 - ty) * 29);
+          const playX = dx / size;
+          const playY = Math.abs(dy / size);
+          if (playX >= -0.14 && playX <= 0.22 && playY <= (0.22 - playX) * 0.62) {
+            r = 255;
+            g = 244;
+            b = 231;
+          }
+        }
+
         const alpha = squircle > 0.92 ? Math.max(0, Math.round(((1 - squircle) / 0.08) * 255)) : 255;
         raw[idx] = Math.min(255, Math.max(0, r));
         raw[idx + 1] = Math.min(255, Math.max(0, g));
@@ -114,6 +129,7 @@ function generateArcIconPng(size) {
 }
 
 for (const size of [16, 48, 128]) {
-  writeFileSync(resolve(iconsDir, `icon${size}.png`), generateArcIconPng(size));
+  writeFileSync(resolve(iconsDir, `icon${size}.png`), generateIconPng(size));
+  writeFileSync(resolve(animeIconsDir, `icon${size}.png`), generateIconPng(size, true));
 }
-console.log('Generated Arc icons: icon16.png, icon48.png, icon128.png');
+console.log('Generated Arc and Anime Study icons.');

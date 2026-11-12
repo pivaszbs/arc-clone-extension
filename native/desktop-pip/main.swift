@@ -51,13 +51,14 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptM
             open()
         } else if type == "start", message["sessionId"] as? String == session {
             guard let mime = message["mime"] as? String, mime.count < 150 else { return }
-            evaluate("window.start", [mime, muted, volume, message["paused"] as? Bool ?? false])
-        } else if type == "playback", message["sessionId"] as? String == session {
-            guard let paused = message["paused"] as? Bool else { return }
-            evaluate("window.setPlayback", [paused, message["failed"] as? Bool ?? false])
+            evaluate("window.start", [mime, muted, volume])
         } else if type == "chunk", message["sessionId"] as? String == session {
             guard let data = message["data"] as? String, data.count < 1_500_000 else { return }
             evaluate("window.chunk", [data])
+        } else if type == "playback-state", message["sessionId"] as? String == session {
+            let paused = message["paused"] as? Bool ?? false
+            let error = message["error"] as? String ?? ""
+            evaluate("window.setSourcePaused", [paused, error])
         } else if type == "status" {
             let id = message["requestId"] as? String ?? ""
             web?.evaluateJavaScript("window.statusSnapshot()") { result, error in
@@ -81,7 +82,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptM
     }
     func open() {
         let panel = DesktopPanel(contentRect:NSRect(x:0,y:0,width:480,height:270),
-                                 styleMask:[.titled,.closable,.resizable,.nonactivatingPanel],
+                                 styleMask:[.titled,.closable,.resizable,.nonactivatingPanel,.fullSizeContentView],
                                  backing:.buffered,defer:false)
         // Set these BEFORE the panel is first shown, for other apps' full-screen Spaces.
         panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary,.stationary,.ignoresCycle]
@@ -89,8 +90,11 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptM
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
         panel.isReleasedWhenClosed = false
-        panel.title = "Across desktops"
-        panel.contentMinSize = NSSize(width:240,height:135)
+        panel.title = "Arc video across desktops"
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.minSize = NSSize(width:240,height:135)
         panel.contentAspectRatio = NSSize(width:16,height:9)
         panel.delegate = self
         let configuration = WKWebViewConfiguration()
@@ -106,9 +110,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptM
             send(["type":"error","sessionId":session,"error":"Desktop player resources are missing."]); close(); return
         }
         web.loadHTMLString(html,baseURL:URL(string:"https://arc-pip.invalid/"))
-        let pointerScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
-        if let frame = (pointerScreen ?? NSScreen.main)?.visibleFrame {
-            panel.setFrameOrigin(NSPoint(x:frame.maxX-panel.frame.width-20,y:frame.minY+24))
+        if let frame = NSScreen.main?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x:frame.maxX-500,y:frame.minY+24))
         }
         panel.orderFrontRegardless()
     }

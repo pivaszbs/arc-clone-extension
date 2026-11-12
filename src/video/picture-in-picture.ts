@@ -1,10 +1,8 @@
 import { DesktopVideoStream } from './desktop-stream';
-import { canMountStudy, OPEN_JAPANESE_STUDY } from '../japanese/study';
 /** Native video PiP only: no cloning, reparenting or restarting the media element. */
 export function installPictureInPictureControls(doc: Document = document) {
   const win = doc.defaultView;
   if (!win || !('requestPictureInPicture' in win.HTMLVideoElement.prototype)) return () => {};
-  const studyAvailable = canMountStudy(win);
   const hostId = 'arc-video-picture-in-picture';
   if (doc.getElementById(hostId)) return () => {};
 
@@ -16,10 +14,15 @@ export function installPictureInPictureControls(doc: Document = document) {
   style.textContent = `
     :host { all: initial; }
     * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
-    .control { position: fixed; pointer-events: auto; max-width: calc(100vw - 16px); }
+    .control { position: fixed; display: flex; align-items: flex-end; flex-direction: column; gap: 4px;
+      max-width: calc(100vw - 16px); opacity: 0; pointer-events: none; }
+    .control[data-hovered], .control:has(button:focus-visible), .control:has(.status:not([hidden])) { opacity: 1; pointer-events: auto; }
+    @media (hover: none) {
+      .control { opacity: 1; pointer-events: auto; }
+    }
     [hidden] { display: none !important; }
-    button { display: flex; align-items: center; gap: 7px; border: 1px solid #ffffff50; border-radius: 8px;
-      background: #24232beF; color: #fff; padding: 8px 10px; font-size: 12px; font-weight: 500;
+    button { display: grid; place-items: center; width: 34px; height: 34px; padding: 0;
+      border: 1px solid #ffffff50; border-radius: 8px; background: #24232bef; color: #fff;
       cursor: pointer; box-shadow: 0 2px 12px #0005; }
     button:hover { background: #3c394c; }
     button:focus-visible { outline: 2px solid #bdb4ff; outline-offset: 3px; }
@@ -31,50 +34,42 @@ export function installPictureInPictureControls(doc: Document = document) {
   shadow.append(style);
   doc.documentElement.append(host);
 
-  const controls = new Map<HTMLVideoElement, { element: HTMLDivElement; button: HTMLButtonElement; update: () => void; dispose: () => void }>();
+  const controls = new Map<HTMLVideoElement, { update: () => void; hover: (target: EventTarget | null) => void; dispose: () => void }>();
+  let pointer: { x: number; y: number; target: EventTarget | null } | null = null;
   let frame = 0;
   let disposed = false;
   const resize = new ResizeObserver(() => schedule());
 
-  function attach(video: HTMLVideoElement) {
-    const element = doc.createElement('div');
-    element.className = 'control';
+  function makeIconButton(outline: string) {
     const button = doc.createElement('button');
     button.type = 'button';
     const icon = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
     icon.setAttribute('viewBox', '0 0 24 24');
     icon.setAttribute('aria-hidden', 'true');
     const path = doc.createElementNS(icon.namespaceURI, 'path');
-    path.setAttribute('d', 'M3 4h18v16H3z M12 12h7v6h-7z');
+    path.setAttribute('d', outline);
     path.setAttribute('fill', 'none');
     path.setAttribute('stroke', 'currentColor');
     path.setAttribute('stroke-width', '1.7');
     icon.append(path);
-    const label = doc.createElement('span');
+    button.append(icon);
+    return button;
+  }
+
+  function attach(video: HTMLVideoElement) {
+    const element = doc.createElement('div');
+    element.className = 'control';
+    const button = makeIconButton('M3 4h18v16H3z M12 12h7v6h-7z');
+    const desktopButton = makeIconButton('M3 4h15v11H3z M8 17v2h5 M14 11h7v8h-7z');
     const status = doc.createElement('p');
     status.className = 'status';
     status.setAttribute('role', 'status');
     status.hidden = true;
-    button.append(icon, label);
-    element.append(button, status);
+    desktopButton.hidden = !/Mac/i.test(navigator.platform);
+    element.append(button, desktopButton, status);
     shadow.append(element);
     let busy = false;
-    const desktopButton = doc.createElement('button');
-    desktopButton.type = 'button';
-    desktopButton.textContent = 'Across desktops';
-    desktopButton.setAttribute('aria-label', 'Picture in picture across desktops');
-    desktopButton.style.marginTop = '4px';
-    desktopButton.hidden = !/Mac/i.test(navigator.platform);
-    element.insertBefore(desktopButton, status);
-    const studyButton = doc.createElement('button');
-    studyButton.type = 'button';
-    studyButton.textContent = 'Learn Japanese';
-    studyButton.style.marginTop = '4px';
-    studyButton.addEventListener('click', (event) => {
-      event.stopPropagation();
-      video.dispatchEvent(new Event(OPEN_JAPANESE_STUDY, { bubbles: true }));
-    });
-    if (studyAvailable) element.insertBefore(studyButton, status);
+    let rect = video.getBoundingClientRect();
     const desktop = new DesktopVideoStream(video, update, (message) => {
       status.textContent = message; status.hidden = false;
     });
@@ -90,30 +85,33 @@ export function installPictureInPictureControls(doc: Document = document) {
       } finally { busy = false; update(); }
     });
 
+    function hover(target: EventTarget | null) {
+      const onControl = target === host && element.matches(':hover');
+      const overVideo = pointer && pointer.x >= rect.left && pointer.x < rect.right
+        && pointer.y >= rect.top && pointer.y < rect.bottom;
+      element.toggleAttribute('data-hovered', !element.hidden && !!(onControl || overVideo));
+    }
+
     function update() {
       const active = doc.pictureInPictureElement === video;
       const text = active ? 'Exit picture in picture' : 'Picture in picture';
-      label.textContent = text;
       button.setAttribute('aria-label', text);
       button.setAttribute('aria-pressed', String(active));
-      button.title = text;
       button.disabled = busy;
       desktopButton.disabled = busy;
-      desktopButton.textContent = desktop.active ? 'Return to page' : 'Across desktops';
-      desktopButton.setAttribute('aria-label', desktop.active ? 'Exit picture in picture across desktops' : 'Picture in picture across desktops');
+      const desktopLabel = desktop.active ? 'Exit picture in picture across desktops' : 'Picture in picture across desktops';
+      desktopButton.setAttribute('aria-label', desktopLabel);
       desktopButton.setAttribute('aria-pressed', String(desktop.active));
-      const rect = video.getBoundingClientRect();
+      rect = video.getBoundingClientRect();
       const visible = rect.width >= 180 && rect.height >= 90 && rect.bottom > 40
         && rect.top < win!.innerHeight - 40 && rect.right > 40 && rect.left < win!.innerWidth - 40
         && win!.getComputedStyle(video).visibility !== 'hidden'
         && win!.getComputedStyle(video).display !== 'none';
-      const pipDisabled = video.disablePictureInPicture && !active;
-      button.hidden = pipDisabled;
-      desktopButton.hidden = pipDisabled || !/Mac/i.test(navigator.platform);
       element.hidden = !visible || video.readyState === 0 || video.videoWidth === 0
-        || (pipDisabled && !studyAvailable) || Boolean(doc.fullscreenElement);
+        || (video.disablePictureInPicture && !active) || Boolean(doc.fullscreenElement);
       element.style.top = `${Math.max(8, rect.top + 8)}px`;
       element.style.right = `${Math.max(8, win!.innerWidth - rect.right + 8)}px`;
+      hover(pointer?.target ?? null);
     }
 
     button.addEventListener('click', async (event) => {
@@ -144,7 +142,7 @@ export function installPictureInPictureControls(doc: Document = document) {
     const events = ['loadedmetadata', 'loadeddata', 'emptied', 'resize', 'enterpictureinpicture', 'leavepictureinpicture'];
     for (const type of events) video.addEventListener(type, schedule);
     resize.observe(video);
-    controls.set(video, { element, button, update, dispose: () => {
+    controls.set(video, { update, hover, dispose: () => {
       for (const type of events) video.removeEventListener(type, schedule);
       resize.unobserve(video);
       if (desktop.active) desktop.stop();
@@ -164,12 +162,24 @@ export function installPictureInPictureControls(doc: Document = document) {
   function schedule() {
     if (!frame && !disposed) frame = win!.requestAnimationFrame(refresh);
   }
+  function trackPointer(event: PointerEvent) {
+    if (event.pointerType === 'touch') return;
+    pointer = { x: event.clientX, y: event.clientY, target: event.target };
+    for (const control of controls.values()) control.hover(event.target);
+  }
+  function clearPointer(event: PointerEvent) {
+    if (event.relatedTarget !== null) return;
+    pointer = null;
+    for (const control of controls.values()) control.hover(null);
+  }
   const observer = new MutationObserver(schedule);
   observer.observe(doc.documentElement, { childList: true, subtree: true, attributes: true,
-    attributeFilter: ['disablepictureinpicture', 'class', 'style', 'hidden', 'src'] });
+    attributeFilter: ['data-arc-study-video', 'disablepictureinpicture', 'class', 'style', 'hidden', 'src'] });
   win.addEventListener('scroll', schedule, true);
   win.addEventListener('resize', schedule);
   win.addEventListener('pageshow', schedule);
+  doc.addEventListener('pointermove', trackPointer, { capture: true, passive: true });
+  doc.addEventListener('pointerout', clearPointer, { capture: true, passive: true });
   doc.addEventListener('fullscreenchange', schedule);
   refresh();
 
@@ -181,6 +191,8 @@ export function installPictureInPictureControls(doc: Document = document) {
     win.removeEventListener('scroll', schedule, true);
     win.removeEventListener('resize', schedule);
     win.removeEventListener('pageshow', schedule);
+    doc.removeEventListener('pointermove', trackPointer, true);
+    doc.removeEventListener('pointerout', clearPointer, true);
     doc.removeEventListener('fullscreenchange', schedule);
     for (const control of controls.values()) control.dispose();
     controls.clear();

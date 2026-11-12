@@ -3,10 +3,41 @@ import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 When('I open the video across desktops', async function () {
   this.originalMute = await this.videoPage.locator('video').evaluate(video => video.muted);
+  await this.videoPage.locator('video').hover();
   await this.videoPage.getByRole('button', {name:'Picture in picture across desktops',exact:true}).click();
   await expect(this.videoPage.getByRole('button',{name:'Exit picture in picture across desktops',exact:true})).toBeVisible({timeout:20000});
 });
-async function status(world) { return world.message({type:'DESKTOP_PIP_STATUS'}); }
+When('I open a downloaded video across desktops', async function () {
+  await this.videoPage.getByLabel('Episode video', { exact: true }).setInputFiles('tests/fixtures/pip-with-audio.mp4');
+  await this.videoPage.locator('video').evaluate(video => { video.loop = true; });
+  await this.videoPage.getByRole('button', { name: 'Player options' }).click();
+  await this.videoPage.getByRole('button', { name: 'Picture in picture across desktops', exact: true }).click({ timeout: 5000 });
+  await expect(this.videoPage.getByRole('button', { name: 'Exit picture in picture across desktops', exact: true })).toBeVisible({ timeout: 20000 });
+});
+async function status(world) {
+  const message = { type: 'DESKTOP_PIP_STATUS' };
+  if (world.videoPage.url().startsWith(`chrome-extension://${world.animeExtensionId}/`)) {
+    return world.videoPage.evaluate(value => chrome.runtime.sendMessage(value), message);
+  }
+  return world.message(message);
+}
+When('the source video pauses and resumes', async function () {
+  const video = this.videoPage.locator('video');
+  await video.evaluate(element => element.pause());
+  await expect.poll(async () => {
+    const state = await status(this);
+    return [state.source?.paused, state.media?.paused];
+  }).toEqual([true, true]);
+  const pausedAt = (await status(this)).media.time;
+  await expect.poll(async () => (await status(this)).media.time).toBe(pausedAt);
+  await video.evaluate(element => element.play());
+});
+Then('the desktop panel follows the source playback state', async function () {
+  await expect.poll(async () => {
+    const state = await status(this);
+    return [state.source?.paused, state.media?.paused];
+  }).toEqual([false, false]);
+});
 Then('the desktop panel joins all Spaces and full-screen Spaces', async function () {
   const state = await status(this);
   assert.equal(state.ok,true,state.error);
@@ -25,6 +56,7 @@ Then('the desktop panel video keeps advancing', async function () {
   await expect.poll(async () => (await status(this)).media?.time || 0,{timeout:10000}).toBeGreaterThan(start);
 });
 When('I return the desktop video to the page', async function () {
+  await this.videoPage.locator('video').hover();
   await this.videoPage.getByRole('button',{name:'Exit picture in picture across desktops',exact:true}).click();
 });
 Then('the desktop player has closed', async function () {
@@ -63,26 +95,4 @@ Then('the desktop panel keeps receiving a playing live stream', async function (
     const state=await status(this);
     return state.media?.received>=4 && state.media?.paused===false && state.media?.ended===false;
   },{timeout:15000}).toBe(true);
-});
-
-When('I pause the original video', async function () {
-  await this.videoPage.locator('video').evaluate(video => video.pause());
-});
-
-When('I resume the original video', async function () {
-  await this.videoPage.locator('video').evaluate(video => video.play());
-});
-
-Then('the desktop video pauses and offers Play', async function () {
-  await expect.poll(async () => {
-    const { media, source } = await status(this);
-    return media?.paused && source?.paused && media?.playbackAction === 'Play';
-  }).toBe(true);
-});
-
-Then('the desktop video resumes and offers Pause', async function () {
-  await expect.poll(async () => {
-    const { media, source } = await status(this);
-    return media?.paused === false && source?.paused === false && media?.playbackAction === 'Pause';
-  }).toBe(true);
 });

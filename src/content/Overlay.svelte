@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { requestArc } from '../shared/messaging';
-  import { shouldPeek } from '../shared/interaction';
+  import { canPreviewInPeek, shouldPeek } from '../shared/interaction';
   import CommandPalette from '../shared/CommandPalette.svelte';
   import Icon from '../shared/Icon.svelte';
   import { containFocus, isActivationKey } from '../shared/focus';
-  import { getSpaceFavorites, getTodayTabs, urlKey } from '../shared/tabs';
+  import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
   import {
     type ArcState,
     type ExtensionSettings,
@@ -19,7 +19,6 @@
     parseCommandBarInput
   } from '../shared/types';
   import { DesktopVideoStream } from '../video/desktop-stream';
-
   let arcState = $state<ArcState>({
     spaces: [
       {
@@ -52,6 +51,28 @@
   let leftSidebarHoverOpen = $state(false);
   let hideTimeout: ReturnType<typeof setTimeout> | null = null;
   let copiedCurrentUrl = $state(false);
+  let currentPageUrl = $state(window.location.href);
+  let pointerDownCoords = { x: 0, y: 0 };
+
+  function isUrlActive(targetUrl: string, currentUrl = currentPageUrl): boolean {
+    if (!targetUrl || !currentUrl) return false;
+    if (urlKey(targetUrl) === urlKey(currentUrl)) return true;
+    if (isRootDomainUrl(targetUrl) && sameHost(targetUrl, currentUrl)) return true;
+    try {
+      const t = new URL(targetUrl);
+      const c = new URL(currentUrl);
+      if (
+        sameHost(targetUrl, currentUrl) &&
+        t.pathname !== '/' &&
+        c.pathname.startsWith(t.pathname)
+      ) {
+        return true;
+      }
+    } catch {
+      // ignore invalid URL
+    }
+    return false;
+  }
 
   let sidebarX = $state(8);
   let sidebarY = $state(8);
@@ -139,8 +160,7 @@
   }
 
   let isLeftSidebarVisible = $derived(
-    settings.leftSidebarMode === 'pinned' ||
-      (settings.leftSidebarMode === 'hover' && leftSidebarHoverOpen)
+    settings.leftSidebarMode === 'pinned' || leftSidebarHoverOpen
   );
 
   let activeSpace = $derived<Space>(
@@ -222,7 +242,7 @@
 
   // 1. Command Bar State
   let showCommandBar = $state(false);
-  let commandMode = $state<'default' | 'new-tab' | 'little-arc'>('default');
+  let commandMode = $state<'default' | 'little-arc'>('default');
   let commandQuery = $state('');
 
   // 2. Peek / Little Arc Modal State
@@ -242,11 +262,58 @@
   let targetLang = $state('en');
   let copiedTranslation = $state(false);
 
-  // 4. ChatGPT & Antigravity AI Hub State
+  // 4. ChatGPT & Antigravity Browser Agent Sidebar State
+  interface AgentChatMessage {
+    id: string;
+    role: 'user' | 'assistant';
+    agent: 'chatgpt' | 'antigravity' | 'browser';
+    content: string;
+    timestamp: string;
+    actionBadge?: string;
+    promptUsed?: string;
+  }
+
+  let showAgentSidebar = $state(false);
+  let agentSidebarMode = $state<'chatgpt' | 'antigravity'>('chatgpt');
+  let agentSidebarDock = $state<'left' | 'right'>('left');
+  let agentSidebarWidth = $state(380);
+  let isResizingAgentSidebar = $state(false);
+  let showBrowserContextDrawer = $state(false);
+  let agentMessages = $state<AgentChatMessage[]>([]);
+  let agentSending = $state(false);
   let showAiBox = $state(false);
   let aiPromptText = $state('');
   let includePageContext = $state(true);
   let agyToastMessage = $state<string | null>(null);
+  let livePageContext = $state<{
+    title: string;
+    url: string;
+    selection: string;
+    excerpt: string;
+    buttons: string[];
+    headings: string[];
+    inputs: string[];
+    videoInfo: {
+      hasVideo: boolean;
+      videoCount: number;
+      iframeCount: number;
+      paused?: boolean;
+      muted?: boolean;
+      duration?: number;
+      currentTime?: number;
+      src?: string;
+      captionText?: string;
+    };
+  }>({
+    title: '',
+    url: '',
+    selection: '',
+    excerpt: '',
+    buttons: [],
+    headings: [],
+    inputs: [],
+    videoInfo: { hasVideo: false, videoCount: 0, iframeCount: 0 }
+  });
 
   function showToast(msg: string) {
     agyToastMessage = msg;
@@ -270,15 +337,12 @@
     return parts.join('\n\n');
   }
 
-  async function sendToChatGPT(customTask = '', explicitSelection = '', inLittleArc = true) {
+  async function launchExternalChatGPT(customTask = '', explicitSelection = '', inLittleArc = true) {
     const prompt = buildContextPrompt(
       customTask || (explicitSelection ? 'Explain and help me with this:' : 'Summarize and help me with this page:'),
       explicitSelection
     );
     const chatUrl = `https://chatgpt.com/?q=${encodeURIComponent(prompt)}`;
-    showTranslatePill = false;
-    showAiBox = false;
-    aiPromptText = '';
     if (inLittleArc) {
       await chrome.runtime.sendMessage({ type: 'OPEN_LITTLE_ARC', url: chatUrl });
     } else {
@@ -290,28 +354,156 @@
     }
   }
 
-  async function sendToAntigravity(customTask = '', explicitSelection = '') {
-    const prompt = buildContextPrompt(
-      customTask || 'Help me with this page / code in Antigravity:',
-      explicitSelection
-    );
+  async function launchExternalAntigravity(customTask = '', explicitSelection = '') {
+    const ctx = collectPageContext();
+    const prompt = [
+      customTask || 'Help me inspect and make this page work in Antigravity:',
+      `Page: ${ctx.title} (${ctx.url})`,
+      ctx.videoInfo.hasVideo || ctx.videoInfo.iframeCount > 0
+        ? `Media: ${ctx.videoInfo.videoCount} <video>, ${ctx.videoInfo.iframeCount} <iframe>`
+        : '',
+      explicitSelection || ctx.selection
+        ? `Selected Text:\n\`\`\`\n${(explicitSelection || ctx.selection).slice(0, 3000)}\n\`\`\``
+        : ''
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
     try {
       await navigator.clipboard.writeText(prompt);
     } catch {
       // ignore clipboard error
     }
-    showTranslatePill = false;
-    showAiBox = false;
-    aiPromptText = '';
-    showToast('🚀 Task & page context copied to clipboard! Launching Antigravity (⌘V to paste)...');
+    showToast('🚀 Task + Browser DOM context copied! Opening Antigravity IDE (⌘V to paste)...');
 
-    // Trigger macOS antigravity:// URL scheme to bring Antigravity.app to the front
     const a = document.createElement('a');
     a.href = 'antigravity://';
     a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
     setTimeout(() => a.remove(), 200);
+  }
+
+  function openAgentSidebar(
+    mode: 'chatgpt' | 'antigravity',
+    initialPrompt = '',
+    explicitSelection = '',
+    autoSubmit = false
+  ) {
+    agentSidebarMode = mode;
+    showAgentSidebar = true;
+    showAiBox = false;
+    showTranslatePill = false;
+    if (explicitSelection) {
+      selectionText = explicitSelection;
+    }
+    livePageContext = collectPageContext();
+
+    if (agentMessages.length === 0) {
+      const host = window.location.hostname.replace(/^www\./, '') || window.location.href;
+      const mediaNote =
+        livePageContext.videoInfo.videoCount > 0 || livePageContext.videoInfo.iframeCount > 0
+          ? `🎬 Detected **${livePageContext.videoInfo.videoCount} video(s)** & **${livePageContext.videoInfo.iframeCount} embedded player frame(s)**.`
+          : `🎯 Detected **${livePageContext.buttons.length} interactive controls** on this page.`;
+      agentMessages = [
+        {
+          id: `welcome-${Date.now()}`,
+          role: 'assistant',
+          agent: mode,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          actionBadge: '🟢 Browser DOM Connected',
+          content: `Connected to **${document.title || host}** (\`${host}\`).\n${mediaNote}\n\nAsk me anything about this page, tell me to **fix/inspect the video or page**, **click any button**, **summarize**, or **manage your tabs & Spaces**!`
+        }
+      ];
+    }
+
+    const combinedPrompt = initialPrompt.trim()
+      ? initialPrompt.trim()
+      : explicitSelection.trim()
+        ? `Help me with this selection:\n"${explicitSelection.trim().slice(0, 500)}"`
+        : '';
+
+    if (combinedPrompt) {
+      aiPromptText = combinedPrompt;
+      if (autoSubmit) {
+        submitAgentSidebarMessage(combinedPrompt);
+      }
+    }
+  }
+
+  async function submitAgentSidebarMessage(overrideText?: string) {
+    const text = (overrideText ?? aiPromptText).trim();
+    if (!text || agentSending) return;
+    if (!overrideText) {
+      aiPromptText = '';
+    }
+
+    const nowStamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const userMsg: AgentChatMessage = {
+      id: `u-${Date.now()}`,
+      role: 'user',
+      agent: agentSidebarMode,
+      content: text,
+      timestamp: nowStamp
+    };
+
+    const historyForApi = agentMessages
+      .slice(-8)
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    agentMessages = [...agentMessages, userMsg];
+    agentSending = true;
+
+    try {
+      const pageContext = collectPageContext();
+      livePageContext = pageContext;
+      const res = await chrome.runtime.sendMessage({
+        type: 'HANDLE_VOICE_COMMAND',
+        transcript: text,
+        pageContext,
+        preferredAgent: agentSidebarMode,
+        fromSidebar: true,
+        history: historyForApi
+      });
+
+      agentSending = false;
+      if (res?.domAction) {
+        executeDomVoiceAction(res.domAction);
+      }
+
+      const replyContent = res?.reply || 'Done.';
+      const assistantMsg: AgentChatMessage = {
+        id: `a-${Date.now()}`,
+        role: 'assistant',
+        agent: res?.agent || agentSidebarMode,
+        content: replyContent,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        actionBadge: res?.actionBadge,
+        promptUsed: text
+      };
+      agentMessages = [...agentMessages, assistantMsg];
+      syncSnapshot();
+    } catch (err) {
+      agentSending = false;
+      agentMessages = [
+        ...agentMessages,
+        {
+          id: `err-${Date.now()}`,
+          role: 'assistant',
+          agent: agentSidebarMode,
+          content: `Could not complete browser action: ${String(err)}`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        }
+      ];
+    }
+  }
+
+  async function sendToChatGPT(customTask = '', explicitSelection = '', _inLittleArc = true) {
+    openAgentSidebar('chatgpt', customTask, explicitSelection, Boolean(customTask || explicitSelection));
+  }
+
+  async function sendToAntigravity(customTask = '', explicitSelection = '') {
+    openAgentSidebar('antigravity', customTask, explicitSelection, Boolean(customTask || explicitSelection));
   }
 
   // 5. Voice Browser Control State (SpeechRecognition + TTS + DOM Actions)
@@ -330,14 +522,16 @@
 
   function collectPageContext() {
     const sel = window.getSelection()?.toString().trim() || selectionText || '';
-    const excerpt = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+    const excerpt = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 1600);
     const interactiveEls = Array.from(
-      document.querySelectorAll<HTMLElement>('a, button, [role="button"], input[type="submit"], input[type="button"]')
+      document.querySelectorAll<HTMLElement>(
+        'a, button, [role="button"], input[type="submit"], input[type="button"]'
+      )
     );
     const buttons: string[] = [];
     for (const el of interactiveEls) {
       const rect = el.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.top <= window.innerHeight) {
+      if (rect.width > 0 && rect.height > 0 && rect.top >= -100 && rect.top <= window.innerHeight + 200) {
         const label = (
           el.innerText ||
           el.getAttribute('aria-label') ||
@@ -352,13 +546,113 @@
         }
       }
     }
+
+    const headings = Array.from(document.querySelectorAll<HTMLElement>('h1, h2, h3'))
+      .map((h) => (h.innerText || '').replace(/\s+/g, ' ').trim())
+      .filter((t) => t.length >= 2 && t.length <= 90)
+      .slice(0, 12);
+
+    const inputs = Array.from(
+      document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        'input[type="text"], input[type="search"], input:not([type]), textarea'
+      )
+    )
+      .map(
+        (inp) =>
+          inp.placeholder || inp.getAttribute('aria-label') || inp.name || inp.id || 'text input'
+      )
+      .slice(0, 10);
+
+    const videos = Array.from(document.querySelectorAll<HTMLVideoElement>('video'));
+    const iframes = Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe'));
+    const primaryVideo = findPrimaryVideo();
+
     return {
       title: document.title || '',
       url: window.location.href,
       selection: sel,
       excerpt,
-      buttons
+      buttons,
+      headings,
+      inputs,
+      videoInfo: {
+        hasVideo: Boolean(primaryVideo),
+        videoCount: videos.length,
+        iframeCount: iframes.length,
+        paused: primaryVideo ? primaryVideo.paused : undefined,
+        muted: primaryVideo ? primaryVideo.muted : undefined,
+        duration:
+          primaryVideo && Number.isFinite(primaryVideo.duration) ? primaryVideo.duration : undefined,
+        currentTime: primaryVideo ? primaryVideo.currentTime : undefined,
+        src: primaryVideo?.currentSrc || primaryVideo?.src || undefined,
+        captionText: ytCaptionLine || undefined
+      }
     };
+  }
+
+  function fixAndInspectPageDom() {
+    let fixedCount = 0;
+
+    // 1. Unlock all <video> elements on the page
+    const videos = Array.from(document.querySelectorAll<HTMLVideoElement>('video'));
+    for (const v of videos) {
+      v.controls = true;
+      v.removeAttribute('disablePictureInPicture');
+      v.style.pointerEvents = 'auto';
+      fixedCount++;
+    }
+
+    // 2. Ensure embedded player iframes have pointer-events enabled and are visible
+    const iframes = Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe'));
+    for (const f of iframes) {
+      const rect = f.getBoundingClientRect();
+      if (rect.width >= 200 && rect.height >= 120) {
+        f.style.pointerEvents = 'auto';
+        f.setAttribute('allowfullscreen', 'true');
+        fixedCount++;
+      }
+    }
+
+    // 3. Remove transparent click-jacking / ad-overlay divs covering the video or page
+    const allDivs = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        '[class*="overlay"], [id*="overlay"], [class*="preroll"], [class*="ad-"], [id*="ad-"]'
+      )
+    );
+    for (const el of allDivs) {
+      if (el.closest('#arc-chrome-overlay-root') || el.closest('#arc-japanese-study')) continue;
+      const style = window.getComputedStyle(el);
+      const z = parseInt(style.zIndex || '0', 10);
+      if (
+        (style.position === 'fixed' || style.position === 'absolute') &&
+        z > 50 &&
+        !el.querySelector('video, iframe')
+      ) {
+        el.style.pointerEvents = 'none';
+        el.style.opacity = '0';
+        fixedCount++;
+      }
+    }
+
+    // 4. Highlight primary video or player iframe so user can see what was unlocked
+    const targetMedia =
+      findPrimaryVideo() ||
+      iframes.find((f) => {
+        const r = f.getBoundingClientRect();
+        return r.width >= 240 && r.height >= 140;
+      });
+    if (targetMedia) {
+      targetMedia.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const prevOutline = targetMedia.style.outline;
+      targetMedia.style.outline = '3px solid #34d399';
+      setTimeout(() => {
+        targetMedia.style.outline = prevOutline;
+      }, 2000);
+    }
+
+    updateYouTubeWidgetState();
+    livePageContext = collectPageContext();
+    showToast(`✓ Inspected DOM & unlocked ${fixedCount || 1} media/page element(s)`);
   }
 
   function executeDomVoiceAction(domAction?: {
@@ -370,7 +664,11 @@
   }) {
     if (!domAction) return;
 
-    if (domAction.type === 'scroll') {
+    if (domAction.type === 'fix_page') {
+      fixAndInspectPageDom();
+    } else if (domAction.type === 'toggle_pip') {
+      ytToggleNativePip();
+    } else if (domAction.type === 'scroll') {
       const amount = Math.round(window.innerHeight * 0.72);
       if (domAction.direction === 'down') {
         window.scrollBy({ top: amount, behavior: 'smooth' });
@@ -436,7 +734,7 @@
         input.dispatchEvent(new Event('change', { bubbles: true }));
       }
     } else if (domAction.type === 'antigravity') {
-      sendToAntigravity(domAction.taskPrompt || '', '');
+      openAgentSidebar('antigravity', domAction.taskPrompt || '', '', true);
     }
   }
 
@@ -570,6 +868,222 @@
     }
   }
 
+  // 6. Media sidebar widget state
+  let isYouTubeOrVideoPage = $state(false);
+  let videoCaptionTranslation = $state('');
+  let videoCaptionTranslating = $state(false);
+  let ytSideWidgetExpanded = $state(true);
+  let ytTitle = $state('');
+  let ytChannel = $state('');
+  let ytThumbnail = $state('');
+  let ytPlaying = $state(false);
+  let ytMuted = $state(false);
+  let ytCurrentTime = $state(0);
+  let ytDuration = $state(0);
+  let ytSpeed = $state(1);
+  let ytLoopStart = $state<number | null>(null);
+  let ytLoopEnd = $state<number | null>(null);
+  let ytPipActive = $state(false);
+  let ytDesktopPipActive = $state(false);
+  let ytCaptionLine = $state('');
+  let ytSearchQuery = $state('');
+  let activeVideoEl: HTMLVideoElement | null = null;
+  let desktopStreamInstance: DesktopVideoStream | null = null;
+
+  function formatMediaTime(sec: number): string {
+    if (!Number.isFinite(sec) || sec < 0) return '0:00';
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  function findPrimaryVideo(): HTMLVideoElement | null {
+    const videos = Array.from(document.querySelectorAll('video')).filter(
+      (v) => v.getBoundingClientRect().width >= 120 || v.readyState > 0
+    );
+    return (
+      videos.sort(
+        (a, b) =>
+          b.getBoundingClientRect().width * b.getBoundingClientRect().height -
+          a.getBoundingClientRect().width * a.getBoundingClientRect().height
+      )[0] || null
+    );
+  }
+
+  async function translateVideoCaption(line: string) {
+    const clean = line.trim();
+    if (!clean) return;
+    videoCaptionTranslating = true;
+    try {
+      const res = await requestArc({
+        type: 'TRANSLATE_SELECTION',
+        text: clean,
+        targetLang: settings.targetLanguage || 'en'
+      });
+      videoCaptionTranslating = false;
+      if (res.ok) {
+        videoCaptionTranslation = res.result.translatedText;
+      }
+    } catch {
+      videoCaptionTranslating = false;
+    }
+  }
+
+  function updateYouTubeWidgetState() {
+    if (currentPageUrl !== window.location.href) {
+      currentPageUrl = window.location.href;
+    }
+    const host = window.location.hostname.toLowerCase();
+    const isYt = host.includes('youtube.com') || host.includes('youtu.be');
+    const vid = findPrimaryVideo();
+
+    if (activeVideoEl !== vid) {
+      activeVideoEl = vid;
+      ytLoopStart = null;
+      ytLoopEnd = null;
+      if (desktopStreamInstance?.active) {
+        desktopStreamInstance.stop();
+      }
+      desktopStreamInstance = null;
+      ytCaptionLine = '';
+    }
+
+    isYouTubeOrVideoPage = isYt || Boolean(vid);
+    if (!isYouTubeOrVideoPage) return;
+
+    if (isYt) {
+      const h1 =
+        document.querySelector<HTMLElement>('h1.ytd-watch-metadata yt-formatted-string') ||
+        document.querySelector<HTMLElement>('ytd-watch-metadata h1');
+      const ch =
+        document.querySelector<HTMLElement>('#owner #channel-name a') ||
+        document.querySelector<HTMLElement>('ytd-channel-name a');
+      ytTitle =
+        h1?.innerText?.trim() ||
+        document.title.replace(/^\(\d+\)\s*/, '').replace(/\s*-\s*YouTube$/i, '') ||
+        'YouTube';
+      ytChannel = ch?.innerText?.trim() || '';
+      const vidId = new URLSearchParams(window.location.search).get('v');
+      ytThumbnail = vidId ? `https://i.ytimg.com/vi/${vidId}/mqdefault.jpg` : '';
+    } else {
+      ytTitle = document.title || formatCleanHost(window.location.href);
+      ytChannel = formatCleanHost(window.location.href);
+      ytThumbnail = '';
+    }
+
+    if (vid) {
+      ytPlaying = !vid.paused && !vid.ended;
+      ytMuted = vid.muted;
+      ytCurrentTime = vid.currentTime || 0;
+      const newDur = Number.isFinite(vid.duration) ? vid.duration : 0;
+      ytDuration = newDur;
+      ytSpeed = vid.playbackRate || 1;
+      ytPipActive = document.pictureInPictureElement === vid;
+      ytDesktopPipActive = Boolean(desktopStreamInstance?.active);
+
+      if (
+        ytLoopStart !== null &&
+        ytLoopEnd !== null &&
+        (vid.currentTime >= ytLoopEnd || vid.currentTime < ytLoopStart - 0.5)
+      ) {
+        vid.currentTime = ytLoopStart;
+      }
+
+      ytCaptionLine = Array.from(document.querySelectorAll('.ytp-caption-segment'))
+        .map(node => node.textContent || '').join(' ').trim();
+    } else {
+      ytPlaying = false;
+      ytCurrentTime = 0;
+      ytDuration = 0;
+      ytPipActive = false;
+    }
+  }
+
+  function ytTogglePlay() {
+    const vid = findPrimaryVideo();
+    if (!vid) return;
+    if (vid.paused) vid.play().catch(() => {});
+    else vid.pause();
+    updateYouTubeWidgetState();
+  }
+
+  function ytSeekRelative(deltaSec: number) {
+    const vid = findPrimaryVideo();
+    if (!vid) return;
+    vid.currentTime = Math.max(0, Math.min(vid.duration || Infinity, vid.currentTime + deltaSec));
+    updateYouTubeWidgetState();
+  }
+
+  function ytSetSpeed(rate: number) {
+    const vid = findPrimaryVideo();
+    if (!vid) return;
+    vid.playbackRate = rate;
+    ytSpeed = rate;
+  }
+
+  function ytToggleLoop5s() {
+    const vid = findPrimaryVideo();
+    if (!vid) return;
+    if (ytLoopStart !== null) {
+      ytLoopStart = null;
+      ytLoopEnd = null;
+    } else {
+      ytLoopEnd = Math.max(1, vid.currentTime);
+      ytLoopStart = Math.max(0, ytLoopEnd - 5);
+      vid.currentTime = ytLoopStart;
+      if (vid.paused) vid.play().catch(() => {});
+    }
+  }
+
+  async function ytToggleNativePip() {
+    const vid = findPrimaryVideo();
+    if (!vid) return;
+    try {
+      if (document.pictureInPictureElement === vid) {
+        await document.exitPictureInPicture();
+      } else {
+        await vid.requestPictureInPicture();
+      }
+      updateYouTubeWidgetState();
+    } catch {
+      showToast('Click on the video once first to enable Picture-in-Picture.');
+    }
+  }
+
+  async function ytToggleDesktopPip() {
+    const vid = findPrimaryVideo();
+    if (!vid) return;
+    if (!desktopStreamInstance) {
+      desktopStreamInstance = new DesktopVideoStream(
+        vid,
+        () => updateYouTubeWidgetState(),
+        (msg) => showToast(msg)
+      );
+    }
+    try {
+      if (desktopStreamInstance.active) {
+        desktopStreamInstance.stop();
+      } else {
+        await desktopStreamInstance.start();
+      }
+      updateYouTubeWidgetState();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Could not start Desktop PiP');
+    }
+  }
+
+  function ytOpenTimestampNoteInChatGpt() {
+    const stamp = formatMediaTime(ytCurrentTime);
+    const prompt = [
+      `Help me understand or summarize this YouTube video at ${stamp}:`,
+      `Video: "${ytTitle}" (${window.location.href})`,
+      ytCaptionLine ? `Current Subtitle at ${stamp}: "${ytCaptionLine}"` : ''
+    ]
+      .filter(Boolean)
+      .join('\n');
+    sendToChatGPT(prompt, '', true);
+  }
+
   async function syncSnapshot() {
     try {
       const res = await chrome.runtime.sendMessage({ type: 'GET_SNAPSHOT' });
@@ -588,26 +1102,30 @@
       clearTimeout(hideTimeout);
       hideTimeout = null;
     }
-    if (settings.leftSidebarMode === 'hover') {
-      leftSidebarHoverOpen = true;
-      syncSnapshot();
+    if (settings.leftSidebarMode !== 'pinned') {
+      if (!leftSidebarHoverOpen) {
+        leftSidebarHoverOpen = true;
+        syncSnapshot();
+      }
     }
   }
 
   function handleLeftSidebarLeave() {
     if (isDraggingSidebar || isResizingSidebar || activeDrag) return;
-    if (settings.leftSidebarMode === 'hover') {
+    if (settings.leftSidebarMode !== 'pinned') {
       if (hideTimeout) clearTimeout(hideTimeout);
       hideTimeout = setTimeout(() => {
         if (!isDraggingSidebar && !isResizingSidebar && !activeDrag) {
           leftSidebarHoverOpen = false;
         }
-      }, 220);
+      }, 240);
     }
   }
 
   async function togglePinLeftSidebar() {
-    const nextMode = settings.leftSidebarMode === 'off' ? 'pinned' : 'off';
+    const isCurrentlyPinned = settings.leftSidebarMode === 'pinned';
+    const nextMode = isCurrentlyPinned ? 'hover' : 'pinned';
+    leftSidebarHoverOpen = !isCurrentlyPinned;
     const res = await chrome.runtime.sendMessage({
       type: 'UPDATE_SETTINGS',
       settings: { leftSidebarMode: nextMode }
@@ -616,10 +1134,17 @@
       arcState = res.state;
       tabs = res.tabs || [];
     }
+    if (nextMode === 'hover') {
+      showToast('◧ Sidebar minified — move cursor to the leftmost edge to slide out like macOS');
+    } else {
+      showToast('📌 Sidebar pinned open');
+    }
   }
 
   onMount(() => {
     syncSnapshot();
+    updateYouTubeWidgetState();
+    const ytInterval = setInterval(updateYouTubeWidgetState, 400);
 
     const msgListener = (
       msg: {
@@ -633,11 +1158,7 @@
       _sender: chrome.runtime.MessageSender,
       sendResponse: (response?: unknown) => void
     ) => {
-      if (msg?.type === 'OPEN_COMMAND_BAR_FROM_CMDT') {
-        openCommandBar('new-tab');
-        sendResponse({ ok: true });
-        return;
-      } else if (msg?.type === 'TRIGGER_ANTIGRAVITY_HANDOFF') {
+      if (msg?.type === 'TRIGGER_ANTIGRAVITY_HANDOFF') {
         sendToAntigravity(msg.customPrompt || '', msg.selectionText || '');
         sendResponse({ ok: true });
         return;
@@ -650,8 +1171,7 @@
         sendResponse({ ok: true });
         return;
       } else if (msg?.type === 'SHOW_PEEK_OVERLAY' && msg.url) {
-        openPeek(msg.url);
-        sendResponse({ ok: true });
+        sendResponse({ ok: openPeek(msg.url) });
         return;
       } else if (msg?.type === 'SHOW_TRANSLATION_POPOVER' && msg.text) {
         selectionText = msg.text;
@@ -774,8 +1294,7 @@
 
       const target = e.target as HTMLElement | null;
       const anchor = target?.closest?.('a[href]') as HTMLAnchorElement | null;
-      if (!anchor || !anchor.href) return;
-      if (anchor.href.startsWith('javascript:') || anchor.href.startsWith('#')) return;
+      if (!anchor || !canPreviewInPeek(anchor.href)) return;
 
       e.preventDefault();
       e.stopPropagation();
@@ -845,17 +1364,36 @@
       }
     };
 
+    // macOS Leftmost-Edge Auto-Show / Auto-Hide Sensor
+    const handleMouseMove = (e: MouseEvent) => {
+      if (settings.leftSidebarMode === 'pinned') return;
+      if (e.clientX <= 14) {
+        handleLeftEdgeEnter();
+      } else if (leftSidebarHoverOpen && e.clientX > sidebarX + sidebarWidth + 32) {
+        handleLeftSidebarLeave();
+      } else if (leftSidebarHoverOpen && e.clientX <= sidebarX + sidebarWidth + 12) {
+        if (hideTimeout) {
+          clearTimeout(hideTimeout);
+          hideTimeout = null;
+        }
+      }
+    };
+
     window.addEventListener('keydown', handleKeydown, true);
     window.addEventListener('click', handleClickCapture, true);
     window.addEventListener('mouseup', handleMouseUp);
     window.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mousemove', handleMouseMove, { passive: true });
 
     return () => {
-      chrome.runtime.onMessage.removeListener(msgListener);
+      clearInterval(ytInterval);
       window.removeEventListener('keydown', handleKeydown, true);
       window.removeEventListener('click', handleClickCapture, true);
       window.removeEventListener('mouseup', handleMouseUp);
       window.removeEventListener('mousedown', handleMouseDown);
+      window.removeEventListener('mousemove', handleMouseMove);
+      if (desktopStreamInstance?.active) desktopStreamInstance.stop();
+      if (chrome.runtime?.id) chrome.runtime.onMessage.removeListener(msgListener);
     };
   });
 
@@ -870,8 +1408,13 @@
     }
   }
 
+  async function openNewTab() {
+    try { await requestArc({ type: 'OPEN_FOCUSED_NEW_TAB' }); }
+    catch { showToast('Could not open a new tab. Refresh this page and try again.'); }
+  }
+
   async function openCommandBar(
-    mode: 'default' | 'new-tab' | 'little-arc' = 'default',
+    mode: 'default' | 'little-arc' = 'default',
     prefillCurrentUrl = false
   ) {
     commandMode = mode;
@@ -893,15 +1436,7 @@
         actionId: item.actionId
       });
     } else if (item.url) {
-      if (usePeek) {
-        openPeek(item.url);
-      } else if (commandMode === 'new-tab' && item.kind === 'search') {
-        await requestArc({
-          type: 'CREATE_TAB',
-          url: item.url,
-          spaceId: item.spaceId || activeSpace?.id
-        });
-      } else {
+      if (!usePeek || !openPeek(item.url)) {
         await requestArc({
           type: 'OPEN_OR_SWITCH_URL',
           url: item.url,
@@ -913,17 +1448,51 @@
   }
 
   async function openSidebarUrl(url: string, event?: MouseEvent) {
+    if (!url) return;
     try {
-      if (event && shouldPeek(event, settings)) {
+      if (event && shouldPeek(event, settings) && canPreviewInPeek(url)) {
         if (settings.peekMode === 'popup') await requestArc({ type: 'OPEN_LITTLE_ARC', url });
         else openPeek(url);
-      } else await requestArc({ type: 'OPEN_OR_SWITCH_URL', url, spaceId: activeSpace.id });
-    } catch { showToast('Could not open this page. Try again.'); }
+        return;
+      }
+      if (event && (event.metaKey || event.ctrlKey)) {
+        await requestArc({ type: 'CREATE_TAB', url, spaceId: activeSpace?.id, active: true });
+        return;
+      }
+      await requestArc({ type: 'OPEN_OR_SWITCH_URL', url, spaceId: activeSpace?.id });
+    } catch {
+      // Fallback direct navigation if extension service worker was reloaded
+      if (!canPreviewInPeek(url)) {
+        showToast('Open this page from Chrome’s address bar.');
+        return;
+      }
+      if (event && (event.metaKey || event.ctrlKey)) {
+        window.open(url, '_blank');
+      } else {
+        window.location.href = url;
+      }
+    }
+  }
+
+  async function switchToSidebarTab(tab: TabInfo, event?: MouseEvent) {
+    try {
+      await requestArc({ type: 'SWITCH_TAB', tabId: tab.id });
+    } catch {
+      if (tab.url && canPreviewInPeek(tab.url)) {
+        if (event && (event.metaKey || event.ctrlKey)) {
+          window.open(tab.url, '_blank');
+        } else {
+          window.location.href = tab.url;
+        }
+      }
+    }
   }
 
   function openPeek(url: string) {
+    if (!canPreviewInPeek(url)) return false;
     peekUrl = url;
     peekCopied = false;
+    return true;
   }
 
   function expandPeekToFullTab() {
@@ -1040,12 +1609,160 @@
       transition: none !important;
     }
 
-    .arc-ls-dragbar {
+    /* macOS Leftmost-Edge Auto-Show Sensor & Top-Left Minified Pill */
+    .arc-left-edge-sensor {
+      position: fixed;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 14px;
+      z-index: 2147483643;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+    }
+
+    .arc-left-edge-bar {
+      width: 4px;
+      height: 96px;
+      border-radius: 0 999px 999px 0;
+      background: rgba(167, 139, 250, 0.25);
+      transition: all 0.16s ease;
+    }
+
+    .arc-left-edge-sensor:hover .arc-left-edge-bar {
+      width: 6px;
+      height: 140px;
+      background: #a78bfa;
+      box-shadow: 0 0 14px rgba(167, 139, 250, 0.85);
+    }
+
+    .arc-macos-minified-pill {
+      position: fixed;
+      top: 10px;
+      left: 8px;
+      z-index: 2147483644;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 10px;
+      background: rgba(20, 18, 38, 0.88);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      backdrop-filter: blur(14px);
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
+      transition: all 0.15s ease;
+    }
+
+    .arc-macos-minified-pill:hover {
+      background: rgba(139, 124, 248, 0.35);
+      border-color: rgba(167, 139, 250, 0.65);
+      transform: translateX(2px);
+    }
+
+    /* macOS / Arc Top-Left Sidebar Bar */
+    .arc-macos-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      margin-bottom: 6px;
+      padding: 2px 0;
+    }
+
+    .arc-macos-left-controls {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .arc-macos-sidebar-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      background: rgba(255, 255, 255, 0.12);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.12s ease;
+    }
+
+    .arc-macos-sidebar-btn:hover {
+      background: rgba(255, 255, 255, 0.24);
+      border-color: rgba(255, 255, 255, 0.38);
+    }
+
+    .arc-macos-sidebar-btn.auto-mode {
+      background: rgba(52, 211, 153, 0.22);
+      border-color: rgba(52, 211, 153, 0.55);
+      color: #6ee7b7;
+    }
+
+    .arc-macos-nav-btn {
+      width: 24px;
+      height: 24px;
+      border-radius: 7px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.88);
+      font-size: 12px;
+      cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
-      height: 16px;
-      margin: -2px -4px 4px;
+      transition: background 0.12s ease;
+    }
+
+    .arc-macos-nav-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+      color: #fff;
+    }
+
+    .arc-top-places-hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 2px;
+      margin-top: 2px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.65);
+    }
+
+    .arc-top-places-add-btn {
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      color: rgba(255, 255, 255, 0.9);
+      border-radius: 6px;
+      padding: 2px 7px;
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.12s ease;
+    }
+
+    .arc-top-places-add-btn:hover {
+      background: rgba(255, 255, 255, 0.22);
+      color: #fff;
+    }
+
+    .arc-ls-dragbar {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 20px;
       cursor: grab;
       border-radius: 8px;
       transition: background 0.12s ease;
@@ -1154,20 +1871,41 @@
 
     .arc-ls-fav {
       position: relative;
-      height: 40px;
-      border-radius: 10px;
+      height: 42px;
+      border-radius: 11px;
       background: rgba(255, 255, 255, 0.09);
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.14);
       display: flex;
       align-items: center;
       justify-content: center;
       cursor: pointer;
-      transition: background 0.12s ease, transform 0.12s ease;
+      transition: all 0.14s ease;
     }
 
-    .arc-ls-fav.active { background: #ffffff23; box-shadow: inset 0 0 0 1px #ffffff30; }
+    .arc-ls-fav.active {
+      background: linear-gradient(145deg, rgba(167, 139, 250, 0.38) 0%, rgba(255, 255, 255, 0.24) 100%);
+      border-color: rgba(196, 181, 253, 0.9);
+      box-shadow:
+        0 4px 14px rgba(139, 124, 248, 0.35),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+    }
+
+    .arc-ls-fav.active::after {
+      content: '';
+      position: absolute;
+      bottom: 3px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 14px;
+      height: 3px;
+      border-radius: 999px;
+      background: #c4b5fd;
+      box-shadow: 0 0 6px #a78bfa;
+    }
+
     .arc-ls-fav:hover {
-      background: rgba(255, 255, 255, 0.18);
+      background: rgba(255, 255, 255, 0.22);
+      border-color: rgba(255, 255, 255, 0.38);
       transform: translateY(-1px);
     }
 
@@ -1175,6 +1913,7 @@
       width: 20px;
       height: 20px;
       border-radius: 4px;
+      pointer-events: none;
     }
 
     .arc-ls-fav-remove {
@@ -1263,6 +2002,141 @@
       color: #0e0e18;
     }
 
+    /* YouTube & Media Sidebar Companion Widget */
+    .arc-yt-widget {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      padding: 9px 10px;
+      border-radius: 12px;
+      background: linear-gradient(155deg, rgba(42, 16, 26, 0.72) 0%, rgba(16, 15, 28, 0.85) 100%);
+      border: 1px solid rgba(251, 113, 133, 0.35);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
+
+    .arc-yt-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .arc-yt-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #fda4af;
+    }
+
+    .arc-yt-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #ef4444;
+      box-shadow: 0 0 8px #ef4444;
+    }
+
+    .arc-yt-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .arc-yt-thumb {
+      width: 56px;
+      height: 34px;
+      border-radius: 6px;
+      object-fit: cover;
+      flex-shrink: 0;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+    }
+
+    .arc-yt-titles {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .arc-yt-title {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .arc-yt-sub {
+      font-size: 10.5px;
+      color: rgba(255, 255, 255, 0.65);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .arc-yt-progress-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.72);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .arc-yt-scrubber {
+      flex: 1;
+      height: 4px;
+      accent-color: #fb7185;
+      cursor: pointer;
+    }
+
+    .arc-yt-controls {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 4px;
+    }
+
+    .arc-yt-btn {
+      padding: 5px 4px;
+      border-radius: 7px;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      background: rgba(255, 255, 255, 0.09);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      transition: background 0.12s ease;
+    }
+
+    .arc-yt-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    .arc-yt-btn.active {
+      background: rgba(244, 63, 94, 0.38);
+      border-color: #fb7185;
+      color: #fff;
+    }
+
+    .arc-yt-caption {
+      font-size: 11px;
+      color: #e9d5ff;
+      background: rgba(15, 12, 28, 0.6);
+      border: 1px solid rgba(192, 132, 252, 0.25);
+      border-radius: 7px;
+      padding: 5px 7px;
+      line-height: 1.35;
+      max-height: 44px;
+      overflow: hidden;
+    }
+
     .arc-ls-scroll {
       min-height: 0;
       overscroll-behavior: contain;
@@ -1307,13 +2181,16 @@
     }
 
     .arc-ls-row:hover {
-      background: rgba(255, 255, 255, 0.11);
+      background: rgba(255, 255, 255, 0.16);
+      color: #fff;
     }
 
     .arc-ls-row.active {
-      background: rgba(255, 255, 255, 0.22);
+      background: linear-gradient(90deg, rgba(167, 139, 250, 0.36) 0%, rgba(255, 255, 255, 0.2) 100%);
+      border: 1px solid rgba(196, 181, 253, 0.55);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
       color: #fff;
-      font-weight: 600;
+      font-weight: 700;
     }
 
     .arc-ls-row img {
@@ -1321,6 +2198,7 @@
       height: 15px;
       border-radius: 3px;
       flex-shrink: 0;
+      pointer-events: none;
     }
 
     .arc-ls-row-title {
@@ -1900,47 +2778,376 @@
         transform: translateY(0) scale(1);
       }
     }
+
+    /* Full-Height ChatGPT & Antigravity Browser Agent Sidebar */
+    .arc-agent-sidebar {
+      position: fixed;
+      z-index: 2147483645;
+      display: flex;
+      flex-direction: column;
+      border-radius: 16px;
+      background: linear-gradient(165deg, rgba(20, 18, 38, 0.97) 0%, rgba(11, 10, 22, 0.98) 100%);
+      border: 1px solid rgba(167, 139, 250, 0.35);
+      box-shadow:
+        0 20px 55px rgba(0, 0, 0, 0.65),
+        inset 0 1px 0 rgba(255, 255, 255, 0.14);
+      backdrop-filter: blur(22px);
+      color: #fff;
+      overflow: hidden;
+      animation: arcFadeIn 0.16s ease-out;
+    }
+
+    .arc-agent-sidebar.mode-antigravity {
+      border-color: rgba(244, 114, 182, 0.42);
+      background: linear-gradient(165deg, rgba(28, 16, 42, 0.97) 0%, rgba(12, 10, 24, 0.98) 100%);
+    }
+
+    .arc-agent-hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 10px 12px 8px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .arc-agent-tabs {
+      display: flex;
+      gap: 4px;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 3px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .arc-agent-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 10px;
+      border-radius: 7px;
+      border: none;
+      background: transparent;
+      color: rgba(255, 255, 255, 0.68);
+      font-size: 11.5px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.12s ease;
+    }
+
+    .arc-agent-tab.active.gpt {
+      background: linear-gradient(135deg, #10b981, #059669);
+      color: #06130e;
+      box-shadow: 0 2px 10px rgba(16, 185, 129, 0.35);
+    }
+
+    .arc-agent-tab.active.agy {
+      background: linear-gradient(135deg, #a78bfa, #f472b6);
+      color: #12091c;
+      box-shadow: 0 2px 10px rgba(244, 114, 182, 0.35);
+    }
+
+    .arc-agent-hdr-actions {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .arc-agent-iconbtn {
+      width: 25px;
+      height: 25px;
+      border-radius: 7px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: rgba(255, 255, 255, 0.07);
+      color: rgba(255, 255, 255, 0.85);
+      font-size: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .arc-agent-iconbtn:hover {
+      background: rgba(255, 255, 255, 0.18);
+      color: #fff;
+    }
+
+    .arc-agent-ctx-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.04);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+    }
+
+    .arc-agent-ctx-status {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.82);
+    }
+
+    .arc-agent-live-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #34d399;
+      box-shadow: 0 0 8px #34d399;
+      display: inline-block;
+    }
+
+    .arc-agent-quick-tools {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+
+    .arc-agent-tool-chip {
+      padding: 4px 8px;
+      border-radius: 7px;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.9);
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.12s ease;
+    }
+
+    .arc-agent-tool-chip:hover {
+      background: rgba(167, 139, 250, 0.25);
+      border-color: rgba(167, 139, 250, 0.55);
+      color: #fff;
+    }
+
+    .arc-agent-drawer {
+      max-height: 175px;
+      overflow-y: auto;
+      padding: 8px 12px;
+      background: rgba(8, 7, 16, 0.72);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 11px;
+    }
+
+    .arc-agent-feed {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      overscroll-behavior: contain;
+    }
+
+    .arc-agent-msg {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      max-width: 94%;
+      padding: 9px 11px;
+      border-radius: 12px;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .arc-agent-msg.user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, rgba(139, 124, 248, 0.35), rgba(99, 102, 241, 0.28));
+      border: 1px solid rgba(167, 139, 250, 0.45);
+      color: #fff;
+    }
+
+    .arc-agent-msg.assistant {
+      align-self: flex-start;
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid rgba(255, 255, 255, 0.13);
+      color: rgba(255, 255, 255, 0.94);
+    }
+
+    .arc-agent-msg-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.55);
+      font-weight: 600;
+    }
+
+    .arc-agent-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      align-self: flex-start;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(52, 211, 153, 0.16);
+      border: 1px solid rgba(52, 211, 153, 0.4);
+      color: #6ee7b7;
+      font-size: 10px;
+      font-weight: 700;
+      margin-bottom: 2px;
+    }
+
+    .arc-agent-msg-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 4px;
+      padding-top: 5px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .arc-agent-composer {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(12, 11, 24, 0.9);
+    }
+
+    .arc-agent-input-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 6px;
+    }
+
+    .arc-agent-textarea {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.09);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 10px;
+      padding: 8px 10px;
+      color: #fff;
+      font-size: 12px;
+      font-family: inherit;
+      resize: none;
+      outline: none;
+      min-height: 44px;
+      max-height: 120px;
+    }
+
+    .arc-agent-textarea:focus {
+      border-color: rgba(167, 139, 250, 0.65);
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .arc-agent-send {
+      height: 36px;
+      padding: 0 12px;
+      border-radius: 9px;
+      border: none;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      color: #090d16;
+      background: linear-gradient(135deg, #34d399, #10b981);
+      flex-shrink: 0;
+    }
+
+    .arc-agent-send.agy {
+      background: linear-gradient(135deg, #a78bfa, #f472b6);
+    }
   `;
 </script>
 
 <svelte:element this={'style'}>{OVERLAY_CSS}</svelte:element>
 
-<!-- Persistent Left Arc Sidebar Overlay -->
-{#if settings.leftSidebarMode === 'off'}
-  <button
-    style="
-      position: fixed;
-      top: 12px;
-      left: 10px;
-      z-index: 2147483644;
-      width: 28px;
-      height: 28px;
-      border-radius: 8px;
-      background: rgba(25, 22, 46, 0.85);
-      border: 1px solid rgba(255, 255, 255, 0.22);
-      color: #fff;
-      font-size: 13px;
-      cursor: pointer;
-      backdrop-filter: blur(10px);
-      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
-    "
+<!-- Persistent / macOS Left-Edge Auto-Show Arc Sidebar Overlay -->
+{#if !isLeftSidebarVisible}
+  <!-- macOS Leftmost-Edge Hover Strip: Move cursor to the leftmost edge to slide out sidebar -->
+  <div
+    class="arc-left-edge-sensor"
+    role="button"
+    tabindex="0"
+    onpointerenter={handleLeftEdgeEnter}
     onclick={togglePinLeftSidebar}
-    title="Show Left Arc Sidebar (Alt+S)"
+    onkeydown={(e) => isActivationKey(e) && togglePinLeftSidebar()}
+    title="Move cursor to leftmost edge to slide out Arc Sidebar (Click to Pin Open · Alt+S)"
   >
-    ▸
+    <div class="arc-left-edge-bar"></div>
+  </div>
+
+  <!-- Easy-to-spot Top-Left macOS Sidebar Button when minified -->
+  <button
+    class="arc-macos-minified-pill"
+    onpointerenter={handleLeftEdgeEnter}
+    onclick={togglePinLeftSidebar}
+    title="Open & Pin Left Arc Sidebar (or hover leftmost edge to slide out like macOS · Alt+S)"
+  >
+    <Icon name="sidebar" size={14} />
+    <span>Sidebar</span>
   </button>
-{:else}
-  <aside
-    class="arc-left-sidebar visible {isDraggingSidebar || isResizingSidebar ? 'no-transition' : ''}"
-    style="
-      background: {currentTheme.gradient};
-      left: {sidebarX}px;
-      top: {sidebarY}px;
-      width: {sidebarWidth}px;
-      {sidebarHeight ? `height: ${sidebarHeight}px;` : `bottom: 8px;`}
-    "
-  >
-    <!-- Top Drag Handle: Drag to move sidebar anywhere, double-click to snap back to left -->
+{/if}
+
+<aside
+  class="arc-left-sidebar {isLeftSidebarVisible ? 'visible' : ''} {isDraggingSidebar || isResizingSidebar ? 'no-transition' : ''}"
+  style="
+    background: {currentTheme.gradient};
+    left: {sidebarX}px;
+    top: {sidebarY}px;
+    width: {sidebarWidth}px;
+    {sidebarHeight ? `height: ${sidebarHeight}px;` : `bottom: 8px;`}
+  "
+  onpointerenter={() => {
+    if (hideTimeout) {
+      clearTimeout(hideTimeout);
+      hideTimeout = null;
+    }
+  }}
+  onpointerleave={handleLeftSidebarLeave}
+>
+  <!-- macOS Top-Left Controls Bar: Prominent Left-Side Minify/Pin Button + Back/Forward/Reload + Drag Grip -->
+  <div class="arc-macos-topbar">
+    <div class="arc-macos-left-controls">
+      <button
+        class="arc-macos-sidebar-btn {settings.leftSidebarMode !== 'pinned' ? 'auto-mode' : ''}"
+        onclick={(e) => {
+          e.stopPropagation();
+          togglePinLeftSidebar();
+        }}
+        title={settings.leftSidebarMode === 'pinned'
+          ? 'Minify Sidebar to Left Edge (Slides out when cursor touches leftmost edge like macOS · Alt+S)'
+          : 'Pin Sidebar Open Permanently (Alt+S)'}
+      >
+        <Icon name="sidebar" size={14} />
+        <span>{settings.leftSidebarMode === 'pinned' ? 'Minify' : '📌 Pin'}</span>
+      </button>
+
+      <button
+        class="arc-macos-nav-btn"
+        onclick={() => window.history.back()}
+        title="Back"
+      >
+        ‹
+      </button>
+      <button
+        class="arc-macos-nav-btn"
+        onclick={() => window.history.forward()}
+        title="Forward"
+      >
+        ›
+      </button>
+      <button
+        class="arc-macos-nav-btn"
+        onclick={() => window.location.reload()}
+        title="Reload Page"
+      >
+        ↻
+      </button>
+    </div>
+
     <div
       class="arc-ls-dragbar"
       role="button"
@@ -1952,68 +3159,76 @@
       <div class="arc-ls-grip"></div>
     </div>
 
-    <!-- Right-edge width resize handle & Bottom-right corner resize handle -->
-    <div
-      class="arc-ls-resize-right"
-      role="presentation"
-      onpointerdown={(e) => startSidebarResize(e, false)}
-      title="Drag to resize sidebar width"
-    ></div>
-    <div
-      class="arc-ls-resize-corner"
-      role="presentation"
-      onpointerdown={(e) => startSidebarResize(e, true)}
-      title="Drag to resize sidebar width & height"
-    ></div>
+    <button
+      class="arc-macos-nav-btn"
+      onclick={(e) => {
+        e.stopPropagation();
+        chrome.runtime.sendMessage({
+          type: 'LAUNCH_BORDERLESS_ARC',
+          url: window.location.href
+        });
+      }}
+      title="Open in Borderless Arc Window (No Chrome top bar · Alt+B)"
+    >
+      <Icon name="window" size={13} />
+    </button>
+  </div>
 
-    <div class="arc-ls-top">
-      <!-- URL / Command Bar Trigger -->
-      <div
-        class="arc-ls-urlbar"
-        role="button"
-        tabindex="0"
-        onclick={() => openCommandBar('default', true)}
-        onkeydown={(e) => isActivationKey(e) && openCommandBar('default', true)}
-        title="Click to edit URL or press Cmd+K to open Arc Command Bar"
+  <!-- Right-edge width resize handle & Bottom-right corner resize handle -->
+  <div
+    class="arc-ls-resize-right"
+    role="presentation"
+    onpointerdown={(e) => startSidebarResize(e, false)}
+    title="Drag to resize sidebar width"
+  ></div>
+  <div
+    class="arc-ls-resize-corner"
+    role="presentation"
+    onpointerdown={(e) => startSidebarResize(e, true)}
+    title="Drag to resize sidebar width & height"
+  ></div>
+
+  <div class="arc-ls-top">
+    <!-- URL / Command Bar Trigger -->
+    <div
+      class="arc-ls-urlbar"
+      role="button"
+      tabindex="0"
+      onclick={() => openCommandBar('default', true)}
+      onkeydown={(e) => isActivationKey(e) && openCommandBar('default', true)}
+      title="Click to edit URL or press Cmd+K to open Arc Command Bar"
+    >
+      <span style="opacity: .65"><Icon name="search" size={15} /></span>
+      <span class="arc-ls-urltext">{formatCleanHost(window.location.href)}</span>
+      <button
+        class="arc-ls-iconbtn"
+        onclick={(e) => {
+          e.stopPropagation();
+          navigator.clipboard.writeText(window.location.href);
+          copiedCurrentUrl = true;
+          setTimeout(() => (copiedCurrentUrl = false), 1400);
+        }}
+        title="Copy current URL"
       >
-        <span style="opacity: .65"><Icon name="search" size={15} /></span>
-        <span class="arc-ls-urltext">{formatCleanHost(window.location.href)}</span>
-        <button
-          class="arc-ls-iconbtn"
-          onclick={(e) => {
-            e.stopPropagation();
-            navigator.clipboard.writeText(window.location.href);
-            copiedCurrentUrl = true;
-            setTimeout(() => (copiedCurrentUrl = false), 1400);
-          }}
-          title="Copy current URL"
-        >
-          <Icon name={copiedCurrentUrl ? 'check' : 'link'} size={14} />
-        </button>
-        <button
-          class="arc-ls-iconbtn"
-          onclick={(e) => {
-            e.stopPropagation();
-            chrome.runtime.sendMessage({
-              type: 'LAUNCH_BORDERLESS_ARC',
-              url: window.location.href
-            });
-          }}
-          title="Open in Borderless Arc Window (No Chrome top bar · Alt+B)"
-        >
-          <Icon name="window" size={14} />
-        </button>
-        <button
-          class="arc-ls-iconbtn"
-          onclick={(e) => {
-            e.stopPropagation();
-            togglePinLeftSidebar();
-          }}
-          title="Collapse Left Sidebar (Alt+S)"
-        >
-          <Icon name="sidebar" size={14} />
-        </button>
-      </div>
+        <Icon name={copiedCurrentUrl ? 'check' : 'link'} size={14} />
+      </button>
+    </div>
+
+    <!-- Top Places Header + Grid (Per-Space Top Places like Arc on macOS) -->
+    <div class="arc-top-places-hdr">
+      <span>{activeSpace?.icon} {activeSpace?.name} · Top Places</span>
+      <button
+        class="arc-top-places-add-btn"
+        onclick={() => {
+          showAddFavForm = !showAddFavForm;
+          showAddPinForm = false;
+          showAddFolderForm = false;
+        }}
+        title="Add current page or custom URL to {activeSpace?.name} Top Places"
+      >
+        {showAddFavForm ? 'Close' : '+ Add Place'}
+      </button>
+    </div>
 
       <!-- Space-Specific Top Pins / Favorites Grid (Supports Drag & Drop, Remove, and Custom Pin Creation!) -->
       <div
@@ -2054,16 +3269,24 @@
       >
         {#each spaceFavorites as fav, favIdx (fav.id)}
           <div
-            class="arc-ls-fav" class:active={urlKey(fav.url) === urlKey(window.location.href)}
+            class="arc-ls-fav"
+            class:active={isUrlActive(fav.url, currentPageUrl)}
             role="button"
             tabindex="0"
             draggable="true"
+            onpointerdown={(e) => {
+              pointerDownCoords = { x: e.clientX, y: e.clientY };
+            }}
             ondragstart={() => {
               activeDrag = { kind: 'fav', index: favIdx };
             }}
-            ondragend={() => {
+            ondragend={(e) => {
+              const dist = Math.hypot(e.clientX - pointerDownCoords.x, e.clientY - pointerDownCoords.y);
               activeDrag = null;
               dropTargetHighlight = null;
+              if (dist < 10) {
+                openSidebarUrl(fav.url, e);
+              }
             }}
             ondragover={(e) => e.preventDefault()}
             ondrop={async (e) => {
@@ -2082,7 +3305,7 @@
             }}
             onclick={(event) => openSidebarUrl(fav.url, event)}
             onkeydown={(event) => { if (isActivationKey(event)) openSidebarUrl(fav.url); }}
-            title="{fav.title} ({fav.url}) · Drag to reorder"
+            title="{fav.title} ({fav.url}) · Click to open · Drag to reorder"
           >
             {#if getFaviconUrl(fav.url, fav.favIconUrl)}
               <img src={getFaviconUrl(fav.url, fav.favIconUrl)} alt={fav.title} draggable="false" />
@@ -2178,7 +3401,6 @@
         </div>
       {/if}
 
-      <!-- Day-to-Day Voice, ChatGPT & Antigravity Quick Strip -->
       <div class="arc-ai-strip">
         <button
           class="arc-ai-btn {isVoiceListening ? 'listening' : ''}"
@@ -2190,108 +3412,196 @@
         </button>
 
         <button
-          class="arc-ai-btn"
+          class="arc-ai-btn {showAgentSidebar && agentSidebarMode === 'chatgpt' ? 'listening' : ''}"
           onclick={(e) => {
-            if (e.shiftKey || e.altKey) {
-              sendToChatGPT('', '', true);
+            if (e.shiftKey) {
+              launchExternalChatGPT('', '', true);
+            } else if (showAgentSidebar && agentSidebarMode === 'chatgpt') {
+              showAgentSidebar = false;
             } else {
-              showAiBox = !showAiBox;
+              openAgentSidebar('chatgpt');
             }
           }}
-          title="Ask ChatGPT (Shift+Click to pop out ChatGPT with current page · Alt+G)"
+          title="Open ChatGPT Browser Agent Sidebar with live page & DOM access (Alt+G · Shift+Click for ChatGPT Web)"
         >
           <span>🤖</span>
           <span>ChatGPT</span>
         </button>
 
         <button
-          class="arc-ai-btn"
+          class="arc-ai-btn {showAgentSidebar && agentSidebarMode === 'antigravity' ? 'listening' : ''}"
           onclick={(e) => {
-            if (e.shiftKey || e.altKey) {
-              sendToAntigravity('', '');
+            if (e.shiftKey) {
+              launchExternalAntigravity('', '');
+            } else if (showAgentSidebar && agentSidebarMode === 'antigravity') {
+              showAgentSidebar = false;
             } else {
-              showAiBox = !showAiBox;
+              openAgentSidebar('antigravity');
             }
           }}
-          title="Send to Antigravity (Shift+Click to immediately launch Antigravity with page context · Alt+A)"
+          title="Open Antigravity Browser Agent Sidebar with live page & DOM access (Alt+A · Shift+Click for Antigravity IDE)"
         >
           <span>🚀</span>
           <span>Antigravity</span>
         </button>
       </div>
-
-      {#if showAiBox}
-        <div class="arc-ai-box">
-          <textarea
-            class="arc-ai-textarea"
-            rows="2"
-            placeholder="Ask a question or describe a coding task..."
-            bind:value={aiPromptText}
-            onkeydown={(e) => {
-              e.stopPropagation();
-              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                sendToChatGPT(aiPromptText, '', true);
-              } else if (e.shiftKey && e.key === 'Enter') {
-                e.preventDefault();
-                sendToAntigravity(aiPromptText, '');
-              }
-            }}
-          ></textarea>
-          <label class="arc-ai-ctx-toggle">
-            <input type="checkbox" bind:checked={includePageContext} />
-            <span>Attach current page URL & highlighted text</span>
-          </label>
-          <div class="arc-ai-actions">
-            <button
-              class="arc-ai-submit"
-              onclick={() => sendToChatGPT(aiPromptText, '', true)}
-              title="Open ChatGPT in Little Arc with this prompt (⌘+Enter)"
-            >
-              🤖 Ask ChatGPT
-            </button>
-            <button
-              class="arc-ai-submit agy"
-              onclick={() => sendToAntigravity(aiPromptText, '')}
-              title="Copy task + context & launch Antigravity.app (Shift+Enter)"
-            >
-              🚀 Antigravity
-            </button>
-          </div>
-          <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 2px;">
-            <button
-              style="background: none; border: none; color: rgba(255,255,255,0.65); font-size: 10.5px; cursor: pointer; text-decoration: underline;"
-              onclick={() => {
-                showApiKeyConfig = !showApiKeyConfig;
-                apiKeyInput = settings.openaiApiKey || '';
-              }}
-            >
-              {settings.openaiApiKey ? '🔑 OpenAI Key Configured' : '⚙️ Set OpenAI Key for Direct Voice AI'}
-            </button>
-          </div>
-          {#if showApiKeyConfig}
-            <div style="display: flex; gap: 5px; margin-top: 2px;">
-              <input
-                type="password"
-                placeholder="sk-... (optional for GPT-4o Voice)"
-                bind:value={apiKeyInput}
-                onkeydown={(e) => e.stopPropagation()}
-                style="flex: 1; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; padding: 4px 7px; color: #fff; font-size: 11px;"
-              />
+      {#if isYouTubeOrVideoPage}
+        <div class="arc-yt-widget" role="region" aria-label="Media & Subtitle Studio Companion">
+          <div class="arc-yt-header">
+            <span class="arc-yt-badge">
+              <span class="arc-yt-dot"></span>
+              <span>▶️ YouTube Studio</span>
+            </span>
+            <div style="display: flex; align-items: center; gap: 6px;">
               <button
-                style="background: #8b7cf8; border: none; border-radius: 6px; padding: 4px 8px; color: #fff; font-size: 11px; font-weight: 600; cursor: pointer;"
-                onclick={async () => {
-                  await chrome.runtime.sendMessage({
-                    type: 'UPDATE_SETTINGS',
-                    settings: { openaiApiKey: apiKeyInput.trim() }
-                  });
-                  showApiKeyConfig = false;
-                  showToast('✓ OpenAI API Key saved for Voice Agent');
-                  syncSnapshot();
-                }}
+                style="background: none; border: none; color: rgba(255,255,255,0.65); font-size: 11px; cursor: pointer;"
+                onclick={() => (ytSideWidgetExpanded = !ytSideWidgetExpanded)}
+                title={ytSideWidgetExpanded ? 'Collapse Media Studio' : 'Expand Media Studio'}
               >
-                Save
+                {ytSideWidgetExpanded ? '▾' : '▸'}
               </button>
             </div>
+          </div>
+
+          {#if ytSideWidgetExpanded}
+            <div class="arc-yt-meta">
+              {#if ytThumbnail}
+                <img src={ytThumbnail} alt="" class="arc-yt-thumb" draggable="false" />
+              {/if}
+              <div class="arc-yt-titles">
+                <div class="arc-yt-title" title={ytTitle}>{ytTitle}</div>
+                {#if ytChannel}
+                  <div class="arc-yt-sub">{ytChannel}</div>
+                {/if}
+              </div>
+            </div>
+
+            {#if ytDuration > 0}
+              <div class="arc-yt-progress-row" style="position: relative;">
+                <span>{formatMediaTime(ytCurrentTime)}</span>
+                <div style="position: relative; flex: 1; display: flex; align-items: center;">
+                  <input
+                    class="arc-yt-scrubber"
+                    style="width: 100%; position: relative; z-index: 2;"
+                    type="range"
+                    min="0"
+                    max={ytDuration}
+                    step="1"
+                    value={ytCurrentTime}
+                    oninput={(e) => {
+                      const v = findPrimaryVideo();
+                      if (v) v.currentTime = Number((e.currentTarget as HTMLInputElement).value);
+                    }}
+                  />
+                </div>
+                <span>{formatMediaTime(ytDuration)}</span>
+              </div>
+
+              <div class="arc-yt-controls">
+                <button class="arc-yt-btn" onclick={() => ytSeekRelative(-5)} title="Rewind 5 seconds">
+                  ⏪ 5s
+                </button>
+                <button class="arc-yt-btn {ytPlaying ? 'active' : ''}" onclick={ytTogglePlay} title={ytPlaying ? 'Pause' : 'Play'}>
+                  {ytPlaying ? '⏸ Pause' : '▶ Play'}
+                </button>
+                <button class="arc-yt-btn" onclick={() => ytSeekRelative(5)} title="Forward 5 seconds">
+                  5s ⏩
+                </button>
+                <button
+                  class="arc-yt-btn {ytLoopStart !== null ? 'active' : ''}"
+                  onclick={ytToggleLoop5s}
+                  title="Loop last 5 seconds"
+                >
+                  🔁 {ytLoopStart !== null ? 'Stop' : 'Loop'}
+                </button>
+              </div>
+
+              <div class="arc-yt-controls" style="grid-template-columns: 1fr 1fr 1fr;">
+                <select
+                  class="arc-yt-btn"
+                  value={String(ytSpeed)}
+                  onchange={(e) => ytSetSpeed(Number((e.currentTarget as HTMLSelectElement).value))}
+                  title="Playback Speed"
+                >
+                  <option value="0.75">0.75×</option>
+                  <option value="1">1.0×</option>
+                  <option value="1.25">1.25×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2.0×</option>
+                </select>
+                <button
+                  class="arc-yt-btn {ytPipActive ? 'active' : ''}"
+                  onclick={ytToggleNativePip}
+                  title="Floating Picture-in-Picture Player"
+                >
+                  📺 PiP
+                </button>
+                <button
+                  class="arc-yt-btn {ytDesktopPipActive ? 'active' : ''}"
+                  onclick={ytToggleDesktopPip}
+                  title="Picture-in-Picture Across macOS Desktops"
+                >
+                  🖥️ Float
+                </button>
+              </div>
+
+              {#if ytCaptionLine}
+                <button
+                  type="button"
+                  class="arc-yt-caption"
+                  style="width: 100%; text-align: left; cursor: pointer;"
+                  onclick={() => translateVideoCaption(ytCaptionLine)}
+                  title="Click to translate this Japanese subtitle line"
+                >
+                  <div>{ytCaptionLine}</div>
+                  {#if videoCaptionTranslating}
+                    <div style="font-size: 10px; color: rgba(165, 180, 252, 0.85); margin-top: 3px;">Translating...</div>
+                  {:else if videoCaptionTranslation}
+                    <div style="font-size: 10.5px; color: #a7f3d0; margin-top: 3px; font-weight: 600;">
+                      {videoCaptionTranslation}
+                    </div>
+                  {/if}
+                </button>
+              {/if}
+
+              <div class="arc-yt-controls" style="grid-template-columns: 1fr 1fr;">
+                <button
+                  class="arc-yt-btn"
+                  onclick={ytOpenTimestampNoteInChatGpt}
+                  title="Ask ChatGPT about this exact moment & subtitle"
+                >
+                  🤖 Ask @ {formatMediaTime(ytCurrentTime)}
+                </button>
+              </div>
+            {:else}
+              <!-- On YouTube Home / Feed when no video is playing yet -->
+              <div style="display: flex; gap: 5px;">
+                <input
+                  class="arc-custom-pin-input"
+                  style="flex: 1;"
+                  type="text"
+                  placeholder="Search YouTube..."
+                  bind:value={ytSearchQuery}
+                  onkeydown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === 'Enter' && ytSearchQuery.trim()) {
+                      window.location.href = `https://www.youtube.com/results?search_query=${encodeURIComponent(ytSearchQuery.trim())}`;
+                    }
+                  }}
+                />
+                <button
+                  class="arc-yt-btn active"
+                  style="padding: 4px 9px;"
+                  onclick={() => {
+                    if (ytSearchQuery.trim()) {
+                      window.location.href = `https://www.youtube.com/results?search_query=${encodeURIComponent(ytSearchQuery.trim())}`;
+                    }
+                  }}
+                >
+                  Go
+                </button>
+              </div>
+            {/if}
           {/if}
         </div>
       {/if}
@@ -2504,7 +3814,8 @@
             {#if !item.collapsed}
               {#each item.children as child (child.id)}
                 <div
-                  class="arc-ls-row" class:active={urlKey(child.url) === urlKey(window.location.href)}
+                  class="arc-ls-row"
+                  class:active={isUrlActive(child.url, currentPageUrl)}
                   style="padding-left: 22px;"
                   role="button"
                   tabindex="0"
@@ -2537,10 +3848,14 @@
             {/if}
           {:else}
             <div
-              class="arc-ls-row" class:active={urlKey(item.url) === urlKey(window.location.href)}
+              class="arc-ls-row"
+              class:active={isUrlActive(item.url, currentPageUrl)}
               role="button"
               tabindex="0"
               draggable="true"
+              onpointerdown={(e) => {
+                pointerDownCoords = { x: e.clientX, y: e.clientY };
+              }}
               ondragstart={() => {
                 activeDrag = {
                   kind: 'pin',
@@ -2550,9 +3865,13 @@
                   favIconUrl: item.favIconUrl
                 };
               }}
-              ondragend={() => {
+              ondragend={(e) => {
+                const dist = Math.hypot(e.clientX - pointerDownCoords.x, e.clientY - pointerDownCoords.y);
                 activeDrag = null;
                 dropTargetHighlight = null;
+                if (dist < 10) {
+                  openSidebarUrl(item.url, e);
+                }
               }}
               ondragover={(e) => e.preventDefault()}
               ondrop={async (e) => {
@@ -2631,8 +3950,8 @@
         class="arc-ls-row"
         role="button"
         tabindex="0"
-        onclick={() => openCommandBar('new-tab')}
-        onkeydown={(e) => isActivationKey(e) && openCommandBar('new-tab')}
+        onclick={openNewTab}
+        onkeydown={(e) => isActivationKey(e) && openNewTab()}
       >
         <span>＋</span>
         <span class="arc-ls-row-title">New Tab</span>
@@ -2641,16 +3960,23 @@
       <!-- Open Tabs (Draggable to Pinned, Favorites, Spaces, or Reorder!) -->
       {#each spaceTabs as tab (tab.id)}
         <div
-          class="arc-ls-row {tab.active ? 'active' : ''}"
+          class="arc-ls-row {tab.active || urlKey(tab.url) === urlKey(currentPageUrl) ? 'active' : ''}"
           role="button"
           tabindex="0"
           draggable="true"
+          onpointerdown={(e) => {
+            pointerDownCoords = { x: e.clientX, y: e.clientY };
+          }}
           ondragstart={() => {
             activeDrag = { kind: 'tab', tab };
           }}
-          ondragend={() => {
+          ondragend={(e) => {
+            const dist = Math.hypot(e.clientX - pointerDownCoords.x, e.clientY - pointerDownCoords.y);
             activeDrag = null;
             dropTargetHighlight = null;
+            if (dist < 10) {
+              switchToSidebarTab(tab, e);
+            }
           }}
           ondragover={(e) => e.preventDefault()}
           ondrop={async (e) => {
@@ -2665,11 +3991,9 @@
             }
             activeDrag = null;
           }}
-          onclick={() => chrome.runtime.sendMessage({ type: 'SWITCH_TAB', tabId: tab.id })}
-          onkeydown={(e) =>
-            isActivationKey(e) &&
-            chrome.runtime.sendMessage({ type: 'SWITCH_TAB', tabId: tab.id })}
-          title="{tab.title} (Drag to pin, favorite, reorder, or move to another Space)"
+          onclick={(e) => switchToSidebarTab(tab, e)}
+          onkeydown={(e) => isActivationKey(e) && switchToSidebarTab(tab)}
+          title="{tab.title} (Click to switch · Drag to pin, favorite, reorder, or move to another Space)"
         >
           {#if getFaviconUrl(tab.url, tab.favIconUrl)}
             <img src={getFaviconUrl(tab.url, tab.favIconUrl)} alt="" draggable="false" />
@@ -2743,7 +4067,6 @@
       </div>
     </div>
   </aside>
-{/if}
 
 {#if showCommandBar}
   <div class="arc-cmd-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) showCommandBar = false; }}>
@@ -2994,4 +4317,316 @@
       {/each}
     </div>
   </div>
+{/if}
+
+<!-- 5. Full-Height ChatGPT & Antigravity Browser Agent Sidebar (Live Page & DOM Access) -->
+{#if showAgentSidebar}
+  <aside
+    class="arc-agent-sidebar {agentSidebarMode === 'antigravity' ? 'mode-antigravity' : 'mode-chatgpt'}"
+    style="
+      top: 8px;
+      bottom: 8px;
+      width: {agentSidebarWidth}px;
+      {agentSidebarDock === 'left'
+        ? `left: ${!isLeftSidebarVisible ? 50 : sidebarX + sidebarWidth + 10}px;`
+        : 'right: 10px;'}
+    "
+    aria-label="ChatGPT and Antigravity Browser Agent Sidebar"
+  >
+    <!-- Top Header: Mode Switcher + Dock/Key/Close Controls -->
+    <div class="arc-agent-hdr">
+      <div class="arc-agent-tabs">
+        <button
+          class="arc-agent-tab gpt {agentSidebarMode === 'chatgpt' ? 'active' : ''}"
+          onclick={() => {
+            agentSidebarMode = 'chatgpt';
+            livePageContext = collectPageContext();
+          }}
+          title="ChatGPT Browser Agent (Direct access to page DOM & tabs)"
+        >
+          <span>🤖</span>
+          <span>ChatGPT</span>
+        </button>
+        <button
+          class="arc-agent-tab agy {agentSidebarMode === 'antigravity' ? 'active' : ''}"
+          onclick={() => {
+            agentSidebarMode = 'antigravity';
+            livePageContext = collectPageContext();
+          }}
+          title="Antigravity Browser Agent (Direct access to page DOM, media & IDE)"
+        >
+          <span>🚀</span>
+          <span>Antigravity</span>
+        </button>
+      </div>
+
+      <div class="arc-agent-hdr-actions">
+        <button
+          class="arc-agent-iconbtn"
+          onclick={() => {
+            showApiKeyConfig = !showApiKeyConfig;
+            apiKeyInput = settings.openaiApiKey || '';
+          }}
+          title={settings.openaiApiKey ? 'OpenAI API Key Connected (Click to edit)' : 'Configure OpenAI API Key for GPT-4o Browser Agent'}
+        >
+          🔑
+        </button>
+        <button
+          class="arc-agent-iconbtn"
+          onclick={() => (agentSidebarDock = agentSidebarDock === 'left' ? 'right' : 'left')}
+          title={agentSidebarDock === 'left' ? 'Dock sidebar to Right edge of screen' : 'Dock sidebar next to Left Arc Sidebar'}
+        >
+          {agentSidebarDock === 'left' ? '⇥' : '⇤'}
+        </button>
+        <button
+          class="arc-agent-iconbtn"
+          onclick={() => {
+            agentMessages = [];
+            openAgentSidebar(agentSidebarMode);
+          }}
+          title="Reset conversation & refresh page DOM snapshot"
+        >
+          ↻
+        </button>
+        <button
+          class="arc-agent-iconbtn"
+          onclick={() => (showAgentSidebar = false)}
+          title="Close Agent Sidebar (Esc)"
+        >
+          ×
+        </button>
+      </div>
+    </div>
+
+    {#if showApiKeyConfig}
+      <div
+        style="display: flex; gap: 6px; padding: 8px 12px; background: rgba(139, 124, 248, 0.14); border-bottom: 1px solid rgba(255,255,255,0.12);"
+      >
+        <input
+          type="password"
+          placeholder="OpenAI API Key (sk-...) for live GPT-4o tool-calling"
+          bind:value={apiKeyInput}
+          onkeydown={(e) => e.stopPropagation()}
+          style="flex: 1; background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.22); border-radius: 7px; padding: 5px 8px; color: #fff; font-size: 11px;"
+        />
+        <button
+          style="background: #34d399; border: none; border-radius: 7px; padding: 5px 10px; color: #06130e; font-size: 11px; font-weight: 700; cursor: pointer;"
+          onclick={async () => {
+            await chrome.runtime.sendMessage({
+              type: 'UPDATE_SETTINGS',
+              settings: { openaiApiKey: apiKeyInput.trim() }
+            });
+            showApiKeyConfig = false;
+            showToast('✓ OpenAI API Key saved for Browser Agent Sidebar');
+            syncSnapshot();
+          }}
+        >
+          Save
+        </button>
+      </div>
+    {/if}
+
+    <!-- Browser Context & 1-Click DOM Tools Bar -->
+    <div class="arc-agent-ctx-bar">
+      <div class="arc-agent-ctx-status">
+        <div style="display: flex; align-items: center; gap: 6px; min-width: 0;">
+          <span class="arc-agent-live-dot"></span>
+          <span
+            style="font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
+            title={window.location.href}
+          >
+            Browser Access: {window.location.hostname.replace(/^www\./, '') || window.location.href}
+          </span>
+        </div>
+        <button
+          style="background: none; border: none; color: #a78bfa; font-size: 10.5px; font-weight: 600; cursor: pointer; flex-shrink: 0;"
+          onclick={() => {
+            livePageContext = collectPageContext();
+            showBrowserContextDrawer = !showBrowserContextDrawer;
+          }}
+        >
+          {showBrowserContextDrawer ? 'Hide DOM ▴' : 'Inspect DOM ▾'}
+        </button>
+      </div>
+
+      <div class="arc-agent-quick-tools">
+        <button
+          class="arc-agent-tool-chip"
+          onclick={() => submitAgentSidebarMessage('Can you help me make this page and video player work?')}
+          title="Scan page for broken video players, cross-origin iframes, or click-blocking overlays and unlock them"
+        >
+          🛠️ Fix Page & Video
+        </button>
+        <button
+          class="arc-agent-tool-chip"
+          onclick={() => submitAgentSidebarMessage('Summarize this page and its key sections')}
+          title="Read live page DOM and summarize"
+        >
+          📄 Summarize
+        </button>
+        <button
+          class="arc-agent-tool-chip"
+          onclick={() => submitAgentSidebarMessage('Translate this page selection')}
+          title="Translate highlighted text or page excerpt"
+        >
+          🌐 Translate
+        </button>
+        <button
+          class="arc-agent-tool-chip"
+          onclick={() => {
+            livePageContext = collectPageContext();
+            showBrowserContextDrawer = !showBrowserContextDrawer;
+          }}
+          title="View clickable buttons, inputs, and open tabs"
+        >
+          🎯 Controls ({livePageContext.buttons.length})
+        </button>
+      </div>
+    </div>
+
+    <!-- Expandable Live DOM & Browser Inspector Drawer -->
+    {#if showBrowserContextDrawer}
+      <div class="arc-agent-drawer">
+        <div style="font-weight: 700; color: #c4b5fd;">
+          📄 {livePageContext.title || 'Untitled Page'}
+        </div>
+        <div style="color: rgba(255,255,255,0.65); font-size: 10.5px;">
+          Media: {livePageContext.videoInfo.videoCount} &lt;video&gt; · {livePageContext.videoInfo.iframeCount} &lt;iframe&gt; · {tabs.length} open tabs in browser
+        </div>
+
+        {#if livePageContext.buttons.length > 0}
+          <div style="margin-top: 2px; font-weight: 600; color: rgba(255,255,255,0.78);">
+            Click an element on the page directly:
+          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 4px;">
+            {#each livePageContext.buttons.slice(0, 14) as btnLabel}
+              <button
+                class="arc-agent-tool-chip"
+                onclick={() => submitAgentSidebarMessage(`Click ${btnLabel}`)}
+                title="Highlight and click '{btnLabel}' on the page"
+              >
+                🎯 {btnLabel}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- Interactive Multi-Turn Conversation Feed -->
+    <div class="arc-agent-feed">
+      {#each agentMessages as msg (msg.id)}
+        <div class="arc-agent-msg {msg.role}">
+          <div class="arc-agent-msg-meta">
+            <span>
+              {#if msg.role === 'user'}
+                You
+              {:else if msg.agent === 'antigravity'}
+                🚀 Antigravity Agent
+              {:else if msg.agent === 'chatgpt'}
+                🤖 ChatGPT Agent
+              {:else}
+                ⚡ Browser Action
+              {/if}
+            </span>
+            <span>{msg.timestamp}</span>
+          </div>
+
+          {#if msg.actionBadge}
+            <div class="arc-agent-badge">{msg.actionBadge}</div>
+          {/if}
+
+          <div>{msg.content}</div>
+
+          {#if msg.role === 'assistant'}
+            <div class="arc-agent-msg-actions">
+              <button
+                class="arc-agent-tool-chip"
+                onclick={() => fixAndInspectPageDom()}
+                title="Unlock video controls & remove overlay blockers on this page"
+              >
+                ⚡ Unlock Video / DOM
+              </button>
+              <button
+                class="arc-agent-tool-chip"
+                onclick={() => speakText(msg.content.replace(/[*#`_~]/g, ''), 'en-US')}
+                title="Read response aloud"
+              >
+                🔊 Listen
+              </button>
+              <button
+                class="arc-agent-tool-chip"
+                onclick={() => launchExternalChatGPT(msg.promptUsed || '', '', true)}
+                title="Continue this thread in ChatGPT Web popup"
+              >
+                🌐 ChatGPT Web ↗
+              </button>
+              <button
+                class="arc-agent-tool-chip"
+                onclick={() => launchExternalAntigravity(msg.promptUsed || '', '')}
+                title="Copy full page DOM context & open Antigravity Desktop IDE"
+              >
+                🚀 Antigravity IDE ↗
+              </button>
+            </div>
+          {/if}
+        </div>
+      {/each}
+
+      {#if agentSending}
+        <div class="arc-agent-msg assistant">
+          <div class="arc-agent-msg-meta">
+            <span>{agentSidebarMode === 'antigravity' ? '🚀 Antigravity' : '🤖 ChatGPT'}</span>
+            <span>Working...</span>
+          </div>
+          <div style="color: #a78bfa;">Inspecting browser DOM & executing actions...</div>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Bottom Composer with Voice & Browser Context Attachment -->
+    <div class="arc-agent-composer">
+      <div style="display: flex; align-items: center; justify-content: space-between; font-size: 10.5px; color: rgba(255,255,255,0.68);">
+        <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;">
+          <input type="checkbox" bind:checked={includePageContext} />
+          <span>Live Browser & DOM Access enabled</span>
+        </label>
+        <button
+          style="background: none; border: none; color: {isVoiceListening ? '#fda4af' : '#a78bfa'}; font-size: 11px; font-weight: 600; cursor: pointer;"
+          onclick={() => toggleVoiceAssistant()}
+          title="Speak a command or question (Alt+V)"
+        >
+          {isVoiceListening ? '🔴 Listening...' : '🎙️ Voice'}
+        </button>
+      </div>
+
+      <div class="arc-agent-input-row">
+        <textarea
+          class="arc-agent-textarea"
+          rows="2"
+          placeholder={agentSidebarMode === 'antigravity'
+            ? 'Ask Antigravity to fix this page, inspect DOM, click elements, or run a task...'
+            : 'Ask ChatGPT about this page, or tell it to click/scroll/fix/translate...'}
+          bind:value={aiPromptText}
+          onkeydown={(e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              submitAgentSidebarMessage();
+            } else if (e.key === 'Escape') {
+              showAgentSidebar = false;
+            }
+          }}
+        ></textarea>
+        <button
+          class="arc-agent-send {agentSidebarMode === 'antigravity' ? 'agy' : ''}"
+          onclick={() => submitAgentSidebarMessage()}
+          disabled={agentSending}
+          title="Send message to Browser Agent (Enter)"
+        >
+          {agentSidebarMode === 'antigravity' ? '🚀 Run' : '🤖 Send'}
+        </button>
+      </div>
+    </div>
+  </aside>
 {/if}

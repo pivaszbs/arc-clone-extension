@@ -11,7 +11,7 @@ return function studyRequest(message: StudyMessage) {
     let settings: QuizSettings = stored[QUIZ_KEY] || { ...defaultQuizSettings };
     if (message.type === 'JAPANESE_SAVE') {
       const card = message.card;
-      if (!card || typeof card.text !== 'string' || !card.text.trim() || card.text.length > 5000 || typeof card.meaning !== 'string' || !Number.isFinite(card.start) || !Number.isFinite(card.end) || card.start < 0 || card.end <= card.start || !/^https?:\/\//.test(card.url)) throw new Error('Check the phrase and video time.');
+      if (!card || typeof card.text !== 'string' || !card.text.trim() || card.text.length > 5000 || typeof card.meaning !== 'string' || !Number.isFinite(card.start) || !Number.isFinite(card.end) || card.start < 0 || card.end <= card.start || !/^(?:https?:\/\/|arc-offline:[^/]+\/\d+\/\d+$)/.test(card.url)) throw new Error('Check the phrase and video time.');
       if (cards.length >= 2000) throw new Error('Export your phrases before adding more than 2,000.');
       if (cards.some((c) => c.text === card.text && c.url === card.url)) throw new Error('This phrase is already saved from this page.');
       cards = [...cards, { ...card, id: crypto.randomUUID(), due: Date.now(), interval: 0 }];

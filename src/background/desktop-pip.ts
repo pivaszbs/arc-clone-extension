@@ -1,10 +1,16 @@
-const HOST = 'local.arcclone.desktop_video_v2';
+const HOST = 'local.arcclone.desktop_video';
 let port: chrome.runtime.Port | undefined;
-let active: { sessionId: string; tabId: number; frameId: number; ready?: (value: any) => void; timer?: ReturnType<typeof setTimeout> } | undefined;
+let active: { sessionId: string; tabId: number; frameId: number; offline: boolean; ready?: (value: any) => void; timer?: ReturnType<typeof setTimeout> } | undefined;
 const statusRequests = new Map<string, { resolve: (value: any) => void; timer: ReturnType<typeof setTimeout> }>();
 
+function sendToSource(source: NonNullable<typeof active>, message: Record<string, unknown>) {
+  const payload = { ...message, sessionId: source.sessionId };
+  return source.offline ? chrome.runtime.sendMessage(payload)
+    : chrome.tabs.sendMessage(source.tabId, payload, { frameId: source.frameId });
+}
+
 function notify(message: Record<string, unknown>) {
-  if (active) void chrome.tabs.sendMessage(active.tabId, { type: 'DESKTOP_PIP_EVENT', ...message }, { frameId: active.frameId }).catch(() => {});
+  if (active) void sendToSource(active, { type: 'DESKTOP_PIP_EVENT', ...message }).catch(() => {});
 }
 function disconnected() {
   const reason = chrome.runtime.lastError?.message || 'The desktop player disconnected.';
@@ -25,7 +31,7 @@ function connect() {
       const pending = statusRequests.get(message.requestId);
       if (pending) {
         clearTimeout(pending.timer); statusRequests.delete(message.requestId);
-        if (active) void chrome.tabs.sendMessage(active.tabId, { type: 'DESKTOP_PIP_SOURCE_STATE', sessionId: active.sessionId }, { frameId: active.frameId }).then(source => pending.resolve({ ok: true, ...message, source })).catch(() => pending.resolve({ ok: true, ...message }));
+        if (active) void sendToSource(active, { type: 'DESKTOP_PIP_SOURCE_STATE' }).then(source => pending.resolve({ ok: true, ...message, source })).catch(() => pending.resolve({ ok: true, ...message }));
         else pending.resolve({ ok: true, ...message });
       }
       return;
@@ -54,7 +60,8 @@ export async function desktopPipRequest(message: any, sender: chrome.runtime.Mes
     if (active) { notify({ event: 'closed', sessionId: active.sessionId }); port?.postMessage({ type: 'close' }); }
     const sessionId = crypto.randomUUID();
     return new Promise((resolve) => {
-      active = { sessionId, tabId: sender.tab!.id!, frameId: sender.frameId || 0, ready: resolve };
+      const offline = sender.url?.split(/[?#]/, 1)[0] === chrome.runtime.getURL('offline.html');
+      active = { sessionId, tabId: sender.tab!.id!, frameId: sender.frameId || 0, offline, ready: resolve };
       active.timer = setTimeout(() => { active?.ready?.({ ok: false, error: 'The desktop player did not start. Check its installation.' }); active!.ready = undefined; }, 15000);
       try { connect().postMessage({ type: 'open', sessionId, muted: Boolean(message.muted), volume: Number(message.volume ?? 1) }); }
       catch { disconnected(); }
@@ -72,11 +79,11 @@ export async function desktopPipRequest(message: any, sender: chrome.runtime.Mes
   if (!active || message.sessionId !== active.sessionId || sender.tab?.id !== active.tabId || (sender.frameId || 0) !== active.frameId) {
     throw new Error('The desktop PiP session is no longer active.');
   }
-  if (message.type === 'DESKTOP_PIP_START') {
-    port?.postMessage({ type: 'start', sessionId: active.sessionId, mime: message.mime, paused: Boolean(message.paused) });
-  } else if (message.type === 'DESKTOP_PIP_PLAYBACK') {
-    port?.postMessage({ type: 'playback', sessionId: active.sessionId, paused: Boolean(message.paused), failed: Boolean(message.failed) });
-  } else if (message.type === 'DESKTOP_PIP_CHUNK') {
+  if (message.type === 'DESKTOP_PIP_START') port?.postMessage({ type: 'start', sessionId: active.sessionId, mime: message.mime });
+  else if (message.type === 'DESKTOP_PIP_PLAYBACK_STATE') {
+    port?.postMessage({ type: 'playback-state', sessionId: active.sessionId, paused: Boolean(message.paused), error: message.error });
+  }
+  else if (message.type === 'DESKTOP_PIP_CHUNK') {
     if (typeof message.data !== 'string' || message.data.length > 1_400_000) throw new Error('Desktop video chunk is too large.');
     port?.postMessage({ type: 'chunk', sessionId: active.sessionId, data: message.data });
   } else if (message.type === 'DESKTOP_PIP_CLOSE') {

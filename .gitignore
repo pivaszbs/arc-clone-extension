@@ -1,5 +1,8 @@
 /node_modules/
 /dist/
+/dist-arc/
 /artifacts/
 /outputs/
 .DS_Store
+.venv/
+__pycache__/

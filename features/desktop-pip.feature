@@ -3,16 +3,26 @@ Feature: macOS desktop video panel
   The companion must be configured as a non-activating full-screen auxiliary panel
   before it is shown. Browser PiP state alone does not prove this requirement.
 
+  @anime-only
+  Scenario: An offline episode uses the desktop panel
+    Given the offline study page is open without a network connection
+    When I open a downloaded video across desktops
+    Then the desktop panel joins all Spaces and full-screen Spaces
+    And the desktop panel decodes the captured video
+    And the original video still uses its blob URL
+    When the source video pauses and resumes
+    Then the desktop panel follows the source playback state
+    When I return the desktop video to the page
+    Then the desktop player has closed
+
   Scenario: Video reaches a panel configured for desktops and full-screen Spaces
     Given a standard video page
     When I open the video across desktops
     Then the desktop panel joins all Spaces and full-screen Spaces
     And the desktop panel decodes the captured video
     And the desktop panel keeps receiving a playing live stream
-    When I pause the original video
-    Then the desktop video pauses and offers Play
-    When I resume the original video
-    Then the desktop video resumes and offers Pause
+    When the source video pauses and resumes
+    Then the desktop panel follows the source playback state
     When I switch to another browser tab
     Then the desktop panel video keeps advancing
     When I return the desktop video to the page

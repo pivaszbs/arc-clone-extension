@@ -10,7 +10,20 @@ async function readyVideo(world) {
   await expect.poll(() => world.videoPage.locator('video').first().evaluate(video => video.readyState > 0 && video.videoWidth > 0)).toBe(true);
 }
 Given('a standard video page', async function () { await openVideoPage(this, 'Video-default'); await readyVideo(this); });
+Then('hovering the video reveals an icon-only picture in picture button', async function () {
+  const button = this.videoPage.getByRole('button', { name: 'Picture in picture', exact: true });
+  const opacity = () => button.evaluate(element => getComputedStyle(element.parentElement).opacity);
+  await this.videoPage.locator('h1').hover();
+  await expect.poll(opacity).toBe('0');
+  await this.videoPage.locator('video').hover();
+  await expect.poll(opacity).toBe('1');
+  await expect(button.locator('svg')).toHaveCount(1);
+  await expect(button).toHaveText('');
+  await this.videoPage.locator('h1').hover();
+  await expect.poll(opacity).toBe('0');
+});
 When('I click its picture in picture button', async function () {
+  await this.videoPage.locator('video').first().hover();
   await this.videoPage.getByRole('button', { name: 'Picture in picture', exact: true }).click();
 });
 Then('the original video is in native picture in picture', async function () {
@@ -18,6 +31,7 @@ Then('the original video is in native picture in picture', async function () {
   await expect(this.videoPage.getByRole('button', { name: 'Exit picture in picture', exact: true })).toHaveAttribute('aria-pressed', 'true');
 });
 When('I click its exit picture in picture button', async function () {
+  await this.videoPage.locator('video').first().hover();
   await this.videoPage.getByRole('button', { name: 'Exit picture in picture', exact: true }).click();
 });
 Then('native picture in picture is closed', async function () {
@@ -52,6 +66,7 @@ Given('a page with two standard videos', async function () {
   await expect.poll(() => this.videoPage.locator('video').evaluateAll(videos => videos.every(video => video.readyState > 0 && video.videoWidth > 0))).toBe(true);
 });
 When('I open the second video in picture in picture', async function () {
+  await this.videoPage.locator('video').nth(1).hover();
   await this.videoPage.getByRole('button', { name: 'Picture in picture', exact: true }).nth(1).click();
 });
 Then('only the second video is in native picture in picture', async function () {
@@ -86,6 +101,7 @@ Given('a video inside an iframe that allows picture in picture', async function 
   await expect(this.videoFrame.getByRole('button', { name: 'Picture in picture', exact: true })).toBeVisible();
 });
 When('I click the iframe video picture in picture button', async function () {
+  await this.videoFrame.locator('video').hover();
   await this.videoFrame.getByRole('button', { name: 'Picture in picture', exact: true }).click();
 });
 Then('the iframe original video is in native picture in picture', async function () {

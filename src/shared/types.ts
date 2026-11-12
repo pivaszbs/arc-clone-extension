@@ -220,6 +220,14 @@ export function parseCommandBarInput(raw: string): { isUrl: boolean; url: string
 }
 
 export function getFaviconUrl(url?: string, explicitFavicon?: string): string {
+  // The host page's image policy also applies inside the injected shadow root.
+  const page = globalThis.location;
+  if (page && (page.protocol === 'http:' || page.protocol === 'https:')) {
+    try {
+      const icon = new URL(explicitFavicon || '');
+      return icon.origin === page.origin && icon.protocol === page.protocol ? icon.href : '';
+    } catch { return ''; }
+  }
   if (explicitFavicon && !explicitFavicon.startsWith('chrome://')) {
     return explicitFavicon;
   }

@@ -85,15 +85,7 @@
   onMount(() => {
     // Fallback if opened directly via chrome://newtab without ?focused=1
     if (!window.location.search.includes('focused=1')) {
-      chrome.tabs.getCurrent().then((cur) => {
-        if (cur?.id) {
-          chrome.tabs.create({
-            url: chrome.runtime.getURL('newtab.html?focused=1'),
-            active: true
-          });
-          chrome.tabs.remove(cur.id);
-        }
-      });
+      window.location.replace(chrome.runtime.getURL('newtab.html?focused=1'));
       return;
     }
 

@@ -8,7 +8,7 @@ async function environment(run) {
   const originals = keys.map((key) => Object.getOwnPropertyDescriptor(globalThis, key));
   const resources = [];
   Object.defineProperty(globalThis, 'location', { configurable: true, value: { href: 'https://www.youtube.com/watch?v=a', hostname: 'www.youtube.com' } });
-  Object.defineProperty(globalThis, 'document', { configurable: true, value: { scripts: [] } });
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { scripts: [], querySelectorAll: () => [] } });
   Object.defineProperty(globalThis, 'performance', { configurable: true, value: { now: () => 0, getEntriesByType: () => resources } });
   try { await run(resources); }
   finally { keys.forEach((key, i) => originals[i] ? Object.defineProperty(globalThis, key, originals[i]) : delete globalThis[key]); }

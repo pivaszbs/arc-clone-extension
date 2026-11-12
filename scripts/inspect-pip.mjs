@@ -21,7 +21,7 @@ try {
     args: ['--enable-unsafe-extension-debugging'], viewport: { width: 1100, height: 800 }
   });
   const cdp = await context.browser().newBrowserCDPSession();
-  await cdp.send('Extensions.loadUnpacked', { path: path.resolve('dist') });
+  await cdp.send('Extensions.loadUnpacked', { path: path.resolve('dist-arc') });
   const page = await context.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.locator('video').evaluate(video => video.play());

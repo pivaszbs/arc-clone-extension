@@ -5,7 +5,7 @@
   import CommandPalette from '../shared/CommandPalette.svelte';
   import Icon from '../shared/Icon.svelte';
   import { containFocus, isActivationKey } from '../shared/focus';
-  import { getSpaceFavorites, getTodayTabs, urlKey } from '../shared/tabs';
+  import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
   import {
     type ArcState,
     type FavoriteItem,
@@ -56,7 +56,10 @@
     noticeTimer = setTimeout(() => notice = '', 3500);
   }
   function focusInput(node: HTMLInputElement) { node.focus(); }
-  function isCurrentUrl(url: string) { return !!activeTab && urlKey(url) === urlKey(activeTab.url); }
+  function isCurrentUrl(url: string) {
+    if (!activeTab) return false;
+    return urlKey(url) === urlKey(activeTab.url) || (isRootDomainUrl(url) && sameHost(url, activeTab.url));
+  }
 
 
   // Command Bar modal state inside Side Panel
