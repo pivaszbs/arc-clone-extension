@@ -1,0 +1,41 @@
+:root { color-scheme: dark; background: #111113; color: #fff6ef; font: 24px system-ui, sans-serif; font-size: clamp(18px, 1.65vw, 32px); }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1720px; margin: auto; padding: 5vh 6vw; }
+header { display: flex; align-items: center; border-bottom: 1px solid #3d3736; padding-bottom: 2vh; }
+header img { width: 2.2em; height: 2.2em; margin-right: 0.8em; }
+#library-diagnostics { margin-left: auto; }
+h1 { font-size: 1.6em; margin: 0; }
+form { padding: 4vh 0 1vh; }
+label { display: block; margin-bottom: 0.65em; }
+input, button { font: inherit; color: inherit; background: #262326; border: 1px solid #645c5e; border-radius: 0.35em; padding: 0.45em 0.75em; }
+input { width: 70%; max-width: 31em; margin-right: 0.5em; }
+button { cursor: pointer; }
+button:disabled { opacity: 0.42; }
+button:focus, input:focus { outline: 0.14em solid #ff895c; outline-offset: 0.12em; background: #4c342d; }
+ol { margin: 2vh 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(3, 1fr); grid-gap: 0.65em; }
+ol button { width: 100%; min-height: 3.2em; text-align: left; }
+ol small { display: block; margin-top: 0.2em; color: #d8b6a9; }
+#player, video { position: fixed; inset: 0; top: 0; left: 0; width: 100%; height: 100%; background: #000; }
+video { object-fit: contain; }
+#controls { position: absolute; bottom: 0; left: 0; width: 100%; padding: 1.4em 4vw 1.6em; background: linear-gradient(transparent, #111113 30%); }
+#episode-title { font-weight: 700; }
+.progress-row { display: flex; align-items: center; margin: 0.5em 0; }
+progress { flex: 1; height: 0.4em; margin-right: 0.65em; accent-color: #ff895c; }
+progress::-webkit-progress-bar { background: #483d39; }
+progress::-webkit-progress-value { background: #ff895c; }
+.actions button, #learning button, #skip-controls button { margin-right: 0.4em; }
+#learning, #skip-controls { margin-top: 0.6em; }
+#learning span, #countdown { margin-right: 0.55em; }
+#caption { position: absolute; bottom: 8%; left: 50%; transform: translateX(-50%); max-width: 86%; width: max-content; white-space: pre-line; background: #101012e8; border-color: transparent; font-size: 1.35em; }
+#player.with-controls #caption { bottom: 27%; }
+#player.with-learning #caption { bottom: 34%; }
+#playback-status { position: absolute; top: 5vh; left: 4vw; padding: 0.65em; background: #171516; }
+[hidden] { display: none !important; }
+dialog { width: 80vw; max-width: 35em; padding: 1.1em; border: 1px solid #645c5e; border-radius: 0.5em; background: #171516; color: inherit; }
+dialog::backdrop { background: #000b; }
+dialog h2 { margin: 0 0 0.5em; font-size: 1.25em; }
+dialog form { padding: 0; }
+#diagnostics-report { max-height: 53vh; overflow: auto; white-space: pre-wrap; font-size: 0.8em; color: #e0cec5; }
+#diagnostics-report:focus { outline: 0.12em solid #ff895c; }
+#caption:disabled { opacity: 1; cursor: default; }

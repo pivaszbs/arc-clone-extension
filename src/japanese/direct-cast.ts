@@ -1,4 +1,5 @@
 import type { Cue } from './study';
+import type { VideoThemes } from './video-themes';
 
 const companion = 'http://127.0.0.1:46157';
 export type CastDevice = { id: string; name: string };
@@ -63,4 +64,33 @@ export async function castEpisode(device: string, file: File, title: string, pos
 
 export function stopDirectCast(id: string) {
   return castRequest(`/session/${id}`, { method: 'DELETE' });
+}
+
+export async function openSafariAirPlay(file: File, title: string, position: number, cues: Cue[], themes: VideoThemes) {
+  const legacy = localStorage.getItem('arc-offline-auto-skip') !== 'off';
+  const skips = Object.fromEntries((['recap', 'op', 'ed'] as const).flatMap(part => {
+    const range = themes[part];
+    const saved = localStorage.getItem(`arc-offline-auto-skip-${part}`);
+    return range ? [[part, { ...range, auto: saved === null ? part === 'recap' || legacy : saved === 'on' }]] : [];
+  }));
+  const { id } = await castRequest<{ id: string }>('/airplay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title, position, skips, subtitles: webVtt(cues) })
+  });
+  try {
+    await castRequest(`/airplay/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: file
+    });
+    return id;
+  } catch (error) {
+    await stopSafariAirPlay(id).catch(() => {});
+    throw error;
+  }
+}
+
+export function stopSafariAirPlay(id: string) {
+  return castRequest(`/airplay/${id}`, { method: 'DELETE' });
 }

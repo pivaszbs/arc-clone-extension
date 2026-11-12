@@ -99,7 +99,7 @@ function isMusic(text: string) {
 function mergeRanges(ranges: TimeRange[], gap = 0) {
   const merged: TimeRange[] = [];
   for (const range of [...ranges].sort((a, b) => a.start - b.start)) {
-    const last = merged.at(-1);
+    const last = merged[merged.length - 1];
     if (last && range.start <= last.end + gap) last.end = Math.max(last.end, range.end);
     else merged.push({ start: range.start, end: range.end });
   }
@@ -156,7 +156,7 @@ export function detectAnimeOpEdIntervals(
 ): AnimeOpEdIntervals {
   const duration = Number.isFinite(videoDuration) && videoDuration > 0 ? videoDuration : 0;
   const timed = cues.filter(cue => valid(cue) && (!duration || cue.end <= duration + 0.5)).sort((a, b) => a.start - b.start);
-  const limit = duration || Math.max(1420, (timed.at(-1)?.end || 0) + 30);
+  const limit = duration || Math.max(1420, (timed[timed.length - 1]?.end || 0) + 30);
   const tagged: Record<Part, TimeRange[]> = { op: [], ed: [] };
   const music: TimeRange[] = [];
   const speech: TimeRange[] = [];
@@ -217,7 +217,7 @@ export function detectAnimeOpEdIntervals(
 
     const occupied = mergeRanges(timed);
     const gaps = occupied.map((range, index) => ({ start: occupied[index - 1]?.end ?? 0, end: range.start }));
-    if (part === 'ed') gaps.push({ start: occupied.at(-1)!.end, end: duration });
+    if (part === 'ed') gaps.push({ start: occupied[occupied.length - 1].end, end: duration });
     const candidates = gaps.filter(range => inWindow(range) && range.end - range.start >= 75 && range.end - range.start <= 110);
     if (candidates.length !== 1) return null;
     const gap = candidates[0];

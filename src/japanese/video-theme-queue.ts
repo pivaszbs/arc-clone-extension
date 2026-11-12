@@ -1,4 +1,4 @@
-import { confirmLateOpening, fingerprintVideo, matchEarlySparseOpening, matchLateOpening, matchRecap, matchVideoThemes, overlapsRecap, refineThemeEdges, type VideoThemes } from './video-themes';
+import { confirmLateOpening, fingerprintVideo, matchEarlySparseOpening, matchKnownOpening, matchLateOpening, matchRecap, matchVideoThemes, overlapsRecap, refineThemeEdges, type VideoThemes } from './video-themes';
 
 type Fingerprint = Awaited<ReturnType<typeof fingerprintVideo>>;
 type Comparison = {
@@ -9,7 +9,7 @@ type Comparison = {
 export type ScanFile = { id: string; file: File };
 export type ScanStatus = { active: string; total: number; scanned: number; failed: number; restoring: boolean };
 
-function scanCache<T>(storeName: 'frames' | 'comparisons', id: string, value?: T): Promise<T | undefined> {
+function openScanCache(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const open = indexedDB.open('arc-video-fingerprints', 2);
     open.onupgradeneeded = () => {
@@ -21,12 +21,42 @@ function scanCache<T>(storeName: 'frames' | 'comparisons', id: string, value?: T
     open.onsuccess = () => {
       const db = open.result;
       db.onversionchange = () => db.close();
+      resolve(db);
+    };
+  });
+}
+
+async function scanCache<T>(storeName: 'frames' | 'comparisons', id: string, value?: T): Promise<T | undefined> {
+  const db = await openScanCache();
+  return new Promise((resolve, reject) => {
       const transaction = db.transaction(storeName, value === undefined ? 'readonly' : 'readwrite');
       const store = transaction.objectStore(storeName);
       const request = value === undefined ? store.get(id) : store.put(value, id);
       transaction.oncomplete = () => { db.close(); resolve(value === undefined ? request.result : undefined); };
       transaction.onabort = () => { db.close(); reject(transaction.error); };
+  });
+}
+
+export async function forgetFrameChecks(ids: Set<string>) {
+  const db = await openScanCache();
+  return new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(['frames', 'comparisons'], 'readwrite');
+    for (const id of ids) transaction.objectStore('frames').delete(id);
+    const request = transaction.objectStore('comparisons').openKeyCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      if (typeof cursor.key === 'string') {
+        let pair: unknown;
+        try { pair = JSON.parse(cursor.key); } catch { /* Leave unrelated cache records in place. */ }
+        if (Array.isArray(pair) && pair.some(key => typeof key === 'string' && ids.has(key))) {
+          transaction.objectStore('comparisons').delete(cursor.key);
+        }
+      }
+      cursor.continue();
     };
+    transaction.oncomplete = () => { db.close(); resolve(); };
+    transaction.onabort = () => { db.close(); reject(transaction.error); };
   });
 }
 
@@ -37,6 +67,7 @@ export class VideoThemeQueue {
   private failed = new Set<string>();
   private compared = new Map<string, Set<string>>();
   private sparseOpenings = new Map<string, NonNullable<VideoThemes['op']>[]>();
+  private knownOpeningMatches = new Map<string, VideoThemes['op']>();
   private recaps = new Map<string, NonNullable<VideoThemes['recap']>>();
   private controller = new AbortController();
   private active = '';
@@ -46,7 +77,9 @@ export class VideoThemeQueue {
   constructor(
     private onStatus: (status: ScanStatus) => void,
     private onMatch: (id: string, themes: VideoThemes) => void,
-    private savedThemes: (id: string) => VideoThemes
+    private savedThemes: (id: string) => VideoThemes,
+    private fresh = false,
+    private preferredId = ''
   ) {}
 
   update(files: ScanFile[]) {
@@ -70,7 +103,7 @@ export class VideoThemeQueue {
 
   private report() {
     this.onStatus({ active: this.active, total: this.files.length,
-      restoring: this.files.some(item => !this.cachedFrames.has(item.id)),
+      restoring: !this.fresh && this.files.some(item => !this.cachedFrames.has(item.id)),
       scanned: this.files.filter(item => this.frames.has(item.id)).length,
       failed: this.files.filter(item => this.failed.has(item.id)).length });
   }
@@ -100,7 +133,7 @@ export class VideoThemeQueue {
         if (compared.has(other.id)) continue;
 
         const key = JSON.stringify([current.id, other.id]);
-        let comparison = await scanCache<Comparison>('comparisons', key).catch(() => undefined);
+        let comparison = this.fresh ? undefined : await scanCache<Comparison>('comparisons', key).catch(() => undefined);
         this.controller.signal.throwIfAborted();
         if (this.paused) return;
         const directions = [[frames, reference], [reference, frames]] as const;
@@ -149,10 +182,46 @@ export class VideoThemeQueue {
     }
   }
 
+  private async checkKnownOpenings() {
+    for (const [index, item] of this.files.entries()) {
+      if (this.paused) return;
+      this.controller.signal.throwIfAborted();
+      const frames = this.frames.get(item.id);
+      const saved = this.savedThemes(item.id);
+      const recap = this.recaps.get(item.id) ?? saved.recap;
+      if (!frames?.op.length || (saved.op && !overlapsRecap(saved.op, recap))) continue;
+      const candidates: NonNullable<VideoThemes['op']>[] = [];
+      for (const other of this.files.slice(Math.max(0, index - 2), index + 3)) {
+        if (other === item) continue;
+        const reference = this.frames.get(other.id);
+        const referenceThemes = this.savedThemes(other.id);
+        const opening = referenceThemes.op;
+        if (!reference || !opening || overlapsRecap(opening, this.recaps.get(other.id) ?? referenceThemes.recap)) continue;
+        const key = JSON.stringify(['known-opening', item.id, other.id, opening, recap]);
+        if (!this.knownOpeningMatches.has(key)) {
+          const cached = this.fresh ? undefined : await scanCache<{ opening?: VideoThemes['op'] }>('comparisons', key).catch(() => undefined);
+          this.controller.signal.throwIfAborted();
+          if (this.paused) return;
+          const match = cached ? cached.opening : matchKnownOpening(frames, reference, opening, recap);
+          this.knownOpeningMatches.set(key, match);
+          if (!cached) await scanCache('comparisons', key, { opening: match }).catch(() => {});
+        }
+        const candidate = this.knownOpeningMatches.get(key);
+        if (!candidate) continue;
+        const confirmed = confirmLateOpening(candidate, candidates);
+        if (confirmed) {
+          if (!this.paused) await this.refineNewThemes(item, { op: confirmed });
+          break;
+        }
+        candidates.push(candidate);
+      }
+    }
+  }
+
   private async restoreFingerprints() {
     const unchecked = this.files.filter(item => !this.cachedFrames.has(item.id));
     await Promise.all(unchecked.map(async item => {
-      const cached = await scanCache<Fingerprint>('frames', item.id).catch(() => undefined);
+      const cached = this.fresh ? undefined : await scanCache<Fingerprint>('frames', item.id).catch(() => undefined);
       this.cachedFrames.set(item.id, cached);
       if (cached?.openingScanEnd !== undefined) this.frames.set(item.id, cached);
     }));
@@ -166,16 +235,22 @@ export class VideoThemeQueue {
       while (!this.controller.signal.aborted) {
         await this.restoreFingerprints();
         if (this.controller.signal.aborted) break;
-        if (!this.paused) await this.compareReadyFiles();
+        if (!this.paused) {
+          await this.compareReadyFiles();
+          await this.checkKnownOpenings();
+        }
         // A folder refresh can add files while cached results are loading.
         if (this.files.some(item => !this.cachedFrames.has(item.id))) continue;
         if (this.paused) break;
-        const next = this.files.find(item => !this.frames.has(item.id) && !this.failed.has(item.id));
+        const priority = Math.max(0, this.files.findIndex(item => item.id === this.preferredId));
+        const needsScan = (item: ScanFile) => !this.frames.has(item.id) && !this.failed.has(item.id);
+        const next = this.files.slice(priority).find(needsScan) ?? this.files.slice(0, priority).find(needsScan);
         if (!next) break;
         this.active = next.file.name;
         this.report();
         try {
           const frames = await fingerprintVideo(next.file, this.controller.signal, this.cachedFrames.get(next.id));
+          this.controller.signal.throwIfAborted();
           await scanCache('frames', next.id, frames).catch(() => {});
           this.controller.signal.throwIfAborted();
           this.frames.set(next.id, frames);
