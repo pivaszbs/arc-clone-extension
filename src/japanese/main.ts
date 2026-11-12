@@ -1,2 +1,2 @@
 import { startJapaneseStudy } from './mount';
-startJapaneseStudy();
+startJapaneseStudy(true);

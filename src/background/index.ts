@@ -2,6 +2,8 @@ import { desktopPipRequest } from './desktop-pip';
 import { getSpaceFavorites, getTodayTabs, urlKey } from '../shared/tabs';
 import { studyRequest } from '../japanese/storage';
 import { subtitleUrl } from '../japanese/captions';
+import { supportedSite } from '../japanese/study';
+import { captureCaptionResponses } from '../japanese/network-captions';
 import {
   type ArcState,
   type ExtensionSettings,
@@ -18,6 +20,7 @@ import {
 } from '../shared/types';
 
 const STORAGE_KEY = 'arc_chrome_state_v1';
+const captionScans = new Map<string, Promise<chrome.scripting.InjectionResult<string[]>[]>>();
 
 const DEFAULT_SETTINGS: ExtensionSettings = {
   targetLanguage: 'en',
@@ -975,6 +978,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     if (typeof message?.type === 'string' && message.type.startsWith('DESKTOP_PIP_')) {
       sendResponse(await desktopPipRequest(message, sender));
+      return;
+    }
+    if (message?.type === 'JAPANESE_SCAN_NETWORK') {
+      const tabId = sender.tab?.id;
+      const allowed = [sender.tab?.url, sender.url].some(value => {
+        try { return supportedSite(new URL(value || '').hostname); } catch { return false; }
+      });
+      if (tabId === undefined || sender.frameId === undefined || !allowed) throw new Error('Open the scan from a supported video page.');
+      const target = sender.documentId ? { tabId, documentIds: [sender.documentId] } : { tabId, frameIds: [sender.frameId] };
+      const key = sender.documentId ?? `${tabId}:${sender.frameId}`;
+      let scan = captionScans.get(key);
+      if (!scan) {
+        scan = chrome.scripting.executeScript({ target, world: 'MAIN', func: captureCaptionResponses })
+          .finally(() => captionScans.delete(key));
+        captionScans.set(key, scan);
+      }
+      const [result] = await scan;
+      sendResponse({ bodies: result?.result || [] });
       return;
     }
     if (message?.type === 'JAPANESE_FETCH_CAPTIONS') {

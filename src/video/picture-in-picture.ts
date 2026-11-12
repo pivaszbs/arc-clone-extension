@@ -1,8 +1,10 @@
 import { DesktopVideoStream } from './desktop-stream';
+import { canMountStudy, OPEN_JAPANESE_STUDY } from '../japanese/study';
 /** Native video PiP only: no cloning, reparenting or restarting the media element. */
 export function installPictureInPictureControls(doc: Document = document) {
   const win = doc.defaultView;
   if (!win || !('requestPictureInPicture' in win.HTMLVideoElement.prototype)) return () => {};
+  const studyAvailable = canMountStudy(win);
   const hostId = 'arc-video-picture-in-picture';
   if (doc.getElementById(hostId)) return () => {};
 
@@ -64,6 +66,15 @@ export function installPictureInPictureControls(doc: Document = document) {
     desktopButton.style.marginTop = '4px';
     desktopButton.hidden = !/Mac/i.test(navigator.platform);
     element.insertBefore(desktopButton, status);
+    const studyButton = doc.createElement('button');
+    studyButton.type = 'button';
+    studyButton.textContent = 'Learn Japanese';
+    studyButton.style.marginTop = '4px';
+    studyButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      video.dispatchEvent(new Event(OPEN_JAPANESE_STUDY, { bubbles: true }));
+    });
+    if (studyAvailable) element.insertBefore(studyButton, status);
     const desktop = new DesktopVideoStream(video, update, (message) => {
       status.textContent = message; status.hidden = false;
     });
@@ -96,8 +107,11 @@ export function installPictureInPictureControls(doc: Document = document) {
         && rect.top < win!.innerHeight - 40 && rect.right > 40 && rect.left < win!.innerWidth - 40
         && win!.getComputedStyle(video).visibility !== 'hidden'
         && win!.getComputedStyle(video).display !== 'none';
+      const pipDisabled = video.disablePictureInPicture && !active;
+      button.hidden = pipDisabled;
+      desktopButton.hidden = pipDisabled || !/Mac/i.test(navigator.platform);
       element.hidden = !visible || video.readyState === 0 || video.videoWidth === 0
-        || (video.disablePictureInPicture && !active) || Boolean(doc.fullscreenElement);
+        || (pipDisabled && !studyAvailable) || Boolean(doc.fullscreenElement);
       element.style.top = `${Math.max(8, rect.top + 8)}px`;
       element.style.right = `${Math.max(8, win!.innerWidth - rect.right + 8)}px`;
     }

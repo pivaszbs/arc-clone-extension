@@ -1,4 +1,4 @@
-const HOST = 'local.arcclone.desktop_video';
+const HOST = 'local.arcclone.desktop_video_v2';
 let port: chrome.runtime.Port | undefined;
 let active: { sessionId: string; tabId: number; frameId: number; ready?: (value: any) => void; timer?: ReturnType<typeof setTimeout> } | undefined;
 const statusRequests = new Map<string, { resolve: (value: any) => void; timer: ReturnType<typeof setTimeout> }>();
@@ -72,8 +72,11 @@ export async function desktopPipRequest(message: any, sender: chrome.runtime.Mes
   if (!active || message.sessionId !== active.sessionId || sender.tab?.id !== active.tabId || (sender.frameId || 0) !== active.frameId) {
     throw new Error('The desktop PiP session is no longer active.');
   }
-  if (message.type === 'DESKTOP_PIP_START') port?.postMessage({ type: 'start', sessionId: active.sessionId, mime: message.mime });
-  else if (message.type === 'DESKTOP_PIP_CHUNK') {
+  if (message.type === 'DESKTOP_PIP_START') {
+    port?.postMessage({ type: 'start', sessionId: active.sessionId, mime: message.mime, paused: Boolean(message.paused) });
+  } else if (message.type === 'DESKTOP_PIP_PLAYBACK') {
+    port?.postMessage({ type: 'playback', sessionId: active.sessionId, paused: Boolean(message.paused), failed: Boolean(message.failed) });
+  } else if (message.type === 'DESKTOP_PIP_CHUNK') {
     if (typeof message.data !== 'string' || message.data.length > 1_400_000) throw new Error('Desktop video chunk is too large.');
     port?.postMessage({ type: 'chunk', sessionId: active.sessionId, data: message.data });
   } else if (message.type === 'DESKTOP_PIP_CLOSE') {

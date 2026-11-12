@@ -11,6 +11,16 @@ export class AutoSubtitles {
   private hidden = new Map<TextTrack, TextTrackMode>();
   private scanning = false;
   private resourceStart = performance.now();
+  useNetworkCaptions(bodies: string[]) {
+    const cues = bodies.map(parseCaptionResponse).filter(cues => japaneseCaptions(cues))
+      .sort((a, b) => b.length - a.length)[0];
+    if (!cues) return 0;
+    this.generation++;
+    this.scanning = false;
+    this.cues = cues;
+    this.source = 'Player network responses';
+    return cues.length;
+  }
   reset(key = '') {
     if (this.key) this.resourceStart = performance.now();
     this.generation++; this.key = key; this.cues = []; this.source = ''; this.attempts.clear(); this.scanning = false;

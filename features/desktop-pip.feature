@@ -9,6 +9,10 @@ Feature: macOS desktop video panel
     Then the desktop panel joins all Spaces and full-screen Spaces
     And the desktop panel decodes the captured video
     And the desktop panel keeps receiving a playing live stream
+    When I pause the original video
+    Then the desktop video pauses and offers Play
+    When I resume the original video
+    Then the desktop video resumes and offers Pause
     When I switch to another browser tab
     Then the desktop panel video keeps advancing
     When I return the desktop video to the page

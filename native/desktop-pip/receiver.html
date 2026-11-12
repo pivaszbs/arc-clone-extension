@@ -1,21 +1,51 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:">
-<style>html,body{margin:0;width:100%;height:100%;background:#111;color:white;font:13px system-ui;overflow:hidden}video{width:100%;height:100%;object-fit:contain}#state{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}button{position:absolute;top:6px;right:6px;background:#222a;color:white;border:1px solid #aaa6;border-radius:5px;padding:4px 8px;cursor:pointer}</style>
-<video id="video" autoplay playsinline></video><div id="state">Connecting video…</div><button onclick="send({type:'toggle-play'})">Play / pause</button>
+<style>
+html,body { margin:0; width:100%; height:100%; background:#111; color:white; font:13px system-ui; overflow:hidden; }
+video { width:100%; height:100%; object-fit:contain; }
+#state { position:absolute; inset:0; display:grid; place-items:center; pointer-events:none; }
+#state[hidden], [hidden] { display:none; }
+#controls { position:absolute; inset:auto 0 0; display:grid; justify-items:center; gap:6px; padding:8px 10px; background:linear-gradient(transparent,#000a); }
+button { min-width:76px; min-height:36px; background:#222e; color:white; border:1px solid #aaa8; border-radius:8px; cursor:pointer; font:inherit; }
+button:hover { background:#424242; }
+button:focus-visible { outline:2px solid #fff; outline-offset:2px; }
+button:disabled { opacity:.55; cursor:default; }
+#playback-error { background:#222; padding:6px 8px; border-radius:6px; }
+</style>
+<video id="video" playsinline></video>
+<div id="state">Connecting video…</div>
+<div id="controls">
+  <span id="playback-error" role="status" hidden></span>
+  <button id="playback" type="button" disabled>Play</button>
+</div>
 <script>
 const video = document.getElementById('video');
 const state = document.getElementById('state');
+const playback = document.getElementById('playback');
+const playbackError = document.getElementById('playback-error');
 const send = value => window.webkit.messageHandlers.bridge.postMessage(value);
 const formats = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4;codecs=avc1.42E01E','video/webm;codecs=vp8,opus'];
 let source, buffer, queue = [], received = 0, tryingPlay = false;
+let sourcePaused = true;
+playback.addEventListener('click', () => send({ type: sourcePaused ? 'play' : 'pause' }));
+window.setPlayback = (paused, failed = false) => {
+  sourcePaused = paused;
+  playback.textContent = paused ? '▶ Play' : 'Ⅱ Pause';
+  playback.setAttribute('aria-label', paused ? 'Play' : 'Pause');
+  playbackError.textContent = failed ? 'Use Play on the original video to resume.' : '';
+  playbackError.hidden = !failed;
+  if (paused) video.pause();
+  else pump();
+};
 async function resume() {
-  if (!video.paused || tryingPlay || video.readyState < 2) return;
+  if (sourcePaused || !video.paused || tryingPlay || video.readyState < 2) return;
   tryingPlay = true;
-  try { await video.play(); } catch(error) { send({type:'error',error:'The desktop player could not resume playback.'}); }
+  try { await video.play(); }
+  catch { if (!sourcePaused) send({type:'error',error:'The desktop player could not resume playback.'}); }
   finally { tryingPlay = false; }
 }
-window.start = (mime, muted, volume) => {
+window.start = (mime, muted, volume, paused) => {
   video.muted = muted; video.volume = volume;
   source = new MediaSource();
   video.src = URL.createObjectURL(source);
@@ -23,7 +53,8 @@ window.start = (mime, muted, volume) => {
     try { buffer = source.addSourceBuffer(mime); buffer.addEventListener('updateend', pump); buffer.addEventListener('error', () => send({type:'error',error:'Video decoding failed in the desktop player.'})); pump(); }
     catch(error) { send({type:'error', error: 'The desktop player does not support this video format.'}); }
   }, {once:true});
-  video.play().catch(() => {});
+  playback.disabled = false;
+  window.setPlayback(paused);
 };
 window.chunk = data => {
   if (queue.length > 80) { send({type:'error',error:'The desktop player could not keep up. Try again.'}); return; }
@@ -33,16 +64,16 @@ function pump() {
   if (!buffer || buffer.updating || source.readyState !== 'open') return;
   // Recorder fragments describe finite clips; this receiver is a continuing live stream.
   if (source.duration !== Infinity) source.duration = Infinity;
-  resume();
   if (buffer.buffered.length) {
     const end = buffer.buffered.end(buffer.buffered.length-1);
-    if (end - video.currentTime > 2.5) video.currentTime = Math.max(buffer.buffered.start(buffer.buffered.length-1),end-.6);
+    if (!sourcePaused && end - video.currentTime > 2.5) video.currentTime = Math.max(buffer.buffered.start(buffer.buffered.length-1),end-.6);
     if (video.currentTime > 35 && buffer.buffered.start(0) < video.currentTime-30) { buffer.remove(0,video.currentTime-20); return; }
   }
+  void resume();
   if (queue.length) { try { buffer.appendBuffer(queue.shift()); } catch(error) { send({type:'error',error:'Could not append video to the desktop player.'}); } }
 }
-video.addEventListener('playing', () => { state.hidden = true; state.style.display = 'none'; send({type:'playing'}); });
+video.addEventListener('playing', () => { state.hidden = true; send({type:'playing'}); });
 video.addEventListener('error', () => send({type:'error',error:'Video could not play in the desktop window.'}));
-window.statusSnapshot = () => ({time:video.currentTime,paused:video.paused,readyState:video.readyState,received,videoWidth:video.videoWidth,audioTracks:video.audioTracks?.length||0,visibility:document.visibilityState,ended:video.ended,duration:Number.isFinite(video.duration)?video.duration:null,bufferEnd:buffer?.buffered.length?buffer.buffered.end(buffer.buffered.length-1):0,muted:video.muted,volume:video.volume});
+window.statusSnapshot = () => ({time:video.currentTime,paused:video.paused,playbackAction:playback.getAttribute('aria-label'),readyState:video.readyState,received,videoWidth:video.videoWidth,audioTracks:video.audioTracks?.length||0,visibility:document.visibilityState,ended:video.ended,duration:Number.isFinite(video.duration)?video.duration:null,bufferEnd:buffer?.buffered.length?buffer.buffered.end(buffer.buffered.length-1):0,muted:video.muted,volume:video.volume});
 send({type:'ready',formats:typeof MediaSource === 'undefined' ? [] : formats.filter(type=>MediaSource.isTypeSupported(type))});
 </script>

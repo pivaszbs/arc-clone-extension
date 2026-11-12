@@ -6,6 +6,9 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = resolve(__dirname, '..');
+// Content scripts share an isolated world. Keep native class fields so esbuild
+// does not emit colliding private-field helpers outside each script's IIFE.
+const contentTarget = 'chrome120';
 
 async function buildExtensionScripts() {
   // 1. Build Background Service Worker
@@ -41,6 +44,7 @@ async function buildExtensionScripts() {
       })
     ],
     build: {
+      target: contentTarget,
       outDir: 'dist',
       emptyOutDir: false,
       lib: {
@@ -62,7 +66,7 @@ async function buildExtensionScripts() {
     root: rootDir,
     plugins: [svelte({ compilerOptions: { css: 'injected' } })],
     build: {
-      outDir: 'dist', emptyOutDir: false,
+      outDir: 'dist', emptyOutDir: false, target: contentTarget,
       lib: { entry: resolve(rootDir, 'src/japanese/main.ts'), name: 'ArcJapanese', formats: ['iife'], fileName: () => 'japanese.js' },
       rollupOptions: { output: { inlineDynamicImports: true } }
     }
@@ -72,7 +76,7 @@ async function buildExtensionScripts() {
     configFile: false,
     root: rootDir,
     build: {
-      outDir: 'dist', emptyOutDir: false,
+      outDir: 'dist', emptyOutDir: false, target: contentTarget,
       lib: { entry: resolve(rootDir, 'src/video/main.ts'), name: 'ArcVideo', formats: ['iife'], fileName: () => 'video.js' },
       rollupOptions: { output: { inlineDynamicImports: true } }
     }

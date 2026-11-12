@@ -1,6 +1,6 @@
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
-export const hostName = 'local.arcclone.desktop_video';
+export const hostName = 'local.arcclone.desktop_video_v2';
 export function hostManifest(extensionIds) {
   if (extensionIds.some(id => !/^[a-p]{32}$/.test(id))) throw new Error('Invalid extension ID.');
   return { name:hostName, description:'Local Arc video player across macOS desktops and full-screen Spaces',

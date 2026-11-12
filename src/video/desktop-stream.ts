@@ -23,7 +23,9 @@ export class DesktopVideoStream {
       this.sessionId = response.sessionId;
       const mime = (response.formats as string[]).find(type => MediaRecorder.isTypeSupported(type));
       if (!mime) throw new Error('The browser and desktop player have no compatible video format.');
-      const start = await chrome.runtime.sendMessage({ type: 'DESKTOP_PIP_START', sessionId: this.sessionId, mime });
+      const start = await chrome.runtime.sendMessage({
+        type: 'DESKTOP_PIP_START', sessionId: this.sessionId, mime, paused: video.paused || video.ended
+      });
       if (start?.error) throw new Error(start.error);
       const options: MediaRecorderOptions & { videoKeyFrameIntervalDuration: number } = {
         mimeType: mime, videoBitsPerSecond: 1600000, audioBitsPerSecond: 128000, videoKeyFrameIntervalDuration: 250
@@ -49,6 +51,8 @@ export class DesktopVideoStream {
       // Element mute does not mute captureStream's audio, avoiding duplicate playback.
       video.muted = true;
       chrome.runtime.onMessage.addListener(this.listener);
+      for (const type of ['play', 'pause', 'ended']) video.addEventListener(type, this.onPlaybackChange);
+      this.syncPlayback();
       this.update();
     } catch (error) {
       this.stop();
@@ -61,17 +65,29 @@ export class DesktopVideoStream {
       return;
     }
     if (message.type !== 'DESKTOP_PIP_EVENT' || message.sessionId !== this.sessionId) return;
-    if (message.event === 'toggle-play') {
-      if (this.video.paused) void this.video.play().catch(() => {}); else this.video.pause();
+    if (message.event === 'play') {
+      void this.video.play().then(() => this.syncPlayback(), () => this.syncPlayback(true));
+    } else if (message.event === 'pause') {
+      this.video.pause();
+      this.syncPlayback();
     } else if (message.event === 'closed' || message.event === 'error') {
       if (message.error) this.error(message.error);
       this.stop(false);
     }
   };
+  syncPlayback(failed = false) {
+    if (!this.active) return;
+    void chrome.runtime.sendMessage({
+      type: 'DESKTOP_PIP_PLAYBACK', sessionId: this.sessionId,
+      paused: this.video.paused || this.video.ended, failed
+    }).catch(() => {});
+  }
+  onPlaybackChange = () => this.syncPlayback();
   onPageHide = () => this.stop();
   stop(closeWindow = true) {
     this.video.ownerDocument.defaultView?.removeEventListener('pagehide', this.onPageHide);
     this.video.removeEventListener('emptied', this.onPageHide);
+    for (const type of ['play', 'pause', 'ended']) this.video.removeEventListener(type, this.onPlaybackChange);
     this.active = false;
     chrome.runtime.onMessage.removeListener(this.listener);
     if (this.recorder && this.recorder.state !== 'inactive') this.recorder.stop();

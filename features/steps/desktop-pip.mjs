@@ -64,3 +64,25 @@ Then('the desktop panel keeps receiving a playing live stream', async function (
     return state.media?.received>=4 && state.media?.paused===false && state.media?.ended===false;
   },{timeout:15000}).toBe(true);
 });
+
+When('I pause the original video', async function () {
+  await this.videoPage.locator('video').evaluate(video => video.pause());
+});
+
+When('I resume the original video', async function () {
+  await this.videoPage.locator('video').evaluate(video => video.play());
+});
+
+Then('the desktop video pauses and offers Play', async function () {
+  await expect.poll(async () => {
+    const { media, source } = await status(this);
+    return media?.paused && source?.paused && media?.playbackAction === 'Play';
+  }).toBe(true);
+});
+
+Then('the desktop video resumes and offers Pause', async function () {
+  await expect.poll(async () => {
+    const { media, source } = await status(this);
+    return media?.paused === false && source?.paused === false && media?.playbackAction === 'Pause';
+  }).toBe(true);
+});

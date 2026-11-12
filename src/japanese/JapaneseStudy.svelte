@@ -1,12 +1,17 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { requestArc } from './client';
-  import { hasJapanese, parseSubtitles, sourceUrl, type Card, type Cue } from './study';
+  import { hasJapanese, OPEN_JAPANESE_STUDY, parseSubtitles, sourceUrl, type Card, type Cue } from './study';
   import { ListeningQuiz, knowledge, choices, defaultQuizSettings, type Challenge, type ListeningCue, type QuizSettings } from './quiz';
   import { AutoSubtitles } from './auto-subtitles';
+  let { networkScanAvailable = false }: { networkScanAvailable?: boolean } = $props();
   let open = $state(false);
   let mode = $state<'watch' | 'review'>('watch');
   let video = $state<HTMLVideoElement | null>(null);
+  let selectedVideo: HTMLVideoElement | null = null;
+  let networkScanning = $state(false);
+  let networkStatus = $state('');
+  let studySession = 0;
   let text = $state('');
   let meaning = $state('');
   let cards = $state<Card[]>([]);
@@ -78,7 +83,8 @@
       text = ''; meaning = ''; captured = null; restoreSpeed();
       challenge = null; quizRequest++; quizEngine.reset(); automatic.reset(); automaticCues = []; automaticSource = '';
     }
-    const nextVideo = Array.from(document.querySelectorAll('video')).filter((v) => v.getBoundingClientRect().width > 0).sort((a, b) => Number(b === document.activeElement) - Number(a === document.activeElement) || b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0] || null;
+    if (!selectedVideo?.isConnected) selectedVideo = null;
+    const nextVideo = selectedVideo ?? Array.from(document.querySelectorAll('video')).filter((v) => v.getBoundingClientRect().width > 0).sort((a, b) => Number(b === document.activeElement) - Number(a === document.activeElement) || b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0] ?? null;
     if (video !== nextVideo) { loop = null; stopAfter = null; restoreSpeed(); challenge = null; quizRequest++; quizEngine.reset(); automatic.reset(); automaticCues = []; automaticSource = ''; }
     video = nextVideo;
     const playerSource = video?.currentSrc || '';
@@ -108,12 +114,60 @@
     try { const response = await requestArc({ type: 'JAPANESE_LIST' }); cards = response.cards; quizSettings = response.settings || { ...defaultQuizSettings }; }
     catch { status = 'Could not load saved phrases. Reload the extension and this page.'; }
   }
+  function openPanel() {
+    if (open) return;
+    open = true;
+    tick();
+    void load();
+  }
+  async function scanNetwork() {
+    if (!video || networkScanning) return;
+    const player = video;
+    const source = player.currentSrc;
+    const url = location.href;
+    const session = studySession;
+    const samePlayer = () => open && studySession === session && video === player && player.currentSrc === source && location.href === url;
+    networkScanning = true;
+    networkStatus = 'Scanning for 10 seconds. Play the video or toggle its Japanese subtitle track now.';
+    try {
+      const { bodies } = await requestArc({ type: 'JAPANESE_SCAN_NETWORK' }) as { bodies: string[] };
+      if (!samePlayer()) return;
+      const count = automatic.useNetworkCaptions(bodies);
+      if (count) {
+        automaticCues = [...automatic.cues];
+        automaticSource = automatic.source;
+        networkStatus = `Loaded ${count} Japanese subtitle ${count === 1 ? 'cue' : 'cues'} from the player.`;
+        if (imported.length) networkStatus += ' Your imported subtitles still take priority.';
+      } else {
+        networkStatus = bodies.length
+          ? 'The scan found subtitle responses without readable Japanese cues.'
+          : 'No subtitle response was captured. Try switching the subtitle track off and on. Subtitles baked into the video have no separate text track.';
+      }
+    } catch {
+      if (samePlayer()) networkStatus = 'The scan could not start in this frame. Reload the page and try again.';
+    } finally {
+      if (!samePlayer()) networkStatus = '';
+      networkScanning = false;
+    }
+  }
   onMount(() => {
     void load();
     const timer = setInterval(tick, 100);
     const selection = () => { const value = window.getSelection()?.toString().trim() || ''; if (value && hasJapanese(value)) lastSelection = value; };
+    const openFromVideo = (event: Event) => {
+      if (!(event.target instanceof HTMLVideoElement)) return;
+      selectedVideo = event.target;
+      if (open) tick(); else openPanel();
+    };
     document.addEventListener('selectionchange', selection);
-    return () => { clearInterval(timer); automatic.reset(); restoreSpeed(); document.removeEventListener('selectionchange', selection); };
+    document.addEventListener(OPEN_JAPANESE_STUDY, openFromVideo);
+    return () => {
+      clearInterval(timer);
+      automatic.reset();
+      restoreSpeed();
+      document.removeEventListener('selectionchange', selection);
+      document.removeEventListener(OPEN_JAPANESE_STUDY, openFromVideo);
+    };
   });
   async function play(cue: Cue, repeat: boolean) {
     if (!video) { status = 'Start a video first. If it is embedded, use the Japanese button inside the player.'; return; }
@@ -216,6 +270,7 @@
     catch { status = 'Could not save quiz frequency.'; }
   }
   function closePanel() {
+    selectedVideo = null; studySession++; networkStatus = '';
     open = false; quizEnabled = false; loop = null; stopAfter = null; challenge = null; quizRequest++; quizLoading = false; quizEngine.reset(); restoreSpeed();
     automatic.reset(); automaticCues = []; automaticSource = '';
   }
@@ -265,6 +320,10 @@
       {:else if mode === 'watch'}
         <p class="connection" aria-live="off">{video ? `Connected to video · ${playbackReady ? playbackPaused ? 'Paused' : 'Playing' : 'Loading'} · ${clock(playbackTime)}` : 'No video connected in this frame'}</p>
         <p class="hint">{automaticSource ? `Ready automatically · ${automaticSource}` : detected ? 'Reading the player’s Japanese captions automatically.' : 'Looking for Japanese subtitles in the player and its caption requests…'}</p>
+        {#if networkScanAvailable}
+          <button disabled={!playbackReady || networkScanning} onclick={scanNetwork}>Scan for subtitles</button>
+          {#if networkStatus}<p class="status" role="status">{networkStatus}</p>{/if}
+        {/if}
         <label class="quiz-toggle"><input type="checkbox" bind:checked={quizEnabled} onchange={() => quizEngine.reset()} /> Pause for listening quizzes</label>
         {#if quizEnabled}<p class="hint">Known phrases pause when due. Short lines with an estimated 1–2 unfamiliar words are sampled. Learning starts from your answers.</p><label>Sample unfamiliar lines <select aria-label="Unfamiliar phrase frequency" value={String(quizSettings.chance)} onchange={setChance}><option value="0.1">Occasionally · 10%</option><option value="0.25">Sometimes · 25%</option><option value="0.5">Often · 50%</option><option value="1">Every eligible line</option></select></label><p class="hint">Quiz mode sends selected subtitle lines to Google Translate to prepare answers. Your answers stay on this device.</p>{/if}
         <p class="hint">Listen once. Replay. Say it aloud. Save a phrase you want to use.</p>
@@ -285,7 +344,7 @@
       <footer><span>{cards.length} saved · stored on this device</span><button disabled={!cards.length} onclick={exportCards}>Export</button></footer>
     </section>
   {/if}
-  <button class="launcher" disabled={busy} aria-expanded={open} onclick={() => { if (open) closePanel(); else { open = true; void load(); } }}>日本語 <span>{open ? 'Close' : 'Learn'}</span></button>
+  <button class="launcher" disabled={busy} aria-expanded={open} onclick={() => { if (open) closePanel(); else openPanel(); }}>日本語 <span>{open ? 'Close' : 'Learn'}</span></button>
 </div>
 
 <style>

@@ -1,9 +1,15 @@
 export type Cue = { start: number; end: number; text: string };
 export type Card = Cue & { id: string; meaning: string; url: string; title: string; due: number; interval: number };
 export const STUDY_KEY = 'arc_japanese_cards_v1';
+export const OPEN_JAPANESE_STUDY = 'arc-open-japanese-study';
 export const hasJapanese = (text: string) => /[\u3040-\u30ff\u3400-\u9fff]/u.test(text);
 export function supportedSite(host: string) {
   return ['youtube.com', 'smotret-anime.com', 'smotret-anime.net'].some((domain) => host === domain || host.endsWith('.' + domain));
+}
+export function canMountStudy(win: Window) {
+  return [win.location.href, win.document.referrer, ...Array.from(win.location.ancestorOrigins || [])].some(value => {
+    try { return supportedSite(new URL(value).hostname); } catch { return false; }
+  });
 }
 export function parseSubtitles(input: string): Cue[] {
   const stamp = '(?:(\\d{1,2}):)?(\\d{2}):(\\d{2})[.,](\\d{3})';

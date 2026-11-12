@@ -35,9 +35,9 @@ npm run install:desktop-pip
 npm run build
 ```
 
-Reload the extension in Chrome, approve its local native-messaging permission if Chrome requests it, then refresh the video page. Choose **Across desktops** at the video's top right. **Return to page** closes the desktop window and restores the original player. The desktop window's play/pause button controls the source video.
+Reload the extension in Chrome, approve its local native-messaging permission if Chrome requests it, then refresh the video page. Choose **Across desktops** at the video's top right. Drag the window by its title bar. **Play** and **Pause** control the source video and follow playback changes on the page. **Return to page** closes the desktop window and restores the original player.
 
-The installer registers only this extension ID in a new `local.arcclone.desktop_video.json` file in your user-level Chrome NativeMessagingHosts folder. Other hosts are preserved. If the loaded extension has a different ID, pass it explicitly to `node scripts/install-desktop-pip.mjs EXTENSION_ID`. The companion executable remains under `outputs/desktop-pip/Arc Desktop Video.app/` in this workspace. It starts on request and exits when the connection closes.
+The installer registers this extension ID in `local.arcclone.desktop_video_v2.json` in your user-level Chrome NativeMessagingHosts folder. It can coexist with the original helper. If the loaded extension has a different ID, pass it explicitly to `node scripts/install-desktop-pip.mjs EXTENSION_ID`. The companion executable remains under `outputs/desktop-pip/Arc Desktop Video.app/` in this workspace. It starts on request and exits when the connection closes.
 
 The desktop player receives a capture of the selected video through local native messaging. It does not reopen the media URL, forward cookies, run an HTTP server, or capture the screen or microphone. It can therefore handle a same-origin blob source without transferring that blob URL to another browser. Captured audio follows the original mute and volume settings, while the page is muted to prevent duplicate audio. Closing the panel restores the page state. There is a short encoding/buffering delay.
 
@@ -55,7 +55,9 @@ The standalone iPad Safari extension is built with `npm run build:safari`. It ge
 
 For an iPad Safari build, run `npm run build:ipad`. The self-contained Userscripts file is written to `outputs/ipad/arc-japanese.user.js`; follow `outputs/ipad/SETUP.md`. This reuses the same player controls and quiz engine with a Userscripts storage / translation adapter. It does not require Xcode or an Apple developer subscription. Device compatibility still needs testing on an iPad.
 
-On YouTube and smotret-anime.com / smotret-anime.net, click **日本語 Learn** at the bottom right. For embedded anime players, use the button inside the player frame. Open a video with Japanese audio and enable Japanese captions when available.
+On YouTube and smotret-anime.com / smotret-anime.net, click **Learn Japanese** beside the video controls in Chrome, or **日本語 Learn** at the bottom right. For embedded anime players, use the button inside the player frame. Open a video with Japanese audio and enable Japanese captions when available.
+
+In Chrome, click **Scan for subtitles** in **Watch & learn** if the panel shows no Japanese text. Play the video or turn the Japanese subtitle track off and on during the 10-second scan so the player requests it again. The scan reads caption-like fetch and XMLHttpRequest responses in the player frame and keeps usable cues in memory for this video. It can recover subtitle files whose names lack a file extension. Captions baked into the video need a separate subtitle file for the study panel.
 
 - Replay the last five seconds, loop the captured section, or slow playback to 0.85× / 0.7×. Closing the panel stops its loop and restores the previous speed.
 - Capture a Japanese caption, select Japanese page text and capture it, or paste a phrase. Add its meaning yourself or click **Translate to English**. Only that explicit translation action sends the phrase to Arc's existing Google Translate service.
