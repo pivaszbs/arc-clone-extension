@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { build } from 'esbuild';
 
 const { outputFiles } = await build({ entryPoints: ['src/japanese/video-themes.ts'], bundle: true, write: false, format: 'esm' });
-const { matchVideoThemes } = await import('data:text/javascript;base64,' + Buffer.from(outputFiles[0].text).toString('base64'));
+const { confirmLateOpening, matchLateOpening, matchRecap, matchVideoThemes, overlapsRecap } = await import('data:text/javascript;base64,' + Buffer.from(outputFiles[0].text).toString('base64'));
 
 function frames(length, makeFrame) {
   return Array.from({ length }, (_, time) => ({ time, pixels: makeFrame(time) }));
@@ -36,4 +36,27 @@ test('does not treat a long static sequence as a theme', () => {
 test('does not offer to skip a brief repeated prologue', () => {
   const episode = seed => frames(150, time => frame(time < 62 ? time + 123 : time + seed));
   assert.equal(matchVideoThemes({ op: episode(700), ed: [] }, { op: episode(9800), ed: [] }).op, undefined);
+});
+
+test('matches a recap to the previous ending and keeps the later opening separate', () => {
+  const previous = { op: [], ed: frames(150, time => frame(time + 700)) };
+  const current = { op: frames(330, time => frame(time >= 190 && time < 250 ? time - 190 + 730 : time + 10000)), ed: [] };
+  const recap = matchRecap(current, previous);
+  assert.deepEqual(recap, { start: 189.5, end: 249.5 });
+  assert.equal(overlapsRecap({ start: 180, end: 265 }, recap), true);
+  assert.equal(overlapsRecap({ start: 250, end: 330 }, recap), false);
+  assert.equal(matchRecap(previous, current), undefined);
+  assert.equal(matchRecap(current, { op: [], ed: frames(150, time => frame(time + 20000)) }), undefined);
+});
+
+test('a late opening with sparse matching frames requires two agreeing references', () => {
+  const anchors = new Set([0, 2, 4, 16, 18, 28, 30, 44, 46, 58, 60, 72, 86, 88]);
+  const episode = (start, seed) => ({ op: frames(590, time => frame(anchors.has(time - start) ? time - start + 123 : time + seed)), ed: [] });
+  const current = episode(480, 700);
+  const first = matchLateOpening(current, episode(115, 9800));
+  const second = matchLateOpening(current, episode(125, 12400));
+  assert.ok(first && second);
+  assert.equal(confirmLateOpening(first, []), undefined);
+  assert.equal(confirmLateOpening(first, [{ start: 405, end: 493 }]), undefined);
+  assert.deepEqual(confirmLateOpening(second, [first]), { start: 479.5, end: 568.5 });
 });

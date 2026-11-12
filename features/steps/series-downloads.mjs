@@ -179,6 +179,19 @@ When('I connect a folder with a saved episode', async function () {
 });
 
 Then('Offline Study loads the saved episode and position when I reopen it', async function () {
+  const url = this.videoPage.url();
+  const olderTab = await this.context.newPage();
+  await olderTab.goto(url);
+  const olderVideo = olderTab.locator('video');
+  const previousSrc = await olderVideo.evaluate(element => element.src);
+  await olderTab.getByRole('combobox', { name: 'Episode', exact: true }).selectOption('Episode 002 - 50002.mp4');
+  await expect.poll(() => olderVideo.evaluate((element, previous) => element.readyState > 0 && element.currentSrc !== previous, previousSrc)).toBe(true);
+  await olderVideo.evaluate(async element => {
+    element.pause();
+    const seeked = new Promise(resolve => element.addEventListener('seeked', resolve, { once: true }));
+    element.currentTime = 1;
+    await seeked;
+  });
   const video = this.videoPage.locator('video');
   await video.evaluate(async element => {
     element.pause();
@@ -186,7 +199,7 @@ Then('Offline Study loads the saved episode and position when I reopen it', asyn
     element.currentTime = 4.5;
     await seeked;
   });
-  const url = this.videoPage.url();
+  await olderTab.close();
   await this.videoPage.close();
   this.videoPage = await this.context.newPage();
   await this.videoPage.addInitScript(() => {
@@ -210,8 +223,8 @@ Then('Offline Study loads the saved episode and position when I reopen it', asyn
   const episodeUrl = new URL(url);
   episodeUrl.searchParams.set('series', `${root}/2-seriya-30002/dub-50002`);
   await this.videoPage.goto(episodeUrl.href);
-  await expect(this.videoPage.getByRole('combobox', { name: 'Episode', exact: true })).toHaveValue('Episode 002 - 50002.mp4');
-  await expect.poll(() => this.videoPage.locator('video').evaluate(element => element.currentTime)).toBeLessThan(3);
+  await expect(this.videoPage.getByRole('combobox', { name: 'Episode', exact: true })).toHaveValue('Episode 003 - 50003.mp4');
+  await expect.poll(() => this.videoPage.locator('video').evaluate(element => element.currentTime)).toBeGreaterThanOrEqual(4.5);
 });
 
 Then('I can use Space and the arrow keys to control fullscreen playback', async function () {
@@ -228,8 +241,9 @@ Then('I can use Space and the arrow keys to control fullscreen playback', async 
   await expect(overlay).toBeHidden();
   await page.keyboard.press('f');
   await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(false);
+  await expect(overlay.locator('button[aria-label="Fullscreen"]')).toHaveCount(1);
   await expect(overlay).toBeHidden();
-  await page.clock.fastForward(500);
+  await page.clock.fastForward(750);
   await expect(overlay).toBeHidden();
   await page.mouse.move(90, 120);
   await expect(page.getByRole('button', { name: 'Fullscreen', exact: true })).toBeVisible();
@@ -277,6 +291,29 @@ Then('I can use Space and the arrow keys to control fullscreen playback', async 
   await expect(caption).toBeVisible();
 });
 
+Then('the options close before the controls hide and stay closed on pointer movement', async function () {
+  const page = this.videoPage;
+  const video = page.locator('video');
+  const controls = page.locator('.player-controls');
+  const options = controls.getByRole('button', { name: 'Player options', exact: true });
+  await video.evaluate(element => { element.loop = true; });
+  await expect(video).toHaveJSProperty('paused', false);
+  await page.clock.install();
+  await options.click();
+  await expect(options).toHaveAttribute('aria-expanded', 'true');
+  const endingAction = controls.getByRole('combobox', { name: 'Ending skip action' });
+  await endingAction.focus();
+  await expect(endingAction).toBeFocused();
+  await page.clock.fastForward(4200);
+  await expect(options).toHaveAttribute('aria-expanded', 'false', { timeout: 2000 });
+  await expect(controls).toBeVisible();
+  await page.clock.fastForward(6100);
+  await expect(controls).toBeHidden();
+  await page.mouse.move(80, 100);
+  await expect(options).toBeVisible();
+  await expect(options).toHaveAttribute('aria-expanded', 'false');
+});
+
 Then('the frame checking queue picks up finished videos and preserves its pause state', { timeout: 25000 }, async function () {
   const page = this.videoPage;
   const queue = page.locator('[aria-label="Frame checking queue"]');
@@ -302,6 +339,32 @@ Then('the frame checking queue picks up finished videos and preserves its pause 
   await expect(status).toContainText('2 / 3 episodes checked');
   await queue.getByRole('button', { name: 'Resume frame checking' }).click();
   await expect(status).toContainText('3 / 3 episodes checked');
+  await expect.poll(() => page.evaluate(async () => {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open('arc-video-fingerprints');
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const db = open.result;
+        const request = db.transaction('comparisons').objectStore('comparisons').count();
+        request.onsuccess = () => { db.close(); resolve(request.result); };
+        request.onerror = () => { db.close(); reject(request.error); };
+      };
+    });
+  })).toBe(3);
+  await page.addInitScript(() => {
+    const get = IDBObjectStore.prototype.get;
+    window.restoredFrameComparisons = 0;
+    IDBObjectStore.prototype.get = function (key) {
+      const request = get.call(this, key);
+      if (this.name === 'comparisons') request.addEventListener('success', () => {
+        if (request.result) window.restoredFrameComparisons++;
+      });
+      return request;
+    };
+  });
+  await page.reload();
+  await expect(status).toContainText('3 / 3 episodes checked');
+  await expect.poll(() => page.evaluate(() => window.restoredFrameComparisons)).toBe(3);
   await queue.getByRole('button', { name: 'Stop frame checking' }).click();
   await expect(status).toBeHidden();
 });
@@ -352,7 +415,7 @@ Then('I can keep watching the opening and choose between skipping the ending or 
   await page.waitForTimeout(550);
   await page.mouse.move(100, 100);
   await page.mouse.move(200, 200);
-  await page.getByRole('button', { name: 'Next episode' }).click({ timeout: 5000 });
+  await page.getByRole('button', { name: 'Next episode', exact: true }).click({ timeout: 5000 });
   await expect(page.getByLabel('Episode', { exact: true })).toHaveValue(/Episode 003 - 50003\.mp4$/);
   await expect(page.locator('.caption')).toHaveText('保存した字幕です。');
 });

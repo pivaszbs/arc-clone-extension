@@ -7,7 +7,7 @@
   import { choices, defaultQuizSettings, words, type Challenge, type ListeningCue, type QuizSettings } from './quiz';
   import { AutoSubtitles, type PageCaptions } from './auto-subtitles';
   import { PhraseStops, placeStudyVideo, readSkipChapters } from './study-player';
-  import type { VideoThemes } from './video-themes';
+  import { overlapsRecap, type VideoThemes } from './video-themes';
   let { loadEpisodeCaptions, inline = false, overlayHidden = false, localCues = [], localBody = '', localSource = '', referenceCues = [], videoThemes = {}, title = '', learning = $bindable(false), studying = $bindable(false), playerActions, playerOptions, onResumeAtEnd, onToggleFullscreen, onNextEpisode }: {
     loadEpisodeCaptions?: () => Promise<PageCaptions | null>;
     inline?: boolean;
@@ -45,7 +45,7 @@
   let busy = $state(false);
   let status = $state('');
   let skipUndo = $state<{ time: number; expiresAt: number } | null>(null);
-  type SkipPart = 'op' | 'ed';
+  type SkipPart = keyof VideoThemes;
   type EndingAction = 'auto' | 'next' | 'skip';
   const skipLabels = { op: 'Skip opening', ed: 'Skip ending' };
   const autoSkipKey = 'arc-offline-auto-skip';
@@ -63,7 +63,7 @@
   const nextEpisode = $derived(onNextEpisode ?? (siteNextEpisode?.url ? openSiteNextEpisode : undefined));
   // Endings followed by little more than credits go straight to the next episode; otherwise skip to what follows.
   const endingTail = 20;
-  let countdown = $state<{ part: SkipPart; end: number; remaining: number } | null>(null);
+  let countdown = $state<{ part: keyof typeof skipLabels; end: number; remaining: number } | null>(null);
   let countdownTime = 0;
   const dismissedSkips = new Set<SkipPart>();
   let subtitleName = $state('');
@@ -125,10 +125,10 @@
   let stopAfter: { video: HTMLVideoElement; end: number } | null = null;
   const due = $derived(cards.filter((card) => card.due <= now).sort((a, b) => a.due - b.due));
   const review = $derived(due[0]);
-  const fallbackOpening = $derived(playbackReady && !skipRange('op') && playbackTime < 360
+  const fallbackOpening = $derived(playbackReady && !skipRange('op') && !canSkip('recap') && playbackTime < 360
     && playbackTime + 85 < playbackDuration && !captured && !challenge);
-  const hideControls = $derived(showPlayback && !playbackPaused && !captured && !challenge
-    && !showSettings && !showTranscript && mode !== 'review' && now - lastActivity >= 10000);
+  const idlePlayback = $derived(showPlayback && !playbackPaused && !captured && !challenge && mode !== 'review');
+  const hideControls = $derived(idlePlayback && !showTranscript && now - lastActivity >= 10000);
   const clock = (time: number) => `${Math.floor(time / 60)}:${String(Math.floor(time % 60)).padStart(2, '0')}`;
 
   $effect(() => {
@@ -265,6 +265,7 @@
     const paused = video?.paused ?? true;
     if (playbackPaused && !paused) lastActivity = now;
     playbackPaused = paused;
+    if (showSettings && idlePlayback && now - lastActivity >= 4000) showSettings = false;
     playbackMuted = video?.muted ?? false;
     playbackReady = !!video && video.readyState >= 1;
     playbackAttached = !!video && !!(playbackReady || video.srcObject || video.getAttribute('src') || video.querySelector('source[src]'));
@@ -592,17 +593,19 @@
     seek(time);
   }
 
-  function skipRange(part: 'op' | 'ed') {
+  function skipRange(part: SkipPart) {
+    if (part === 'recap') return videoThemes.recap;
     const segment = subtitleSegments[part];
     const subtitleRange = segment ? { start: segment.start + subtitleOffset, end: segment.end + subtitleOffset } : null;
     const frames = videoThemes[part];
     if (chapters[part]) return chapters[part];
     // Theme lyrics usually start after the intro music and stop before the outro, so a frame match is more exact.
-    if (frames && (!subtitleRange || (frames.start < subtitleRange.end && frames.end > subtitleRange.start))) return frames;
-    return (segment?.source !== 'dialogue-gap' && subtitleRange) || frames || subtitleRange;
+    const range = frames && (!subtitleRange || (frames.start < subtitleRange.end && frames.end > subtitleRange.start))
+      ? frames : (segment?.source !== 'dialogue-gap' && subtitleRange) || frames || subtitleRange;
+    return part === 'op' && overlapsRecap(range || undefined, videoThemes.recap) ? undefined : range;
   }
 
-  function canSkip(part: 'op' | 'ed') {
+  function canSkip(part: SkipPart) {
     const segment = skipRange(part);
     return playbackReady && !!segment && segment.end > playbackTime && segment.end <= playbackDuration + 0.5
       && playbackTime >= Math.max(0, segment.start - 1) && !captured && !challenge;
@@ -780,6 +783,10 @@
       <div class="skip-suggestion">
         <button onclick={undoSkip}>Undo skip</button>
       </div>
+    {:else if inline && !overlayHidden && mode !== 'review' && canSkip('recap')}
+      <div class="skip-suggestion">
+        <button class="primary" onclick={() => skipPart('recap')}>Skip recap</button>
+      </div>
     {/if}
     <section aria-label="Japanese learning" class="panel" hidden={overlayHidden || siteOverlayHidden}>
       {#if !challenge && mode !== 'review' && !captured && ((studyPlayer && !combined) || detected || (mode === 'learn' && !sourceCues.length))}
@@ -815,7 +822,10 @@
           {/if}
         {/if}
         <button class="active" class:learning={mode === 'learn'} aria-pressed={mode === 'learn'} disabled={!!challenge} onclick={() => switchMode(mode === 'learn' ? 'watch' : 'learn')}>Learn</button>
-        <button aria-label="Player options" title="Player options" aria-expanded={showSettings} onclick={() => { showSettings = !showSettings; }}>⋯</button>
+        <button aria-label="Player options" title="Player options" aria-expanded={showSettings} onclick={() => {
+          showSettings = !showSettings;
+          if (showSettings) lastActivity = Date.now();
+        }}>⋯</button>
         {@render playerActions?.()}
         {#if !inline}
           <button data-study-player aria-pressed={studyPlayer} aria-label={studyPlayer ? 'Return to page player' : 'Close Japanese panel'} title={studyPlayer ? 'Return to page player' : 'Close Japanese panel'} disabled={busy} onclick={closePanel}>×</button>

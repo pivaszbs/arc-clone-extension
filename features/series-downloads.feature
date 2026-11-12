@@ -26,6 +26,11 @@ Feature: Anime365 series downloads
     When I connect a folder with a saved episode
     Then I can use Space and the arrow keys to control fullscreen playback
 
+  Scenario: Offline player options close after idle time with a focused control
+    Given the offline study page is open without a network connection
+    When I connect a folder with a saved episode
+    Then the options close before the controls hide and stay closed on pointer movement
+
   Scenario: Frame checking queues newly finished downloads and resumes after reloading
     Given the offline study page is open without a network connection
     When I connect a folder with a saved episode

@@ -6,6 +6,7 @@
   import type { SeriesQueue } from '../background/series-downloads';
 
   const source = new URLSearchParams(location.search).get('series') || '';
+  let { expanded = $bindable(!!source) }: { expanded?: boolean } = $props();
   let url = $state(source);
   let episode = $state<EpisodeDownloads | null>(null);
   let plan = $state<SeriesPlan>();
@@ -71,7 +72,7 @@
   }
 </script>
 
-<details open={!!url}>
+<details bind:open={expanded}>
   <summary>Download a series</summary>
   {#if source === url && episode?.video}
     <div class="row episode">
@@ -131,14 +132,17 @@
 </details>
 
 <style>
-  details { margin: 16px 0; padding: 12px 16px; background: #22212b; border-radius: 12px; max-width: 720px; }
-  summary { cursor: pointer; font-weight: 600; }
+  details { padding: 15px 16px; background: var(--surface, #171719); border: 1px solid var(--line, #2f2d2d); border-radius: 10px; overflow-wrap: anywhere; }
+  summary { cursor: pointer; font-weight: 650; }
   form { margin-top: 12px; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; }
   .episode { margin-top: 12px; gap: 16px; }
-  a { color: #decaff; }
+  a { color: var(--accent, #ff8248); }
   input[type='url'] { flex: 1; min-width: 180px; }
-  input, button { font: inherit; padding: 6px 9px; border: 1px solid #ffffff2e; border-radius: 6px; }
+  input, button { font: inherit; color: inherit; background: #201f22; padding: 6px 9px; border: 1px solid #ffffff2e; border-radius: 6px; }
+  button { cursor: pointer; }
+  button:disabled { cursor: default; opacity: .45; }
+  :is(a, summary, input, button):focus-visible { outline: 2px solid var(--accent, #ff8248); outline-offset: 2px; }
   ul { max-height: 150px; overflow: auto; margin-bottom: 8px; }
   ul[aria-label='Episode availability'] { list-style: none; padding: 0; }
   li label { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
