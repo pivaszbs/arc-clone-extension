@@ -308,49 +308,64 @@ async function resetSpace(spaceId: string) {
   }
 }
 
-// Configure SidePanel and Context Menus on install/startup
-async function setupExtension() {
+async function setupSidePanel() {
   try {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   } catch (err) {
     console.warn('Could not set sidePanel behavior:', err);
   }
+}
 
-  chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
+function registerContextMenus() {
+  const items: chrome.contextMenus.CreateProperties[] = [
+    {
       id: 'arc-ask-chatgpt',
       title: '🤖 Ask ChatGPT about Selection / Page',
       contexts: ['selection', 'page']
-    });
-    chrome.contextMenus.create({
+    },
+    {
       id: 'arc-send-antigravity',
       title: '🚀 Send Selection / Page to Antigravity',
       contexts: ['selection', 'page']
-    });
-    chrome.contextMenus.create({
+    },
+    {
       id: 'arc-peek-link',
       title: 'Open in Arc Peek / Little Arc',
       contexts: ['link']
-    });
-    chrome.contextMenus.create({
+    },
+    {
       id: 'arc-pin-page',
       title: 'Pin Page to Current Arc Space',
       contexts: ['page']
-    });
-    chrome.contextMenus.create({
+    },
+    {
       id: 'arc-translate-selection',
       title: 'Translate Selection with Arc',
       contexts: ['selection']
-    });
+    }
+  ];
+  chrome.contextMenus.removeAll(() => {
+    const error = chrome.runtime.lastError;
+    if (error) {
+      console.warn('Could not clear Arc context menus:', error.message);
+      return;
+    }
+    for (const item of items) {
+      chrome.contextMenus.create(item, () => {
+        const error = chrome.runtime.lastError;
+        if (error) console.warn(`Could not create Arc context menu ${item.id}:`, error.message);
+      });
+    }
   });
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  setupExtension();
+  void setupSidePanel();
+  registerContextMenus();
 });
 
 chrome.runtime.onStartup.addListener(async () => {
-  setupExtension();
+  void setupSidePanel();
   // A restored browser session can assign different live tab IDs.
   const state = await loadState();
   for (const space of state.spaces) {
