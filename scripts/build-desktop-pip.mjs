@@ -1,0 +1,12 @@
+import { mkdir, copyFile, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
+if (process.platform !== 'darwin') throw new Error('The desktop PiP companion requires macOS.');
+const root = path.resolve('outputs/desktop-pip/Arc Desktop Video.app/Contents');
+await mkdir(path.join(root, 'MacOS'), { recursive: true });
+await mkdir(path.join(root, 'Resources'), { recursive: true });
+await copyFile('native/desktop-pip/receiver.html', path.join(root, 'Resources/receiver.html'));
+await writeFile(path.join(root,'Info.plist'), `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>ArcDesktopVideo</string><key>CFBundleIdentifier</key><string>local.arcclone.desktopvideo</string><key>CFBundleName</key><string>Arc Desktop Video</string><key>CFBundlePackageType</key><string>APPL</string><key>LSUIElement</key><true/><key>NSHighResolutionCapable</key><true/></dict></plist>`);
+const result = spawnSync('xcrun', ['swiftc','-swift-version','5','-O','native/desktop-pip/main.swift','-o',path.join(root,'MacOS/ArcDesktopVideo'),'-framework','AppKit','-framework','WebKit'], { stdio:'inherit' });
+if (result.status !== 0) process.exit(result.status || 1);
+console.log(`Built ${path.dirname(root)}`);

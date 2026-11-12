@@ -1,0 +1,1 @@
+:root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; } body { margin: 0; min-width: 290px; max-width: 440px; } main { padding: 24px; } span { font-size: 11px; letter-spacing: 1px; color: #9377b6; } h1 { font-size: 24px; line-height: 1.2; } li { margin: 12px 0; } ol { padding-left: 22px; } p, small { opacity: .8; } small { display: block; font-size: 12px; }
