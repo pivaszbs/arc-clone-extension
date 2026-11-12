@@ -43,7 +43,9 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptM
     }
     func receive(_ message: [String: Any]) {
         let type = message["type"] as? String ?? ""
-        if type == "open" {
+        if type == "open-quicktime" {
+            openInQuickTime(message)
+        } else if type == "open" {
             close()
             session = message["sessionId"] as? String ?? ""
             muted = message["muted"] as? Bool ?? false
@@ -66,6 +68,27 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptM
                       "media":result as? [String:Any] ?? [:], "window":self.windowState()])
             }
         } else if type == "close" { close() }
+    }
+    func openInQuickTime(_ message: [String: Any]) {
+        guard let path = message["path"] as? String, path.hasPrefix("/"),
+              let size = message["size"] as? Int, let modified = message["modified"] as? Double else {
+            send(["ok":false, "error":"Choose a downloaded episode."]); return
+        }
+        let file = URL(fileURLWithPath:path).resolvingSymlinksInPath()
+        guard ["mp4", "m4v", "mov"].contains(file.pathExtension.lowercased()),
+              let values = try? file.resourceValues(forKeys:[.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
+              values.isRegularFile == true, values.fileSize == size,
+              let date = values.contentModificationDate, abs(date.timeIntervalSince1970 * 1000 - modified) < 1000 else {
+            send(["ok":false, "error":"The selected episode no longer matches Chrome’s downloaded file. Open it from Finder in QuickTime."])
+            return
+        }
+        guard let quickTime = NSWorkspace.shared.urlForApplication(withBundleIdentifier:"com.apple.QuickTimePlayerX") else {
+            send(["ok":false, "error":"QuickTime Player is unavailable on this Mac."]); return
+        }
+        NSWorkspace.shared.open([file], withApplicationAt:quickTime, configuration:NSWorkspace.OpenConfiguration()) { _, error in
+            if error == nil { send(["ok":true]) }
+            else { send(["ok":false, "error":"QuickTime could not open this episode."]) }
+        }
     }
     func evaluate(_ function: String, _ arguments: [Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: arguments), let json = String(data:data, encoding:.utf8) else { return }

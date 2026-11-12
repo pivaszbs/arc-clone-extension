@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { build } from 'esbuild';
 
 const { outputFiles } = await build({ entryPoints: ['src/japanese/video-themes.ts'], bundle: true, write: false, format: 'esm' });
-const { confirmLateOpening, matchLateOpening, matchRecap, matchVideoThemes, overlapsRecap } = await import('data:text/javascript;base64,' + Buffer.from(outputFiles[0].text).toString('base64'));
+const { confirmLateOpening, matchKnownOpening, matchLateOpening, matchRecap, matchVideoThemes, overlapsRecap } = await import('data:text/javascript;base64,' + Buffer.from(outputFiles[0].text).toString('base64'));
 
 function frames(length, makeFrame) {
   return Array.from({ length }, (_, time) => ({ time, pixels: makeFrame(time) }));
@@ -59,4 +59,19 @@ test('a late opening with sparse matching frames requires two agreeing reference
   assert.equal(confirmLateOpening(first, []), undefined);
   assert.equal(confirmLateOpening(first, [{ start: 405, end: 493 }]), undefined);
   assert.deepEqual(confirmLateOpening(second, [first]), { start: 479.5, end: 568.5 });
+});
+
+test('matches scattered frames across a known opening after a recap', () => {
+  const anchors = new Set([0, 2, 4, 6, 16, 28, 38, 40, 42, 46, 58, 86]);
+  const reference = { op: frames(310, time => frame(time + 9800)), ed: [] };
+  const episode = anchorSet => ({
+    op: frames(300, time => frame(anchorSet.has(time - 76) ? time - 76 + 9900 : time + 700)),
+    ed: []
+  });
+  const opening = { start: 99.5, end: 189.5 };
+  const current = episode(anchors);
+  assert.equal(matchVideoThemes(current, reference).op, undefined);
+  assert.deepEqual(matchKnownOpening(current, reference, opening, { start: 50, end: 66 }), { start: 75.5, end: 165.5 });
+  assert.equal(matchKnownOpening(current, reference, opening, { start: 50, end: 85 }), undefined);
+  assert.equal(matchKnownOpening(episode(new Set([...anchors].slice(0, -1))), reference, opening), undefined);
 });

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http: ws:; media-src 'self' http:; object-src 'none'; base-uri 'none'">
+  <title>Anime Study</title>
+  <link rel="stylesheet" href="tv.css">
+  <script defer src="tv.js"></script>
+</head>
+<body>
+  <main id="library">
+    <header><img src="icon.png" alt=""><h1 id="title">Anime Study</h1><button id="library-diagnostics">Diagnostics</button></header>
+    <form id="connect">
+      <label for="address">Address from your Mac</label>
+      <input id="address" inputmode="url" type="url" placeholder="http://…" autocomplete="off" required>
+      <button>Connect</button>
+    </form>
+    <p id="library-status" role="status"></p>
+    <div class="library-bar">
+      <button id="all-titles" hidden>← All titles</button>
+      <button id="change" hidden>Change library</button>
+    </div>
+    <ol id="episodes" aria-label="Episodes"></ol>
+  </main>
+  <section id="player" hidden aria-label="Episode player">
+    <video id="video" playsinline preload="metadata"></video>
+    <div id="osd" hidden aria-live="polite"></div>
+    <button id="pause-circle" hidden aria-label="Resume playback">▶</button>
+    <button id="caption" hidden aria-label="Study this subtitle"></button>
+    <p id="playback-status" role="status" hidden></p>
+    <div id="skip-controls" hidden>
+      <button id="skip"></button><span id="countdown"></span><button id="keep" hidden>Keep watching</button>
+    </div>
+    <div id="controls" hidden>
+      <div class="controls-header">
+        <div>
+          <div id="series-badge"></div>
+          <div id="episode-title"></div>
+        </div>
+        <div id="clock"></div>
+      </div>
+      <div class="progress-wrap">
+        <progress id="progress" max="1" value="0"></progress>
+        <div id="segment-markers" aria-hidden="true"></div>
+      </div>
+      <div class="actions">
+        <button id="back">Episodes</button>
+        <button id="play">Play</button>
+        <button id="rewind">−15s</button>
+        <button id="forward">+15s</button>
+        <button id="learn">Learn</button>
+        <button id="skip-menu-btn">Auto-skip</button>
+        <button id="next">Next episode</button>
+        <button id="player-diagnostics">Diagnostics</button>
+      </div>
+      <div id="learning" hidden>
+        <span>Pause to study</span><button id="frequency"></button>
+        <button id="replay" hidden>Replay line</button><button id="continue" hidden>Continue</button>
+      </div>
+      <div id="skip-settings" hidden>
+        <div class="settings-row">
+          <span class="settings-label">Auto-skip:</span>
+          <button id="toggle-op"></button>
+          <button id="toggle-ed"></button>
+          <button id="toggle-recap"></button>
+          <button id="skip-delay-btn"></button>
+        </div>
+        <div id="timing-rows"></div>
+      </div>
+    </div>
+  </section>
+  <dialog id="diagnostics" aria-labelledby="diagnostics-title">
+    <h2 id="diagnostics-title">Diagnostics</h2>
+    <pre id="diagnostics-report" tabindex="0" aria-label="Playback and connection report"></pre>
+    <form method="dialog"><button autofocus>Close diagnostics</button></form>
+  </dialog>
+</body>
+</html>

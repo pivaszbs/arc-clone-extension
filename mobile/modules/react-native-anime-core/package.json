@@ -1,0 +1,62 @@
+{
+  "name": "react-native-anime-core",
+  "version": "0.0.1",
+  "description": "Shared Anime Study core (subtitles, opening/ending ranges, episode pairing) in C++ via Nitro",
+  "main": "src/index",
+  "module": "src/index",
+  "types": "src/index.ts",
+  "react-native": "src/index",
+  "source": "src/index",
+  "files": [
+    "src",
+    "react-native.config.js",
+    "lib",
+    "nitrogen",
+    "android/build.gradle",
+    "android/gradle.properties",
+    "android/fix-prefab.gradle",
+    "android/CMakeLists.txt",
+    "android/src",
+    "cpp",
+    "ios/**/*.h",
+    "ios/**/*.m",
+    "ios/**/*.mm",
+    "ios/**/*.cpp",
+    "ios/**/*.swift",
+    "app.plugin.js",
+    "nitro.json",
+    "*.podspec",
+    "README.md"
+  ],
+  "scripts": {
+    "specs": "nitrogen",
+    "test:core": "mkdir -p build && clang++ -std=c++20 -Wall -Wextra -fsanitize=undefined cpp/core/AnimeCoreLogic.cpp tests/core_test.cpp -o build/core_test && ./build/core_test"
+  },
+  "keywords": [
+    "react-native",
+    "nitro"
+  ],
+  "author": "Anton Krylov",
+  "license": "MIT",
+  "devDependencies": {},
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*",
+    "react-native-nitro-modules": "*"
+  },
+  "peerDependenciesMeta": {
+    "react-native-nitro-modules": {
+      "optional": true
+    }
+  },
+  "prettier": {
+    "quoteProps": "consistent",
+    "singleQuote": true,
+    "tabWidth": 2,
+    "trailingComma": "es5",
+    "useTabs": false,
+    "semi": false
+  },
+  "private": true,
+  "homepage": "https://github.com/pivaszbs/arc-clone-extension"
+}

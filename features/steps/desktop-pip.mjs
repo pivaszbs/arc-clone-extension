@@ -56,7 +56,8 @@ Then('the desktop panel video keeps advancing', async function () {
   await expect.poll(async () => (await status(this)).media?.time || 0,{timeout:10000}).toBeGreaterThan(start);
 });
 When('I return the desktop video to the page', async function () {
-  await this.videoPage.locator('video').hover();
+  // The offline player puts a tap layer over the video, so move the pointer over its frame.
+  await this.videoPage.locator('.video-frame').or(this.videoPage.locator('video')).first().hover();
   await this.videoPage.getByRole('button',{name:'Exit picture in picture across desktops',exact:true}).click();
 });
 Then('the desktop player has closed', async function () {

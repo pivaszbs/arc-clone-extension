@@ -40,3 +40,13 @@ Feature: Anime365 series downloads
     Given the offline study page is open without a network connection
     When I connect a folder with a saved episode
     Then I can keep watching the opening and choose between skipping the ending or going to the next episode
+
+  Scenario: Opening Offline from a different anime respects the requested series
+    Given the offline study page is open without a network connection
+    When I connect a folder with a saved episode
+    Then opening an undownloaded series never resumes another anime
+
+  Scenario: AirPlay receives the ending chapter used by the offline player
+    Given the offline study page is open without a network connection
+    When I connect a folder with a saved episode
+    Then Safari AirPlay receives the episode's ending chapter

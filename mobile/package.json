@@ -1,0 +1,40 @@
+{
+  "name": "anime-study-mobile",
+  "version": "0.1.0",
+  "main": "index.ts",
+  "dependencies": {
+    "expo": "~58.0.25",
+    "expo-blur": "~58.0.6",
+    "expo-build-properties": "~58.0.12",
+    "expo-document-picker": "~58.0.5",
+    "expo-file-system": "~58.0.13",
+    "expo-font": "~58.0.12",
+    "expo-haptics": "~58.0.8",
+    "expo-screen-orientation": "~58.0.4",
+    "expo-status-bar": "~58.0.5",
+    "expo-symbols": "~58.0.5",
+    "expo-system-ui": "~58.0.7",
+    "expo-video": "~58.0.14",
+    "react": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-anime-core": "file:modules/react-native-anime-core",
+    "react-native-nitro-modules": "^0.37.2",
+    "react-native-safe-area-context": "~5.11.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.3.0",
+    "nitrogen": "^0.37.2",
+    "typescript": "~6.0.3"
+  },
+  "scripts": {
+    "start": "expo start --dev-client",
+    "ios": "expo run:ios",
+    "ios:ipad": "expo run:ios --device \"iPad Air 11-inch (M3)\"",
+    "prebuild": "expo prebuild --platform ios",
+    "typecheck": "tsc --noEmit",
+    "test:core": "npm --prefix modules/react-native-anime-core run test:core",
+    "specs": "npm --prefix modules/react-native-anime-core run specs",
+    "doctor": "expo-doctor"
+  },
+  "private": true
+}
