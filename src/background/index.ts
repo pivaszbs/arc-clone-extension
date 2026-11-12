@@ -21,7 +21,6 @@ import {
 declare const __ARC_LEGACY_ID__: string;
 
 const STORAGE_KEY = 'arc_chrome_state_v1';
-const captionScans = new Map<string, Promise<chrome.scripting.InjectionResult<string[]>[]>>();
 
 const DEFAULT_SETTINGS: ExtensionSettings = {
   targetLanguage: 'en',
@@ -1189,9 +1188,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             collapsed: false,
             children: []
           };
-          const items = parentId ? findFolder(space.pinnedItems, parentId)?.children : space.pinnedItems;
-          if (!items) throw new Error('Folder no longer exists.');
-          items.push(folder);
+          const parent = parentId ? findFolder(space.pinnedItems, parentId) : undefined;
+          if (parentId && !parent) throw new Error('Folder no longer exists.');
+          if (parent) {
+            parent.collapsed = false;
+            parent.children.push(folder);
+          } else space.pinnedItems.push(folder);
           await saveState(state);
         }
         sendResponse(await getFullSnapshot());

@@ -87,18 +87,6 @@ export interface PinnedFolder {
 
 export type PinnedItem = PinnedLink | PinnedFolder;
 
-export interface LinkRoute {
-  id: string;
-  match: 'host' | 'contains' | 'prefix';
-  text: string;
-  spaceId: string;
-}
-
-export interface SiteBoost {
-  origin: string;
-  css: string;
-}
-
 export interface Space {
   id: string;
   name: string;
@@ -143,8 +131,6 @@ export interface ExtensionSettings {
   openaiApiKey?: string;
   voiceAutoSpeak?: boolean;
   voiceContinuous?: boolean;
-  linkRoutes?: LinkRoute[];
-  siteBoosts?: SiteBoost[];
 }
 
 export interface ArchivedTab {

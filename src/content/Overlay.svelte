@@ -5,6 +5,7 @@
   import CommandPalette from '../shared/CommandPalette.svelte';
   import Icon from '../shared/Icon.svelte';
   import { containFocus, isActivationKey } from '../shared/focus';
+  import { pinnedRows } from '../shared/pins';
   import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
   import {
     type ArcState,
@@ -3812,11 +3813,25 @@
               <span class="arc-ls-row-title">{item.title}</span>
             </div>
             {#if !item.collapsed}
-              {#each item.children as child (child.id)}
+              {#each pinnedRows(item.children, true) as { item: child, depth } (child.id)}
+                {#if child.type === 'folder'}
+                <div
+                  class="arc-ls-row folder"
+                  style="padding-left: {22 + depth * 16}px;"
+                  role="button"
+                  tabindex="0"
+                  aria-expanded={!child.collapsed}
+                  onclick={() => chrome.runtime.sendMessage({ type: 'TOGGLE_FOLDER', spaceId: activeSpace.id, folderId: child.id }).then(syncSnapshot)}
+                  onkeydown={(e) => { if (isActivationKey(e)) chrome.runtime.sendMessage({ type: 'TOGGLE_FOLDER', spaceId: activeSpace.id, folderId: child.id }).then(syncSnapshot); }}
+                >
+                  <span class="folder-symbol">{child.collapsed ? '▸' : '▾'} <Icon name="folder" /></span>
+                  <span class="arc-ls-row-title">{child.title}</span>
+                </div>
+                {:else}
                 <div
                   class="arc-ls-row"
                   class:active={isUrlActive(child.url, currentPageUrl)}
-                  style="padding-left: 22px;"
+                  style="padding-left: {22 + depth * 16}px;"
                   role="button"
                   tabindex="0"
                   onclick={(event) => openSidebarUrl(child.url, event)}
@@ -3844,6 +3859,7 @@
                     ×
                   </button>
                 </div>
+                {/if}
               {/each}
             {/if}
           {:else}
