@@ -55,6 +55,10 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptM
         } else if type == "chunk", message["sessionId"] as? String == session {
             guard let data = message["data"] as? String, data.count < 1_500_000 else { return }
             evaluate("window.chunk", [data])
+        } else if type == "playback-state", message["sessionId"] as? String == session {
+            let paused = message["paused"] as? Bool ?? false
+            let error = message["error"] as? String ?? ""
+            evaluate("window.setSourcePaused", [paused, error])
         } else if type == "status" {
             let id = message["requestId"] as? String ?? ""
             web?.evaluateJavaScript("window.statusSnapshot()") { result, error in

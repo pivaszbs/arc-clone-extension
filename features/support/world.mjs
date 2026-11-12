@@ -50,7 +50,7 @@ class BrowserWorld extends World {
 }
 setWorldConstructor(BrowserWorld);
 
-Before(async function () {
+Before(async function ({ pickle }) {
   this.kind = process.env.E2E_BROWSER || 'chromium';
   this.profile = await mkdtemp(path.join(tmpdir(), `arc-cucumber-${this.kind}-`));
   this.tabIds = {};
@@ -63,12 +63,34 @@ Before(async function () {
     viewport: { width: 1024, height: 900 }
   });
   this.cdp = await this.context.browser().newBrowserCDPSession();
-  const { id } = await this.cdp.send('Extensions.loadUnpacked', { path: path.resolve('dist') });
+  const tags = new Set(pickle.tags.map(tag => tag.name));
+  const animeOnly = ['@anime-only', '@japanese-page-subtitles', '@series-downloads'].some(tag => tags.has(tag));
+  const both = tags.has('@both-extensions');
+  const migrate = tags.has('@legacy-migration');
+  const loadExtension = async directory => {
+    const { id } = await this.cdp.send('Extensions.loadUnpacked', { path: path.resolve(directory) });
+    if (process.platform === 'darwin') await registerHost(path.join(this.profile, 'NativeMessagingHosts'), id);
+    return id;
+  };
+  if (animeOnly || both) this.animeExtensionId = await loadExtension('dist');
+  if (migrate) {
+    const legacy = await this.context.newPage();
+    await legacy.goto(`chrome-extension://${this.animeExtensionId}/offline.html`);
+    await legacy.evaluate(() => chrome.storage.local.set({
+      arc_chrome_state_v1: {
+        activeSpaceId: 'saved-space',
+        spaces: [{ id: 'saved-space', name: 'Saved Space', icon: '', theme: 'indigo', favorites: [],
+          pinnedItems: [{ id: 'saved-pin', type: 'link', title: 'Saved pin', url: 'https://example.com/' }] }]
+      }
+    }));
+    await legacy.close();
+  }
+  const id = animeOnly ? this.animeExtensionId : await loadExtension('dist-arc');
   this.extensionId = id;
-  if (process.platform === 'darwin') await registerHost(path.join(this.profile, 'NativeMessagingHosts'), id);
   this.panel = await this.context.newPage();
-  await this.panel.goto(`chrome-extension://${id}/sidepanel.html`);
-  await expect(this.panel.locator('.space-name')).toHaveText('Personal');
+  await this.panel.goto(`chrome-extension://${id}/${animeOnly ? 'offline.html' : 'sidepanel.html'}`);
+  if (animeOnly) await expect(this.panel.getByRole('heading', { name: 'Offline study' })).toBeVisible();
+  else await expect(this.panel.locator('.space-name')).toHaveText(migrate ? 'Saved Space' : 'Personal');
   this.worker = this.context.serviceWorkers().find(worker => worker.url().startsWith(`chrome-extension://${id}/`))
     || await this.context.waitForEvent('serviceworker');
   await this.context.tracing.start({ screenshots: true, snapshots: true });

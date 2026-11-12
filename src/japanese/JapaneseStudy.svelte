@@ -1,33 +1,109 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
+  import type { Snippet } from 'svelte';
   import { requestArc } from './client';
-  import { hasJapanese, parseSubtitles, sourceUrl, type Card, type Cue } from './study';
-  import { ListeningQuiz, knowledge, choices, defaultQuizSettings, type Challenge, type ListeningCue, type QuizSettings } from './quiz';
-  import { AutoSubtitles } from './auto-subtitles';
-  let open = $state(false);
-  let mode = $state<'watch' | 'review'>('watch');
+  import { hasJapanese, sourceUrl, type Card, type Cue } from './study';
+  import { detectAnimeOpEdIntervals, japaneseCaptions, parseCaptionResponse, subtitleUrl } from './captions';
+  import { choices, defaultQuizSettings, words, type Challenge, type ListeningCue, type QuizSettings } from './quiz';
+  import { AutoSubtitles, type PageCaptions } from './auto-subtitles';
+  import { PhraseStops, placeStudyVideo, readSkipChapters } from './study-player';
+  import type { VideoThemes } from './video-themes';
+  let { loadEpisodeCaptions, inline = false, overlayHidden = false, localCues = [], localBody = '', localSource = '', referenceCues = [], videoThemes = {}, title = '', learning = $bindable(false), studying = $bindable(false), playerActions, playerOptions, onResumeAtEnd, onToggleFullscreen, onNextEpisode }: {
+    loadEpisodeCaptions?: () => Promise<PageCaptions | null>;
+    inline?: boolean;
+    overlayHidden?: boolean;
+    localCues?: Cue[];
+    localBody?: string;
+    localSource?: string;
+    referenceCues?: Cue[][];
+    videoThemes?: VideoThemes;
+    title?: string;
+    learning?: boolean;
+    studying?: boolean;
+    playerActions?: Snippet;
+    playerOptions?: Snippet;
+    onResumeAtEnd?: () => void;
+    onToggleFullscreen?: () => void;
+    /** Offered beside "Skip ending" when another episode can follow. */
+    onNextEpisode?: () => void;
+  } = $props();
+  let open = $state(untrack(() => inline));
+  let studyPlayer = $state(false);
+  let showSettings = $state(false);
+  let showTranscript = $state(false);
+  let mode = $state<'watch' | 'learn' | 'review'>(untrack(() => learning ? 'learn' : 'watch'));
   let video = $state<HTMLVideoElement | null>(null);
   let text = $state('');
   let meaning = $state('');
   let cards = $state<Card[]>([]);
-  let imported = $state<Cue[]>([]);
+  let imported = $state<Cue[]>(untrack(() => localCues));
   let detected = $state<Cue | null>(null);
-  let loop = $state<Cue | null>(null);
   let now = $state(Date.now());
+  let lastActivity = $state(Date.now());
   let busy = $state(false);
   let status = $state('');
+  let skipUndo = $state<{ time: number; expiresAt: number } | null>(null);
+  type SkipPart = 'op' | 'ed';
+  const skipLabels = { op: 'Skip opening', ed: 'Skip ending' };
+  const autoSkipKey = 'arc-offline-auto-skip';
+  const siteAutoSkipKey = 'animeAutoSkip';
+  const replaceSitePlayerKey = 'animeReplaceSitePlayer';
+  let autoSkip = $state(true);
+  // On the anime site, open the Arc player in place of the site's player unless the user turned it off.
+  let replaceSitePlayer = $state(true);
+  let sitePreferencesLoaded = false;
+  let leftSitePlayer = false;
+  let siteNextEpisode = $state<{ page: string; url: string | null } | null>(null);
+  const nextEpisode = $derived(onNextEpisode ?? (siteNextEpisode?.url ? openSiteNextEpisode : undefined));
+  // Endings followed by little more than credits go straight to the next episode; otherwise skip to what follows.
+  const endingTail = 20;
+  let countdown = $state<{ part: SkipPart; end: number; remaining: number } | null>(null);
+  let countdownTime = 0;
+  const dismissedSkips = new Set<SkipPart>();
   let subtitleName = $state('');
+  let subtitleLink = $state('');
+  let loadingSubtitleLink = $state(false);
   let translating = $state(false);
   let selectedSpeed = $state('1');
   let playbackTime = $state(0);
   let playbackPaused = $state(true);
+  let playbackMuted = $state(false);
   let playbackReady = $state(false);
+  let playbackAttached = $state(false);
+  let playbackRequestedAt = $state(0);
+  let captionLookupDone = $state(false);
+  let subtitleScan = $state<Promise<void> | null>(null);
+  let playbackDuration = $state(0);
+  let subtitleOffset = $state(0);
   let automaticCues = $state<Cue[]>([]);
   let automaticSource = $state('');
-  const automatic = new AutoSubtitles();
+  const automatic = new AutoSubtitles(untrack(() => loadEpisodeCaptions));
   let lastScan = 0;
   let lastPlayerSource = '';
-  let quizEnabled = $state(false);
+  let importedBody = $state(untrack(() => localBody));
+  let automaticBody = $state('');
+  let captured = $state<Cue | null>(null);
+  let resumeAt = $state<number | null>(null);
+  const phraseStops = new PhraseStops();
+  const sourceCues = $derived(imported.length ? imported : automaticCues);
+  const transcript = $derived(sourceCues.filter(cue => hasJapanese(cue.text) && cue.end + subtitleOffset > 0).map(offsetCue));
+  const timeline = $derived([...transcript].sort((a, b) => a.end - b.end));
+  let chapters = $state<ReturnType<typeof readSkipChapters>>({});
+  const subtitleSegments = $derived(detectAnimeOpEdIntervals(imported.length ? importedBody : automaticBody, sourceCues, playbackDuration,
+    importedBody === localBody ? referenceCues : []));
+  const combined = $derived(studyPlayer && playbackAttached && !!video);
+  // The Netflix-style skip prompts run in offline study and once the Arc player has replaced the site's player.
+  const skipControls = $derived(inline || (!!loadEpisodeCaptions && combined));
+  const showPlayback = $derived(combined || inline);
+  const phraseWords = $derived(captured ? words(captured.text) : []);
+  const playbackStatus = $derived(!video ? 'No video found'
+    : !playbackAttached ? 'Waiting for the site to provide video'
+    : !playbackReady ? 'Waiting for video metadata'
+    : playbackPaused ? 'Paused' : 'Playing');
+  const subtitleStatus = $derived(sourceCues.length ? `${transcript.length} Japanese subtitle cues loaded`
+    : detected ? 'Reading the player’s Japanese captions'
+    : inline || captionLookupDone ? 'No Japanese subtitles found' : 'Looking for Japanese subtitles');
+  const cardSource = () => localSource || (window === window.top ? location.href : document.referrer || location.href);
   let quizSettings = $state<QuizSettings>({ ...defaultQuizSettings });
   let challenge = $state<Challenge | null>(null);
   let options = $state<string[]>([]);
@@ -36,24 +112,76 @@
   let quizLoading = $state(false);
   let quizError = $state('');
   let quizSaved = $state(false);
-  const learned = $derived(knowledge(cards));
-  const quizEngine = new ListeningQuiz();
   let quizRequest = 0;
   let currentUrl = location.href;
   let previousVideo: HTMLVideoElement | null = null;
   let oldRate: number | null = null;
-  let lastSelection = '';
   let stopAfter: { video: HTMLVideoElement; end: number } | null = null;
   const due = $derived(cards.filter((card) => card.due <= now).sort((a, b) => a.due - b.due));
   const review = $derived(due[0]);
+  const fallbackOpening = $derived(playbackReady && !skipRange('op') && playbackTime < 360
+    && playbackTime + 85 < playbackDuration && !captured && !challenge);
+  const hideControls = $derived(showPlayback && !playbackPaused && !captured && !challenge
+    && !showSettings && !showTranscript && mode !== 'review' && now - lastActivity >= 10000);
   const clock = (time: number) => `${Math.floor(time / 60)}:${String(Math.floor(time % 60)).padStart(2, '0')}`;
+
+  $effect(() => {
+    if (combined && open && video) return placeStudyVideo(video);
+  });
+
+  $effect(() => {
+    if (inline) {
+      learning = mode === 'learn';
+      studying = !!captured;
+    }
+  });
+
+  function revealControls() {
+    if (showPlayback) lastActivity = Date.now();
+  }
+
+  $effect(() => {
+    const player = video;
+    if (!open || !player) return;
+    const modes = new Map<TextTrack, TextTrackMode>();
+    function enableChapters() {
+      if (!player) return;
+      for (const track of player.textTracks) {
+        if (track.kind === 'chapters' && track.mode === 'disabled') {
+          modes.set(track, track.mode);
+          track.mode = 'hidden';
+        }
+      }
+    }
+    enableChapters();
+    const clearCountdown = () => { countdown = null; };
+    player.addEventListener('seeking', clearCountdown);
+    player.textTracks.addEventListener('addtrack', enableChapters);
+    return () => {
+      player.removeEventListener('seeking', clearCountdown);
+      player.textTracks.removeEventListener('addtrack', enableChapters);
+      for (const [track, mode] of modes) if (track.mode === 'hidden') track.mode = mode;
+    };
+  });
+
+  function offsetCue(cue: Cue): Cue {
+    return { ...cue, start: Math.max(0, cue.start + subtitleOffset), end: cue.end + subtitleOffset };
+  }
+
+  function timedCue(cues: Cue[]) {
+    if (!video) return null;
+    const time = video.currentTime - subtitleOffset;
+    const cue = cues.find(item => time >= item.start && time < item.end && hasJapanese(item.text));
+    if (!cue) return null;
+    return offsetCue(cue);
+  }
 
   function readCue(): ListeningCue | null {
     if (!video) return null;
-    const fileCue = imported.find((cue) => video!.currentTime >= cue.start && video!.currentTime < cue.end);
-    if (fileCue && hasJapanese(fileCue.text)) return fileCue;
-    const autoCue = automaticCues.find((cue) => video!.currentTime >= cue.start && video!.currentTime < cue.end);
-    if (autoCue && hasJapanese(autoCue.text)) return autoCue;
+    const fileCue = timedCue(imported);
+    if (fileCue) return fileCue;
+    const autoCue = timedCue(automaticCues);
+    if (autoCue) return autoCue;
     for (const track of Array.from(video.textTracks)) {
       if (track.language && !/^ja(?:[-_]|$)/i.test(track.language)) continue;
       for (const cue of Array.from(track.activeCues || [])) {
@@ -64,80 +192,377 @@
     if (caption && hasJapanese(caption)) return { start: Math.max(0, video.currentTime - 5), end: Math.max(0.1, video.currentTime), text: caption, estimated: true };
     return null;
   }
-  function stopLoop() { loop = null; }
   function restoreSpeed() {
     if (previousVideo && oldRate !== null) previousVideo.playbackRate = oldRate;
     previousVideo = null; oldRate = null;
     selectedSpeed = '1';
   }
+  function resetSubtitleLookup() {
+    automatic.reset();
+    subtitleScan = null;
+    captionLookupDone = false;
+    lastScan = 0;
+    automaticCues = [];
+    automaticSource = '';
+    automaticBody = '';
+  }
   function tick() {
     now = Date.now();
-    if (!open) return;
     if (currentUrl !== location.href) {
-      currentUrl = location.href; imported = []; subtitleName = ''; loop = null; stopAfter = null;
+      currentUrl = location.href; imported = []; importedBody = ''; subtitleName = ''; stopAfter = null;
+      subtitleOffset = 0;
+      subtitleLink = '';
+      leftSitePlayer = false;
+      siteNextEpisode = null;
       text = ''; meaning = ''; captured = null; restoreSpeed();
-      challenge = null; quizRequest++; quizEngine.reset(); automatic.reset(); automaticCues = []; automaticSource = '';
+      challenge = null; captured = null; resumeAt = null; quizRequest++; phraseStops.reset(); resetSubtitleLookup();
+      playbackRequestedAt = 0;
     }
-    const nextVideo = Array.from(document.querySelectorAll('video')).filter((v) => v.getBoundingClientRect().width > 0).sort((a, b) => Number(b === document.activeElement) - Number(a === document.activeElement) || b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0] || null;
-    if (video !== nextVideo) { loop = null; stopAfter = null; restoreSpeed(); challenge = null; quizRequest++; quizEngine.reset(); automatic.reset(); automaticCues = []; automaticSource = ''; }
+    if (!open) {
+      replaceSitePlayerWhenReady();
+      return;
+    }
+    const nextVideo = combined && video?.isConnected ? video
+      : Array.from(document.querySelectorAll('video')).filter((v) => v.getBoundingClientRect().width > 0).sort((a, b) => Number(b === document.activeElement) - Number(a === document.activeElement) || b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0] || null;
+    if (video !== nextVideo) { stopAfter = null; restoreSpeed(); challenge = null; captured = null; resumeAt = null; quizRequest++; phraseStops.reset(); resetSubtitleLookup(); playbackRequestedAt = 0; }
     video = nextVideo;
     const playerSource = video?.currentSrc || '';
     if (playerSource !== lastPlayerSource) {
-      lastPlayerSource = playerSource; automatic.reset(); automaticCues = []; automaticSource = '';
-      challenge = null; quizRequest++; quizEngine.reset();
+      subtitleOffset = 0;
+      skipUndo = null;
+      countdown = null;
+      dismissedSkips.clear();
+      lastPlayerSource = playerSource; resetSubtitleLookup();
+      challenge = null; captured = null; resumeAt = null; quizRequest++; phraseStops.reset();
     }
     playbackTime = video?.currentTime || 0;
-    playbackPaused = video?.paused ?? true;
+    const paused = video?.paused ?? true;
+    if (playbackPaused && !paused) lastActivity = now;
+    playbackPaused = paused;
+    playbackMuted = video?.muted ?? false;
     playbackReady = !!video && video.readyState >= 1;
-    if (video && !imported.length && now - lastScan >= 1500) {
+    playbackAttached = !!video && !!(playbackReady || video.srcObject || video.getAttribute('src') || video.querySelector('source[src]'));
+    playbackDuration = video && Number.isFinite(video.duration) ? video.duration : 0;
+    const nextChapters = video ? readSkipChapters(video) : {};
+    if (['op', 'ed'].some(key => {
+      const part = key as 'op' | 'ed';
+      return chapters[part]?.start !== nextChapters[part]?.start || chapters[part]?.end !== nextChapters[part]?.end;
+    })) chapters = nextChapters;
+    if (!inline && !imported.length && !subtitleScan && now - lastScan >= 1500) {
       lastScan = now;
-      const currentVideo = video;
-      void automatic.scan(currentVideo).then(() => {
-        if (video === currentVideo && open) { automaticCues = [...automatic.cues]; automaticSource = automatic.source; }
-      }).catch(() => {});
+      const scan = automatic.scan(video);
+      subtitleScan = scan;
+      void scan.then(() => {
+        if (subtitleScan === scan && open) {
+          captionLookupDone = true;
+          if (automaticSource !== automatic.source || automaticCues.length !== automatic.cues.length || automaticBody !== automatic.body) {
+            automaticCues = automatic.cues;
+            automaticSource = automatic.source;
+            automaticBody = automatic.body;
+          }
+        }
+      }).catch(() => {
+        if (subtitleScan === scan) captionLookupDone = true;
+      }).finally(() => {
+        if (subtitleScan === scan) subtitleScan = null;
+      });
     }
     detected = readCue();
-    if (loop && video && (video.currentTime >= loop.end || video.currentTime < loop.start - 0.5)) video.currentTime = loop.start;
-    if (stopAfter && stopAfter.video.currentTime >= stopAfter.end) { stopAfter.video.pause(); stopAfter = null; }
-    if (quizEnabled && mode === 'watch' && video && !loop && !stopAfter && !challenge && !video.seeking) {
-      const next = quizEngine.observe(detected, video.currentTime, !video.paused || video.ended, learned, quizSettings.chance);
-      if (next) { video.pause(); void beginQuiz(next); }
+    if (stopAfter && (stopAfter.video.currentTime >= stopAfter.end || stopAfter.video.ended)) {
+      stopAfter.video.pause();
+      stopAfter = null;
     }
+    if (mode === 'learn' && quizSettings.chance > 0 && video && !stopAfter && !captured && !video.seeking && (!video.paused || video.ended)) {
+      const next = phraseStops.observe(timeline, detected, playbackTime, quizSettings.chance);
+      if (next) inspectPhrase(next);
+    }
+    if (skipControls) {
+      if (loadEpisodeCaptions && siteNextEpisode?.page !== location.href) lookupSiteNextEpisode();
+      updateSkipCountdown();
+    } else countdown = null;
   }
   async function load() {
     try { const response = await requestArc({ type: 'JAPANESE_LIST' }); cards = response.cards; quizSettings = response.settings || { ...defaultQuizSettings }; }
     catch { status = 'Could not load saved phrases. Reload the extension and this page.'; }
   }
+  function seek(time: number) {
+    if (!video || !Number.isFinite(time)) return;
+    stopAfter = null;
+
+    phraseStops.reset();
+    video.currentTime = Math.max(0, Math.min(playbackDuration || time, time));
+    tick();
+  }
+
+  function handlePlayerKey(event: KeyboardEvent) {
+    revealControls();
+    if (!inline || !open) return;
+    if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const target = event.target;
+    if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input:not(.seek), textarea, select, summary'))) return;
+
+    if (event.key === 'f' && onToggleFullscreen) {
+      event.preventDefault();
+      if (!event.repeat) onToggleFullscreen();
+      return;
+    }
+
+    if (!video || video.readyState < 1 || captured || challenge || mode === 'review') return;
+    if (event.key === ' ' && !(target instanceof HTMLElement && target.closest('button, a[href]'))) {
+      event.preventDefault();
+      if (!event.repeat) void togglePlayback();
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      seek(video.currentTime + (event.key === 'ArrowLeft' ? -5 : 5));
+    }
+  }
+
+  async function togglePlayback() {
+    if (!video) return;
+    if (studyPlayer && !playbackAttached) {
+      const start = video.closest('.video-js')?.querySelector<HTMLElement>('.vjs-big-play-button');
+      if (start?.getClientRects().length) {
+        playbackRequestedAt = Date.now();
+        start.click();
+      } else status = 'Start playback with the site’s Play button.';
+      return;
+    }
+    if (!video.paused) video.pause();
+    else {
+      try { await video.play(); }
+      catch { status = 'Playback could not start. Try the original player.'; }
+    }
+    tick();
+  }
+  async function copyPlaybackReport() {
+    const manifest = globalThis.chrome?.runtime?.getManifest?.();
+    const report = [
+      manifest ? `${manifest.name} ${manifest.version}` : 'Anime Study',
+      `Video: ${playbackStatus}`,
+      `Position: ${clock(playbackTime)} / ${clock(playbackDuration)}`,
+      `Subtitles: ${subtitleStatus}`,
+      video?.error ? `Media error code: ${video.error.code}` : '',
+    ].filter(Boolean).join('\n');
+    try {
+      await navigator.clipboard.writeText(report);
+      status = 'Playback report copied.';
+    } catch { status = 'Chrome blocked clipboard access. Open Playback details to read the report.'; }
+  }
+  function adjustSubtitleTiming(amount: number) {
+    subtitleOffset += amount;
+    stopAfter = null;
+
+    phraseStops.reset();
+    tick();
+  }
+  function openStudy() {
+    open = true;
+    if (loadEpisodeCaptions) studyPlayer = true;
+    tick();
+    void load();
+  }
   onMount(() => {
+    if (inline) {
+      try { autoSkip = localStorage.getItem(autoSkipKey) !== 'off'; } catch { /* Use the default. */ }
+    } else if (loadEpisodeCaptions) {
+      void siteStorage()?.get([siteAutoSkipKey, replaceSitePlayerKey]).then(saved => {
+        autoSkip = saved[siteAutoSkipKey] !== false;
+        replaceSitePlayer = saved[replaceSitePlayerKey] !== false;
+      }).catch(() => {}).finally(() => { sitePreferencesLoaded = true; });
+      if (!siteStorage()) sitePreferencesLoaded = true;
+    }
     void load();
     const timer = setInterval(tick, 100);
-    const selection = () => { const value = window.getSelection()?.toString().trim() || ''; if (value && hasJapanese(value)) lastSelection = value; };
-    document.addEventListener('selectionchange', selection);
-    return () => { clearInterval(timer); automatic.reset(); restoreSpeed(); document.removeEventListener('selectionchange', selection); };
+    return () => { clearInterval(timer); automatic.reset(); restoreSpeed(); };
   });
-  async function play(cue: Cue, repeat: boolean) {
-    if (!video) { status = 'Start a video first. If it is embedded, use the Japanese button inside the player.'; return; }
+  async function replayPhrase() {
+    if (!video || !captured) return;
     try {
-      stopAfter = null;
-      quizEngine.reset();
-      loop = repeat ? cue : null;
-      video.currentTime = cue.start;
-      if (!repeat) stopAfter = { video, end: cue.end };
+      video.currentTime = captured.start;
+      stopAfter = { video, end: captured.end };
       await video.play();
-    } catch { loop = null; stopAfter = null; status = 'Playback could not start. Press play on the video and try again.'; }
+    } catch {
+      stopAfter = null;
+      status = 'Could not replay this phrase.';
+    }
   }
-  function lastFive(): Cue {
-    const end = video?.currentTime || 0;
-    return { start: Math.max(0, end - 5), end: Math.max(0.1, end), text: '' };
+
+  function inspectPhrase(cue: Cue) {
+    if (video) {
+      resumeAt ??= video.currentTime;
+      video.pause();
+      playbackPaused = true;
+    }
+    mode = 'learn';
+
+    stopAfter = null;
+    captured = { ...cue };
+    text = cue.text;
+    meaning = cards.find(card => card.text === cue.text)?.meaning || '';
+    status = '';
   }
-  function capture() {
-    text = detected?.text || lastSelection || '';
-    if (video) video.pause();
-    loop = null; stopAfter = null;
-    status = text ? 'Say it aloud, then add a meaning you have checked.' : 'No Japanese subtitle detected. Paste a phrase below or load Japanese SRT / VTT subtitles.';
+
+  async function resumePhrase() {
+    if (busy) return;
+    const time = resumeAt;
+    captured = null;
+    resumeAt = null;
+    stopAfter = null;
+    status = '';
+    if (!video) return;
+    if (inline && time !== null && time >= playbackDuration && playbackDuration > 0) {
+      onResumeAtEnd?.();
+      return;
+    }
+    if (time !== null && Math.abs(video.currentTime - time) > 0.05) video.currentTime = time;
+    try { await video.play(); } catch { status = 'Press Play to continue.'; }
+    tick();
   }
-  let captured = $state<Cue | null>(null);
-  function capturePhrase() { captured = detected ? { ...detected } : video ? lastFive() : null; capture(); }
+
+  function switchMode(next: typeof mode) {
+    if (next === mode) return;
+    if (captured && next === 'watch') void resumePhrase();
+    else {
+      captured = null;
+      resumeAt = null;
+      stopAfter = null;
+
+    }
+    mode = next;
+    phraseStops.reset();
+    if (next === 'review') { video?.pause(); void load(); }
+  }
+
+  function siteStorage() {
+    return globalThis.chrome?.storage?.local;
+  }
+
+  function setAutoSkip(enabled: boolean) {
+    autoSkip = enabled;
+    if (!enabled) countdown = null;
+    if (!inline) {
+      void siteStorage()?.set({ [siteAutoSkipKey]: enabled }).catch(() => {});
+      return;
+    }
+    try { localStorage.setItem(autoSkipKey, enabled ? 'on' : 'off'); } catch { /* Keep the current preference. */ }
+  }
+
+  function setReplaceSitePlayer(enabled: boolean) {
+    replaceSitePlayer = enabled;
+    void siteStorage()?.set({ [replaceSitePlayerKey]: enabled }).catch(() => {});
+  }
+
+  function replaceSitePlayerWhenReady() {
+    if (!loadEpisodeCaptions || inline || !replaceSitePlayer || !sitePreferencesLoaded || leftSitePlayer) return;
+    if (!Array.from(document.querySelectorAll('video')).some(item => item.getBoundingClientRect().width > 0)) return;
+    openStudy();
+  }
+
+  function lookupSiteNextEpisode() {
+    const page = location.href;
+    siteNextEpisode = { page, url: null };
+    void requestArc({ type: 'ANIME_NEXT_EPISODE_LINK' }).then(response => {
+      if (siteNextEpisode?.page === page) siteNextEpisode = { page, url: typeof response?.url === 'string' ? response.url : null };
+    }).catch(() => {});
+  }
+
+  function openSiteNextEpisode() {
+    const url = siteNextEpisode?.url;
+    if (!url) return;
+    void requestArc({ type: 'ANIME_OPEN_EPISODE', url }).then(response => {
+      if (response?.error) status = response.error;
+    }).catch(() => { status = 'Could not open the next episode.'; });
+  }
+
+  function endingGoesNext(end: number) {
+    return !!nextEpisode && playbackDuration - end <= endingTail;
+  }
+
+  function playNextEpisode() {
+    if (!nextEpisode) return;
+    dismissedSkips.add('ed');
+    countdown = null;
+    nextEpisode();
+  }
+
+  function keepWatching() {
+    if (!countdown) return;
+    dismissedSkips.add(countdown.part);
+    countdown = null;
+  }
+
+  function updateSkipCountdown() {
+    if (!autoSkip || !video || video.seeking || mode === 'review' || stopAfter) {
+      countdown = null;
+      return;
+    }
+    const part = (['op', 'ed'] as const).find(part => !dismissedSkips.has(part) && canSkip(part)
+      && playbackTime >= (skipRange(part)?.start ?? Infinity));
+    const range = part && skipRange(part);
+    if (!part || !range) {
+      countdown = null;
+      return;
+    }
+    if (countdown?.part !== part || countdown.end !== range.end) {
+      countdown = video.paused ? null : { part, end: range.end, remaining: 5 };
+      countdownTime = playbackTime;
+      return;
+    }
+    if (!video.paused && video.playbackRate > 0) {
+      countdown.remaining -= Math.max(0, playbackTime - countdownTime) / video.playbackRate;
+    }
+    countdownTime = playbackTime;
+    if (countdown.remaining <= 0) {
+      if (part === 'ed' && endingGoesNext(range.end)) playNextEpisode();
+      else skipPart(part);
+    }
+  }
+
+  function skipPart(part: SkipPart) {
+    const segment = skipRange(part);
+    if (segment && canSkip(part)) {
+      dismissedSkips.add(part);
+      countdown = null;
+      if (video) skipUndo = { time: video.currentTime, expiresAt: Date.now() + 10000 };
+      seek(segment.end);
+    } else if (part === 'op' && fallbackOpening && video) {
+      const time = video.currentTime;
+      skipUndo = { time, expiresAt: Date.now() + 10000 };
+      seek(time + 85);
+    }
+  }
+
+  function undoSkip() {
+    if (skipUndo === null) return;
+    const { time } = skipUndo;
+    skipUndo = null;
+    seek(time);
+  }
+
+  function skipRange(part: 'op' | 'ed') {
+    const segment = subtitleSegments[part];
+    const subtitleRange = segment ? { start: segment.start + subtitleOffset, end: segment.end + subtitleOffset } : null;
+    const frames = videoThemes[part];
+    if (chapters[part]) return chapters[part];
+    // Theme lyrics usually start after the intro music and stop before the outro, so a frame match is more exact.
+    if (frames && (!subtitleRange || (frames.start < subtitleRange.end && frames.end > subtitleRange.start))) return frames;
+    return (segment?.source !== 'dialogue-gap' && subtitleRange) || frames || subtitleRange;
+  }
+
+  function canSkip(part: 'op' | 'ed') {
+    const segment = skipRange(part);
+    return playbackReady && !!segment && segment.end > playbackTime && segment.end <= playbackDuration + 0.5
+      && playbackTime >= Math.max(0, segment.start - 1) && !captured && !challenge;
+  }
+
+  async function pictureInPicture() {
+    if (!video) return;
+    try {
+      if (document.pictureInPictureElement === video) await document.exitPictureInPicture();
+      else await video.requestPictureInPicture();
+    } catch { status = 'Picture in picture could not start.'; }
+  }
+
   async function translate() {
     const phrase = text.trim();
     if (!phrase) return;
@@ -151,15 +576,15 @@
     finally { translating = false; }
   }
   async function save() {
-    if (!text.trim() || !meaning.trim()) { status = 'Add both the Japanese phrase and its meaning.'; return; }
+    if (!captured || !text.trim() || !meaning.trim()) { status = 'Add both the Japanese phrase and its meaning.'; return; }
     if (!hasJapanese(text)) { status = 'Use Japanese characters for the phrase.'; return; }
     busy = true;
     try {
-      const range = captured || detected || (video ? lastFive() : { start: 0, end: 5, text: '' });
-      const url = window === window.top ? location.href : document.referrer || location.href;
-      const response = await requestArc({ type: 'JAPANESE_SAVE', card: { ...range, text: text.trim(), meaning: meaning.trim(), url, title: document.title } });
-      cards = response.cards; text = ''; meaning = ''; captured = null;
-      status = 'Saved. Review it with the meaning hidden.';
+      const range = captured;
+      const url = cardSource();
+      const response = await requestArc({ type: 'JAPANESE_SAVE', card: { ...range, text: text.trim(), meaning: meaning.trim(), url, title: title || document.title } });
+      cards = response.cards;
+      status = 'Phrase saved.';
     } catch (error) { status = error instanceof Error ? error.message : 'Could not save. Try again.'; }
     finally { busy = false; }
   }
@@ -190,11 +615,11 @@
     try {
       let id = challenge.cardId;
       if (!id) {
-        const url = window === window.top ? location.href : document.referrer || location.href;
+        const url = cardSource();
         const existing = cards.find((card) => card.text === challenge!.cue.text && card.url === url);
         if (existing) id = existing.id;
         else {
-          const saved = await requestArc({ type: 'JAPANESE_SAVE', card: { ...challenge.cue, text: challenge.cue.text, meaning: challenge.meaning, url, title: document.title } });
+          const saved = await requestArc({ type: 'JAPANESE_SAVE', card: { ...challenge.cue, text: challenge.cue.text, meaning: challenge.meaning, url, title: title || document.title } });
           cards = saved.cards;
           id = cards.find((card) => card.text === challenge!.cue.text && card.url === url)?.id;
         }
@@ -207,17 +632,44 @@
   }
   async function continueQuiz() {
     if (busy) return;
-    challenge = null; quizRequest++; quizLoading = false; quizEngine.reset(); quizError = '';
-    if (mode === 'watch' && video) { try { await video.play(); } catch { status = 'Press play on the video to continue.'; } }
+    challenge = null; quizRequest++; quizLoading = false; phraseStops.reset(); quizError = '';
   }
   async function setChance(event: Event) {
     const chance = Number((event.currentTarget as HTMLSelectElement).value);
+    quizSettings = { chance };
+    phraseStops.reset();
     try { quizSettings = (await requestArc({ type: 'JAPANESE_QUIZ_SETTINGS', settings: { chance } })).settings; }
     catch { status = 'Could not save quiz frequency.'; }
   }
   function closePanel() {
-    open = false; quizEnabled = false; loop = null; stopAfter = null; challenge = null; quizRequest++; quizLoading = false; quizEngine.reset(); restoreSpeed();
-    automatic.reset(); automaticCues = []; automaticSource = '';
+    if (loadEpisodeCaptions) leftSitePlayer = true;
+    skipUndo = null;
+    studyPlayer = false; showSettings = false; showTranscript = false;
+    open = false; captured = null; resumeAt = null; stopAfter = null; challenge = null; quizRequest++; quizLoading = false; phraseStops.reset(); restoreSpeed();
+    resetSubtitleLookup();
+    playbackRequestedAt = 0;
+  }
+  async function importSubtitleLink() {
+    const url = subtitleLink.trim();
+    if (!subtitleUrl(url)) { status = 'Paste a direct HTTPS link to the episode’s subtitle file.'; return; }
+    const page = location.href;
+    const player = video;
+    const source = player?.currentSrc;
+    loadingSubtitleLink = true;
+    try {
+      const { body } = await requestArc({ type: 'JAPANESE_FETCH_CAPTIONS', url });
+      if (!open || page !== location.href || player !== video || source !== video?.currentSrc) return;
+      const cues = parseCaptionResponse(body);
+      if (!japaneseCaptions(cues, true)) { status = 'This file has no readable Japanese subtitle lines.'; return; }
+      imported = cues; importedBody = body;
+      subtitleName = 'Subtitle download link';
+      subtitleOffset = 0;
+
+      phraseStops.reset();
+      status = `Loaded ${cues.length} lines from the subtitle link.`;
+    } catch {
+      if (open && page === location.href) status = 'Could not load that link. Download the subtitle file and open it here instead.';
+    } finally { loadingSubtitleLink = false; }
   }
   async function importFile(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
@@ -225,10 +677,11 @@
     if (!file) return;
     if (file.size > 5000000) { status = 'Choose a subtitle file smaller than 5 MB.'; return; }
     try {
-      const cues = parseSubtitles(await file.text());
-      if (!cues.some((cue) => hasJapanese(cue.text))) { status = 'No Japanese SRT / VTT lines found. ASS files are not supported yet.'; return; }
-      imported = cues; subtitleName = file.name;
-      status = `Loaded ${cues.length} lines. Timings must match this video.`;
+      const textBody = await file.text();
+      const cues = parseCaptionResponse(textBody);
+      if (!cues.some((cue) => hasJapanese(cue.text))) { status = 'No Japanese SRT / VTT / ASS lines found.'; return; }
+      imported = cues; importedBody = textBody; subtitleName = file.name;
+      status = `Loaded ${cues.length} lines from ${file.name}. Timings must match this video.`;
     } catch { status = 'Could not read that subtitle file.'; }
     input.value = '';
   }
@@ -247,64 +700,217 @@
   }
 </script>
 
-<div class="study">
+<svelte:window onpointermove={revealControls} onpointerdown={revealControls} onkeydown={handlePlayerKey} />
+
+{#snippet timelineControls()}
+  <input aria-label="Playback position" class="seek" type="range" min="0" max={playbackDuration || 1} step="0.1" value={playbackTime} disabled={!playbackDuration || !!captured || !!challenge} oninput={event => seek(event.currentTarget.valueAsNumber)} />
+  <span class="clock">{clock(playbackTime)} / {clock(playbackDuration)}</span>
+{/snippet}
+
+{#if combined}<div class="backdrop" aria-hidden="true"></div>{/if}
+<div class="study" class:combined class:inline class:waiting={studyPlayer && !combined}>
   {#if open}
-    <section aria-label="Japanese learning" class="panel">
-      <header><div><small>ARC · JAPANESE</small><h2>A little, every day.</h2></div><button aria-label="Close Japanese panel" disabled={busy} onclick={closePanel}>×</button></header>
-      <nav aria-label="Study mode"><button disabled={!!challenge} class:active={mode === 'watch'} onclick={() => { mode = 'watch'; status = ''; }}>Watch & learn</button><button disabled={!!challenge} class:active={mode === 'review'} onclick={() => { mode = 'review'; stopLoop(); status = ''; void load(); }}>Review · {due.length}</button></nav>
+    {#if countdown}
+      {@const goesNext = countdown.part === 'ed' && endingGoesNext(countdown.end)}
+      <div class="skip-suggestion" role="group" aria-label={skipLabels[countdown.part]}>
+        {#if countdown.part === 'ed' && nextEpisode}
+          <button class:primary={goesNext} onclick={playNextEpisode}>Next episode</button>
+        {/if}
+        <button class:primary={!goesNext} onclick={() => countdown && skipPart(countdown.part)}>{skipLabels[countdown.part]}</button>
+        <span>{goesNext ? 'Next episode' : 'Skipping'} in {Math.max(1, Math.ceil(countdown.remaining))} s</span>
+        <button onclick={keepWatching}>Keep watching</button>
+      </div>
+    {:else if skipControls && skipUndo && now < skipUndo.expiresAt}
+      <div class="skip-suggestion">
+        <button onclick={undoSkip}>Undo skip</button>
+      </div>
+    {/if}
+    <section aria-label="Japanese learning" class="panel" hidden={overlayHidden}>
+      {#if !challenge && mode !== 'review' && !captured && ((studyPlayer && !combined) || detected || (mode === 'learn' && !sourceCues.length))}
+        <div class="caption-row">
+          {#if studyPlayer && !combined}
+            <span class="notice">{playbackRequestedAt && now - playbackRequestedAt >= 5000
+              ? 'The site hasn’t supplied video yet. Try its Play button.'
+              : 'Start the video to switch to the Arc player.'}</span>
+          {:else if detected}
+            <button class="caption" lang="ja" title="Study this subtitle" onclick={() => detected && inspectPhrase(detected)}>{detected.text}</button>
+          {:else if !sourceCues.length}
+            <span class="notice">{video ? subtitleStatus : 'Start the video to connect'}</span>
+          {/if}
+        </div>
+      {/if}
+      <div class="player-controls" class:controls-hidden={hideControls}>
+      {#if inline}<div class="playback-timeline">{@render timelineControls()}</div>{/if}
+      <div class="toolbar">
+        {#if showPlayback || studyPlayer}
+          <button aria-label={playbackPaused ? 'Play' : 'Pause'} onclick={togglePlayback} disabled={!video || !!captured || !!challenge}>{playbackPaused ? '▶' : '❚❚'}</button>
+        {/if}
+        {#if showPlayback && !inline}{@render timelineControls()}{/if}
+        {#if showPlayback && (loadEpisodeCaptions || inline)}
+          {#if !skipControls && skipUndo && now < skipUndo.expiresAt}
+            <button onclick={undoSkip}>Undo skip</button>
+          {/if}
+          {#if (canSkip('op') && countdown?.part !== 'op') || (fallbackOpening && (!skipUndo || now >= skipUndo.expiresAt))}
+            <button onclick={() => skipPart('op')}>{fallbackOpening ? 'Skip opening (+85s)' : 'Skip opening'}</button>
+          {/if}
+          {#if canSkip('ed') && countdown?.part !== 'ed'}
+            <button onclick={() => skipPart('ed')}>Skip ending</button>
+            {#if nextEpisode}<button onclick={playNextEpisode}>Next episode</button>{/if}
+          {/if}
+        {/if}
+        <button class="active" class:learning={mode === 'learn'} aria-pressed={mode === 'learn'} disabled={!!challenge} onclick={() => switchMode(mode === 'learn' ? 'watch' : 'learn')}>Learn</button>
+        <button aria-label="Player options" title="Player options" aria-expanded={showSettings} onclick={() => { showSettings = !showSettings; }}>⋯</button>
+        {@render playerActions?.()}
+        {#if !inline}
+          <button data-study-player aria-pressed={studyPlayer} aria-label={studyPlayer ? 'Return to page player' : 'Close Japanese panel'} title={studyPlayer ? 'Return to page player' : 'Close Japanese panel'} disabled={busy} onclick={closePanel}>×</button>
+        {/if}
+      </div>
+      {#if showSettings}
+        <div class="extras" aria-label="Player options">
+          {@render playerOptions?.()}
+          {#if inline || loadEpisodeCaptions}<label><input type="checkbox" checked={autoSkip} onchange={event => setAutoSkip(event.currentTarget.checked)} /> Auto-skip openings and endings</label>{/if}
+          {#if loadEpisodeCaptions}<label><input type="checkbox" checked={replaceSitePlayer} onchange={event => setReplaceSitePlayer(event.currentTarget.checked)} /> Always use the Arc player on this site</label>{/if}
+          {#if video}<button onclick={() => { if (video) { video.muted = !video.muted; tick(); } }}>{playbackMuted ? 'Unmute' : 'Mute'}</button>{/if}
+          {#if showPlayback && document.pictureInPictureEnabled}<button disabled={!playbackReady} onclick={pictureInPicture}>Picture in picture</button>{/if}
+          <label>Speed <select aria-label="Playback speed" disabled={!video} bind:value={selectedSpeed} onchange={speed}><option value="1">Normal</option><option value="0.85">0.85×</option><option value="0.7">0.7×</option></select></label>
+          <button disabled={!!challenge} onclick={() => { switchMode(mode === 'review' ? 'watch' : 'review'); showSettings = false; }}>Review · {due.length}</button>
+          <button disabled={!cards.length} onclick={exportCards}>Export phrases</button>
+          <details>
+            <summary>Subtitles</summary>
+            {#if sourceCues.length}
+              <div class="controls">
+                <button onclick={() => adjustSubtitleTiming(-0.5)}>Earlier</button>
+                <span>Timing {subtitleOffset > 0 ? '+' : ''}{subtitleOffset.toFixed(1)}s</span>
+                <button onclick={() => adjustSubtitleTiming(0.5)}>Later</button>
+              </div>
+            {/if}
+            {#if subtitleName || automaticSource}<p class="notice">{subtitleName || automaticSource}</p>{/if}
+            <input aria-label="Japanese subtitle file" type="file" accept=".srt,.vtt,.ass,.ssa" onchange={importFile} />
+            {#if loadEpisodeCaptions}
+              <label>Subtitle URL <input type="url" bind:value={subtitleLink} /></label>
+              <button onclick={importSubtitleLink} disabled={loadingSubtitleLink || !subtitleLink.trim()}>Load subtitle link</button>
+            {/if}
+          </details>
+          <details>
+            <summary>Playback details</summary>
+            <p class="notice">{playbackStatus} · {clock(playbackTime)} / {clock(playbackDuration)}</p>
+            <p class="notice">{subtitleStatus}</p>
+            {#if !inline && !sourceCues.length}
+              <button disabled={!!subtitleScan} onclick={() => { resetSubtitleLookup(); tick(); }}>Retry subtitles</button>
+            {/if}
+            <button onclick={copyPlaybackReport}>Copy playback report</button>
+          </details>
+        </div>
+      {/if}
       {#if challenge}
-        <p class="hint">{mode === 'watch' ? 'Video paused. What did you hear?' : 'What does this phrase mean?'}</p>
-        {#if mode === 'review' || result}<div class="caption" lang="ja">{challenge.cue.text}</div>{:else}<button disabled={!video} onclick={() => challenge && play(challenge.cue, false)}>Listen again</button>{/if}
+        <p class="hint">What does this phrase mean?</p>
+        <div class="caption" lang="ja">{challenge.cue.text}</div>
         {#if quizLoading}<p role="status">Preparing translations…</p>{/if}
         <div class="quiz-options">{#each options as option}<button disabled={!!result || busy} class:correct={!!result && option === challenge.meaning} class:wrong={result === 'incorrect' && option === chosen} onclick={() => answerQuiz(option)}>{option}</button>{/each}</div>
         {#if !result && options.length}<button disabled={busy} onclick={() => answerQuiz(null)}>I don’t know yet</button>{/if}
         {#if result}<p role="status">{result === 'correct' ? 'Correct. This phrase will return later.' : 'The highlighted answer is the translation. This phrase will return sooner.'}</p><p class="hint">{challenge.meaning}</p>{/if}
         {#if quizError}<p class="status" role="alert">{quizError}</p><button disabled={busy} onclick={() => result ? saveQuizResult() : challenge && beginQuiz(challenge)}>Retry</button>{/if}
-        {#if result}<button class="primary" disabled={busy || !quizSaved} onclick={continueQuiz}>{mode === 'watch' ? 'Continue watching' : 'Next review'}</button>{:else}<button disabled={busy} onclick={continueQuiz}>Skip without changing progress</button>{/if}
+        {#if result}<button class="primary" disabled={busy || !quizSaved} onclick={continueQuiz}>Next review</button>{:else}<button disabled={busy} onclick={continueQuiz}>Skip without changing progress</button>{/if}
         <p class="hint">Translations may be machine generated. Your answer updates the review schedule automatically.</p>
-      {:else if mode === 'watch'}
-        <p class="connection" aria-live="off">{video ? `Connected to video · ${playbackReady ? playbackPaused ? 'Paused' : 'Playing' : 'Loading'} · ${clock(playbackTime)}` : 'No video connected in this frame'}</p>
-        <p class="hint">{automaticSource ? `Ready automatically · ${automaticSource}` : detected ? 'Reading the player’s Japanese captions automatically.' : 'Looking for Japanese subtitles in the player and its caption requests…'}</p>
-        <label class="quiz-toggle"><input type="checkbox" bind:checked={quizEnabled} onchange={() => quizEngine.reset()} /> Pause for listening quizzes</label>
-        {#if quizEnabled}<p class="hint">Known phrases pause when due. Short lines with an estimated 1–2 unfamiliar words are sampled. Learning starts from your answers.</p><label>Sample unfamiliar lines <select aria-label="Unfamiliar phrase frequency" value={String(quizSettings.chance)} onchange={setChance}><option value="0.1">Occasionally · 10%</option><option value="0.25">Sometimes · 25%</option><option value="0.5">Often · 50%</option><option value="1">Every eligible line</option></select></label><p class="hint">Quiz mode sends selected subtitle lines to Google Translate to prepare answers. Your answers stay on this device.</p>{/if}
-        <p class="hint">Listen once. Replay. Say it aloud. Save a phrase you want to use.</p>
-        <div class="caption" lang="ja">{detected?.text || (video ? automaticCues.length ? 'Japanese subtitles connected. Waiting for the next line.' : 'No Japanese text found yet. The video may not provide Japanese subtitles.' : 'Start a video to connect playback.')}</div>
-        <div class="controls"><button disabled={!video} onclick={() => play(lastFive(), false)}>Replay 5 seconds</button><button disabled={!video} class:active={!!loop} onclick={() => loop ? stopLoop() : play(detected || lastFive(), true)}>{loop ? 'Stop loop' : detected ? 'Loop captured section' : 'Loop last 5 seconds'}</button></div>
-        <div class="controls"><label>Speed <select aria-label="Playback speed" disabled={!video} bind:value={selectedSpeed} onchange={speed}><option value="1">Normal</option><option value="0.85">0.85×</option><option value="0.7">0.7×</option></select></label><button onclick={capturePhrase}>Capture phrase</button></div>
-        {#if !video}<p class="hint">Start a video. For embedded videos, use the Japanese button inside the player.</p>{/if}
-        <label for="jp-phrase">Japanese phrase</label><textarea id="jp-phrase" lang="ja" rows="2" bind:value={text} placeholder="Capture, select, or paste Japanese text"></textarea>
-        <div class="controls"><label for="jp-meaning">Meaning in your own words</label><button disabled={translating || !text.trim()} onclick={translate}>{translating ? 'Translating…' : 'Translate to English'}</button></div><textarea id="jp-meaning" rows="2" bind:value={meaning} placeholder="Add a meaning you have checked"></textarea>
-        <small class="translation-note">Translate sends this phrase to Google Translate.</small>
-        <button class="primary" disabled={busy || !text.trim() || !meaning.trim()} onclick={save}>{busy ? 'Saving…' : 'Save phrase'}</button>
-        <details><summary>Advanced: use your own subtitles</summary><p class="hint">Optional SRT or VTT override. Normal playback discovers player subtitles automatically.</p><input aria-label="Japanese subtitle file" type="file" accept=".srt,.vtt" onchange={importFile} />{#if subtitleName}<small>{subtitleName}</small>{/if}</details>
-      {:else if review}
+      {:else if mode === 'review' && review}
         <p class="hint">Answer a translation question. The result schedules your next review automatically.</p><button class="primary" onclick={() => { if (video) video.pause(); void beginQuiz({ cue: review, kind: 'known', unknown: [], meaning: review.meaning, cardId: review.id }); }}>Start next review</button>
-        <a href={sourceUrl(review.url, review.start)} target="_blank" rel="noopener noreferrer">Open source · {clock(review.start)}</a><p class="hint">YouTube links return to the saved time. On anime pages, seek to the time shown.</p>
-      {:else}<div class="caption">{cards.length ? 'You’re caught up.' : 'Your first phrase starts here.'}</div><p class="hint">{cards.length ? 'Come back when a phrase is due. Remembered phrases return after 1, 2, 4 days and longer.' : 'Capture a phrase while watching, add its meaning, then come here to practise remembering it.'}</p>{/if}
-      {#if status}<p class="status" role="status">{status}</p>{/if}
-      <footer><span>{cards.length} saved · stored on this device</span><button disabled={!cards.length} onclick={exportCards}>Export</button></footer>
+        {#if sourceUrl(review.url, review.start)}<a href={sourceUrl(review.url, review.start)} target="_blank" rel="noopener noreferrer">Open source · {clock(review.start)}</a>{/if}
+      {:else if mode === 'review'}<div class="caption">{cards.length ? 'You’re caught up.' : 'Your first phrase starts here.'}</div><p class="hint">{cards.length ? 'Come back when a phrase is due. Remembered phrases return after 1, 2, 4 days and longer.' : 'Capture a phrase while watching, add its meaning, then come here to practise remembering it.'}</p>{/if}
+      {#if mode === 'learn' && !challenge}
+        <div class="learn-bar">
+          <label>Pause to study <select value={String(quizSettings.chance)} onchange={setChance}>
+            <option value="0">Never</option><option value="0.1">Random · 10%</option><option value="0.25">Random · 25%</option><option value="0.5">Random · 50%</option><option value="1">Every phrase</option>
+          </select></label>
+          {#if transcript.length}
+            <details bind:open={showTranscript}>
+              <summary>Transcript</summary>
+              {#if showTranscript}
+                <div class="transcript">
+                  {#each transcript as cue}
+                    <button lang="ja" onclick={() => { inspectPhrase(cue); showTranscript = false; }}>
+                      <span class="clock">{clock(cue.start)}</span> {cue.text}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </details>
+          {/if}
+        </div>
+      {/if}
+      {#if captured}
+        <div class="phrase">
+          <p class="phrase-text" lang="ja">{captured.text}</p>
+          {#if phraseWords.length}<p class="words" lang="ja">{phraseWords.join(' · ')}</p>{/if}
+          <div class="controls">
+            <button disabled={!video} onclick={replayPhrase}>Replay</button>
+          {#if !inline}<button disabled={translating} title="Send this phrase to Google Translate" onclick={translate}>{translating ? 'Translating…' : 'Translate'}</button>{/if}
+            <button class="active" disabled={busy} onclick={resumePhrase}>Continue</button>
+          </div>
+          <div class="controls">
+            <input aria-label="Meaning" bind:value={meaning} placeholder="Add a meaning" />
+            <button disabled={busy || !meaning.trim()} onclick={save}>Save phrase</button>
+          </div>
+        </div>
+      {/if}
+      {#if status}<p class="notice" role="status">{status}</p>{/if}
+      </div>
     </section>
+  {:else if !inline}
+    <button class="launcher" hidden={!!loadEpisodeCaptions} aria-expanded={open} onclick={openStudy}>{loadEpisodeCaptions ? 'Arc player' : 'Learn Japanese'}</button>
   {/if}
-  <button class="launcher" disabled={busy} aria-expanded={open} onclick={() => { if (open) closePanel(); else { open = true; void load(); } }}>日本語 <span>{open ? 'Close' : 'Learn'}</span></button>
 </div>
 
 <style>
-  :host { all: initial; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #f4f3fa; font-size: 13px; }
-  .connection { color: #d2c4ed; font-size: 12px; padding: 9px 11px; border: 1px solid #ffffff20; border-radius: 9px; }
-  .quiz-options { display: grid; gap: 8px; margin: 14px 0; } .quiz-options button { text-align: left; padding: 12px; } .quiz-options button.correct { background: #49795966; border-color: #8cda9b; opacity: 1; } .quiz-options button.wrong { background: #a34d4d66; border-color: #eea1a1; opacity: 1; } .quiz-toggle { display: flex; gap: 8px; align-items: center; padding-top: 10px; }
-  @media (pointer: coarse) {
-    .study { right: max(12px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); width: min(420px, calc(100vw - 24px)); font-size: 16px; }
-    .panel { max-height: calc(100dvh - 100px - env(safe-area-inset-bottom)); padding: 20px; }
-    button, select, summary { min-height: 48px; }
-    .quiz-options button { min-height: 60px; font-size: 17px; padding: 15px; }
-    header button { min-width: 48px; }
-    textarea { font-size: 16px; }
-    input[type='checkbox'] { width: 24px; height: 24px; flex-shrink: 0; }
-    .hint { font-size: 14px; }
+  :host { all: initial; }
+  * { box-sizing: border-box; }
+  .backdrop { position: fixed; inset: 0; background: #0d0d12; z-index: 2147483644; }
+  .study { position: fixed; right: 12px; bottom: 12px; width: min(100% - 24px, 380px); z-index: 2147483647; color: #f7f5fc; font: 13px/1.5 system-ui, sans-serif; color-scheme: dark; }
+  .study.combined { left: 12px; width: auto; }
+  .study.waiting { top: 12px; bottom: auto; }
+  .study.inline { position: static; width: 100%; }
+  .panel { background: #18171f; border: 1px solid #393642; border-radius: 12px; padding: 8px 10px; max-height: min(60dvh, 430px); overflow: auto; }
+  .combined .panel, .inline .panel { border: 0; background: transparent; padding: 0; pointer-events: none; }
+  .combined .player-controls, .inline .player-controls {
+    background: #18171fed; border: 1px solid #393642; border-radius: 9px; padding: 4px 7px; pointer-events: auto;
   }
-  * { box-sizing: border-box; } .study { position: fixed; right: 20px; bottom: 20px; z-index: 2147483646; width: min(366px, calc(100vw - 24px)); pointer-events: none; line-height: 1.5; }
-  .panel, .launcher { pointer-events: auto; } .panel { border: 1px solid #ffffff24; border-radius: 20px; background: #24232ded; backdrop-filter: blur(24px); padding: 20px; margin-bottom: 10px; box-shadow: 0 20px 80px #0006; max-height: calc(100dvh - 100px); overflow: auto; }
-  header, nav, .controls, footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; } header { align-items: start; margin-bottom: 18px; } small { color: #beb9d4; font-size: 10px; letter-spacing: 1px; } h2 { font-size: 20px; font-weight: 550; margin: 3px 0 0; letter-spacing: -.5px; }
-  button, select, textarea { font: inherit; color: inherit; } button, select, summary { cursor: pointer; } button { border: 1px solid #ffffff1c; border-radius: 9px; background: #ffffff09; padding: 8px 10px; } button:hover { background: #ffffff18; } button:disabled { opacity: .45; cursor: default; } button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid #cfb6ff; outline-offset: 3px; }
-  header button { border: 0; font-size: 20px; padding: 0 5px; } nav { justify-content: start; padding-bottom: 3px; } nav button { flex: 1; } .active { background: #ae8af52b; border-color: #bc9cf56b; } .hint { color: #bfbacb; font-size: 12px; margin: 12px 0; } .caption { background: #15141c66; padding: 18px; border-radius: 12px; margin: 12px 0; font-size: 19px; line-height: 1.7; overflow-wrap: anywhere; min-height: 90px; } .controls { margin: 10px 0; } .controls button { flex: 1; font-size: 12px; } label { display: block; font-size: 12px; margin: 10px 0 5px; color: #d5d0e2; } .controls label { margin: 0; } select { background: #33303e; border: 1px solid #ffffff20; border-radius: 7px; padding: 5px; } textarea { display: block; resize: vertical; width: 100%; border: 1px solid #ffffff23; border-radius: 10px; padding: 10px; background: #15141c66; } textarea::placeholder { color: #a5a0b2; font-size: 12px; } .primary { background: #ceb9f7; color: #21192e; border: 0; width: 100%; margin-top: 12px; font-weight: 600; } .primary:hover { background: #ddccff; } details { margin-top: 14px; color: #c8c1d8; font-size: 12px; } input { max-width: 100%; } footer { border-top: 1px solid #ffffff15; margin-top: 18px; padding-top: 12px; color: #bfbacb; font-size: 10px; } footer button { padding: 4px 8px; font-size: 11px; } .status { font-size: 12px; color: #e6d8ff; } .launcher { display: block; margin-left: auto; border-radius: 24px; background: #302b40; box-shadow: 0 4px 20px #0004; padding: 10px 16px; border-color: #cbb1f44d; } .launcher span { margin-left: 10px; color: #d1bddf; } a { color: #d9c2ff; display: block; margin-top: 14px; font-size: 12px; }
+  .player-controls.controls-hidden { visibility: hidden; pointer-events: none; }
+  .skip-suggestion {
+    display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 8px;
+    width: fit-content; max-width: 100%; margin: 0 0 6px auto; padding: 5px 7px;
+    border: 1px solid #393642; border-radius: 9px; background: #18171fed; pointer-events: auto;
+  }
+  .skip-suggestion span { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .toolbar, .extras, .learn-bar, .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .toolbar { min-height: 32px; }
+  .playback-timeline { display: flex; align-items: center; gap: 8px; min-height: 24px; padding-bottom: 3px; }
+  .seek { flex: 1 1 72px; width: 0; accent-color: #ceb9f7; }
+  .clock { font-variant-numeric: tabular-nums; color: #c2bdce; white-space: nowrap; }
+  .caption-row { display: grid; place-items: center; margin-bottom: 4px; }
+  .caption { max-width: 100%; text-align: center; font-size: clamp(15px, 2vw, 23px); line-height: 1.35; white-space: pre-line; overflow-wrap: anywhere; }
+  button, select, input { color: inherit; font: inherit; }
+  button, select, input:not([type='range']) { border: 1px solid #ffffff24; border-radius: 6px; background: #ffffff09; padding: 4px 8px; }
+  button, select, summary { cursor: pointer; }
+  button:hover { background: #ffffff19; }
+  .combined .caption-row > *, .inline .caption-row > * { background: #0d0d12e8; border-radius: 6px; padding: 4px 8px; pointer-events: auto; }
+  button:disabled { opacity: .4; cursor: default; }
+  button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid #cfb6ff; outline-offset: 2px; }
+  .active { border-color: #8e78ae; }
+  .learning, .primary { background: #ceb9f7; color: #201829; }
+  .learning:hover, .primary:hover { background: #deccff; }
+  .extras, .learn-bar, .phrase { border-top: 1px solid #ffffff1a; margin-top: 6px; padding-top: 6px; }
+  .phrase { width: min(100%, 680px); margin-inline: auto; }
+  .phrase-text { font-size: 20px; white-space: pre-line; }
+  .phrase p { margin: 3px 0; }
+  .phrase .controls + .controls { margin-top: 5px; }
+  .phrase input { flex: 1; min-width: 100px; }
+  .words, .notice, .hint { color: #c2bdce; }
+  .notice { margin: 4px 0; }
+  a { color: #decaff; }
+  .transcript { display: grid; max-height: 135px; overflow: auto; gap: 2px; }
+  .transcript button, .quiz-options button { text-align: left; }
+  .quiz-options { display: grid; gap: 4px; margin: 6px 0; }
+  .quiz-options .correct { border-color: #8cda9b; }
+  .quiz-options .wrong { border-color: #eea1a1; }
+  .launcher[hidden] { display: none; }
+  .launcher { display: block; margin-left: auto; background: #302b40; }
 </style>

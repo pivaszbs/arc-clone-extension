@@ -10,7 +10,7 @@ The sidebar and command bar use the same Clear rules. Clear closes inactive Toda
 
 Pinned pages track the opened tab as well as the saved URL, so navigation keeps the tab out of Today. Reset Space returns linked open pins to their saved URLs. Pin bindings are local to the browser session. Chrome owns its toolbar, tab strip, and reserved shortcuts. An extension cannot guarantee an exact match to Arc's native browser frame. Peek also depends on whether the destination allows iframe embedding.
 
-Run `npm test` for tab behavior regression tests, `npm run check` for Svelte and TypeScript checks, and `npm run build` to update the loadable extension in `dist/`.
+Run `npm test` for tab behavior regression tests, `npm run check` for Svelte and TypeScript checks, and `npm run build` to build Arc for Chrome in `dist-arc/` and Anime Study in `dist/`.
 
 The sidebar, new-tab page, and webpage overlay share one command palette. It supports keyboard navigation, immediate input focus, loading and retry feedback, and ignores stale searches. Space dialogs keep keyboard focus inside and return it when dismissed. Row controls work with Enter and Space, and animations respect reduced-motion preferences.
 
@@ -37,7 +37,7 @@ npm run build
 
 Reload the extension in Chrome, approve its local native-messaging permission if Chrome requests it, then refresh the video page. Choose **Across desktops** at the video's top right. **Return to page** closes the desktop window and restores the original player. The desktop window's play/pause button controls the source video.
 
-The installer registers only this extension ID in a new `local.arcclone.desktop_video.json` file in your user-level Chrome NativeMessagingHosts folder. Other hosts are preserved. If the loaded extension has a different ID, pass it explicitly to `node scripts/install-desktop-pip.mjs EXTENSION_ID`. The companion executable remains under `outputs/desktop-pip/Arc Desktop Video.app/` in this workspace. It starts on request and exits when the connection closes.
+The installer registers both unpacked extension IDs in the `local.arcclone.desktop_video.json` file in your user-level Chrome NativeMessagingHosts folder. Other hosts are preserved. If the loaded extension has a different ID, pass it explicitly to `node scripts/install-desktop-pip.mjs EXTENSION_ID`. The companion executable remains under `outputs/desktop-pip/Arc Desktop Video.app/` in this workspace. It starts on request and exits when the connection closes.
 
 The desktop player receives a capture of the selected video through local native messaging. It does not reopen the media URL, forward cookies, run an HTTP server, or capture the screen or microphone. It can therefore handle a same-origin blob source without transferring that blob URL to another browser. Captured audio follows the original mute and volume settings, while the page is muted to prevent duplicate audio. Closing the panel restores the page state. There is a short encoding/buffering delay.
 
@@ -57,6 +57,12 @@ For an iPad Safari build, run `npm run build:ipad`. The self-contained Userscrip
 
 On YouTube and smotret-anime.com / smotret-anime.net, click **日本語 Learn** at the bottom right. For embedded anime players, use the button inside the player frame. Open a video with Japanese audio and enable Japanese captions when available.
 
+On an Anime365 Japanese-subtitled episode in Chrome, the study player uses the episode's ASS download and follows the embedded video's clock. **Earlier** and **Later** shift the study subtitles by half a second. **Return to page player** restores the site's video controls and keeps the playback position.
+
+Use **Offline** beside the episode player to find the video and subtitle downloads. The **Anime Study** toolbar icon opens the offline library. Saved phrases and local playback are available offline. Translation of a new phrase requires a connection.
+
+For a whole series, select **Download series** beside the player or paste an Anime365 link in **Offline study**. Check the episode list, then start the queue. Chrome downloads one file at a time into `Downloads/Arc Anime`. You can pause the queue or retry failed files. Episodes without a downloadable video and Japanese subtitle pair are listed as unavailable. To watch, choose **Open a downloaded series folder** and select the series folder. Matching subtitle files load when you choose an episode.
+
 - Replay the last five seconds, loop the captured section, or slow playback to 0.85× / 0.7×. Closing the panel stops its loop and restores the previous speed.
 - Capture a Japanese caption, select Japanese page text and capture it, or paste a phrase. Add its meaning yourself or click **Translate to English**. Only that explicit translation action sends the phrase to Arc's existing Google Translate service.
 - Save a phrase with its source and time, or let a listening quiz save it automatically. **Review** asks you to choose its translation and grades the selected answer automatically. Incorrect answers return in ten minutes; correct answers return after one day, then two, four, and up to thirty days. You do not mark phrases or vocabulary as known yourself.
@@ -68,7 +74,7 @@ Enable **Pause for listening quizzes** to pause after eligible Japanese lines an
 
 Unfamiliar lines are sampled at 25% by default, adjustable to 10%, 50%, or every eligible line, with at least 30 seconds of video between sampled unfamiliar-line questions. Native / imported subtitle timings pause at the line end; visible YouTube captions pause when the line changes or clears. Seeking skips pending questions. Quiz mode sends selected subtitle lines to Arc's Google Translate service when no saved meaning exists; answers and results remain local. Failed translation requests can be retried or skipped without a learning penalty. Closing the panel disables quizzes for that frame. The first version uses translation choices, not AI grading of typed answers.
 
-After building, reload **Arc for Chrome** in Chrome's extensions page, then refresh the video page. The new controls use Arc's existing website access; they do not require additional permission types or an API key.
+Reload **Anime Study** in Chrome's extensions page, then refresh the video page.
 
 For a local UI preview, run `npx vite --host 127.0.0.1` and open `/preview.html?surface=japanese` on the displayed local address. The preview uses temporary mock storage and does not affect your real saved phrases.
 
@@ -99,20 +105,12 @@ For a local UI preview, run `npx vite --host 127.0.0.1` and open `/preview.html?
 
 ---
 
-## 🚀 How to Load in Google Chrome
+## Load the extensions in Google Chrome
 
-1. Install dependencies and build the extension (already built into `dist/`):
-   ```bash
-   npm install
-   npm run build
-   ```
-2. Open Google Chrome and navigate to:
-   ```
-   chrome://extensions
-   ```
-3. Enable **Developer mode** (toggle in the top-right corner).
-4. Click **Load unpacked** (top-left button) and select the **`dist`** folder inside this project:
-   ```
-   /Users/antonkrylov/code/arc clone/dist
-   ```
-5. Click the **Arc for Chrome** icon in your Chrome toolbar (pin it for quick access) to toggle the **Arc Vertical Sidebar**, and refresh any open web tab to activate the in-page **Command Bar (`Cmd+K`)**, **Peek (`Shift+Click`)**, and **Highlight-to-Translate**!
+Run `npm install` and `npm run build`, then open `chrome://extensions` and enable **Developer mode**.
+
+1. If you already use the combined extension, **reload its existing entry first**. The entry loaded from `dist/` becomes **Anime Study** and keeps your offline library and saved phrases. For a new install, use **Load unpacked** and select `dist/`.
+2. Use **Load unpacked** to select `dist-arc/` for **Arc for Chrome**. On its first load, Arc copies saved Spaces, pins, Favorites, and settings from the existing installation in `dist/` in the same Chrome profile.
+3. Refresh open website tabs. The **Anime Study** toolbar button opens the offline library. The **Arc for Chrome** toolbar button opens its sidebar.
+
+Either extension can run independently. On macOS, run `npm run install:desktop-pip` to register both unpacked extensions with the desktop companion.

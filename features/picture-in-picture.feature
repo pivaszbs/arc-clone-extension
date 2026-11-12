@@ -5,6 +5,7 @@ Feature: Native picture in picture for standard HTML video
 
   Scenario: A standard video enters and exits native picture in picture
     Given a standard video page
+    Then hovering the video reveals an icon-only picture in picture button
     When I click its picture in picture button
     Then the original video is in native picture in picture
     When I click its exit picture in picture button

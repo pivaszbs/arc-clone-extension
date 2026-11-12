@@ -10,6 +10,25 @@ export function urlKey(url: string): string {
   }
 }
 
+export function sameHost(urlA: string, urlB: string): boolean {
+  try {
+    const a = new URL(urlA).hostname.replace(/^www\./i, '').toLowerCase();
+    const b = new URL(urlB).hostname.replace(/^www\./i, '').toLowerCase();
+    return Boolean(a && a === b);
+  } catch {
+    return false;
+  }
+}
+
+export function isRootDomainUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return (u.pathname === '/' || u.pathname === '') && !u.search && !u.hash;
+  } catch {
+    return false;
+  }
+}
+
 export function getSpaceFavorites(state: ArcState, spaceId?: string) {
   const space = state.spaces.find((s) => s.id === (spaceId || state.activeSpaceId)) || state.spaces[0];
   return Array.isArray(space?.favorites) ? space.favorites : state.favorites;

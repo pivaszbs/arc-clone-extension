@@ -1,21 +1,51 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:">
-<style>html,body{margin:0;width:100%;height:100%;background:#111;color:white;font:13px system-ui;overflow:hidden}video{width:100%;height:100%;object-fit:contain}#state{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}button{position:absolute;top:6px;right:6px;background:#222a;color:white;border:1px solid #aaa6;border-radius:5px;padding:4px 8px;cursor:pointer}</style>
-<video id="video" autoplay playsinline></video><div id="state">Connecting video…</div><button onclick="send({type:'toggle-play'})">Play / pause</button>
+<style>
+html,body{margin:0;width:100%;height:100%;background:#111;color:white;font:13px system-ui;overflow:hidden}
+video{width:100%;height:100%;object-fit:contain}
+#state{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}
+button{position:absolute;top:6px;right:6px;width:30px;height:28px;background:#222a;color:white;border:1px solid #aaa6;border-radius:5px;cursor:pointer;opacity:0}
+body:hover button,button:focus-visible{opacity:1}
+</style>
+<video id="video" playsinline></video><div id="state" role="status">Connecting video…</div><button id="playback" type="button" aria-label="Pause" disabled>❚❚</button>
 <script>
 const video = document.getElementById('video');
 const state = document.getElementById('state');
+const playback = document.getElementById('playback');
 const send = value => window.webkit.messageHandlers.bridge.postMessage(value);
 const formats = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4;codecs=avc1.42E01E','video/webm;codecs=vp8,opus'];
 let source, buffer, queue = [], received = 0, tryingPlay = false;
+let sourcePaused = false;
+let requestTimer;
+playback.addEventListener('click', () => {
+  playback.disabled = true;
+  requestTimer = setTimeout(() => { playback.disabled = false; }, 2000);
+  send({type:'toggle-play'});
+});
+window.setSourcePaused = (paused, error) => {
+  clearTimeout(requestTimer);
+  sourcePaused = paused;
+  playback.textContent = paused ? '▶' : '❚❚';
+  playback.setAttribute('aria-label', paused ? 'Play' : 'Pause');
+  playback.disabled = false;
+  if (paused) video.pause();
+  else resume();
+  if (error) {
+    state.hidden = false;
+    state.textContent = error;
+    state.style.display = 'grid';
+  } else if (paused || video.readyState >= 2) state.style.display = 'none';
+};
 async function resume() {
-  if (!video.paused || tryingPlay || video.readyState < 2) return;
+  if (sourcePaused || !video.paused || tryingPlay || video.readyState < 2) return;
   tryingPlay = true;
-  try { await video.play(); } catch(error) { send({type:'error',error:'The desktop player could not resume playback.'}); }
+  try { await video.play(); }
+  catch(error) { if (!sourcePaused && error.name !== 'AbortError') send({type:'error',error:'The desktop player could not resume playback.'}); }
   finally { tryingPlay = false; }
 }
 window.start = (mime, muted, volume) => {
+  playback.disabled = false;
   video.muted = muted; video.volume = volume;
   source = new MediaSource();
   video.src = URL.createObjectURL(source);
@@ -23,7 +53,6 @@ window.start = (mime, muted, volume) => {
     try { buffer = source.addSourceBuffer(mime); buffer.addEventListener('updateend', pump); buffer.addEventListener('error', () => send({type:'error',error:'Video decoding failed in the desktop player.'})); pump(); }
     catch(error) { send({type:'error', error: 'The desktop player does not support this video format.'}); }
   }, {once:true});
-  video.play().catch(() => {});
 };
 window.chunk = data => {
   if (queue.length > 80) { send({type:'error',error:'The desktop player could not keep up. Try again.'}); return; }
@@ -36,7 +65,7 @@ function pump() {
   resume();
   if (buffer.buffered.length) {
     const end = buffer.buffered.end(buffer.buffered.length-1);
-    if (end - video.currentTime > 2.5) video.currentTime = Math.max(buffer.buffered.start(buffer.buffered.length-1),end-.6);
+    if (!sourcePaused && end - video.currentTime > 2.5) video.currentTime = Math.max(buffer.buffered.start(buffer.buffered.length-1),end-.6);
     if (video.currentTime > 35 && buffer.buffered.start(0) < video.currentTime-30) { buffer.remove(0,video.currentTime-20); return; }
   }
   if (queue.length) { try { buffer.appendBuffer(queue.shift()); } catch(error) { send({type:'error',error:'Could not append video to the desktop player.'}); } }

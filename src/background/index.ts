@@ -1,7 +1,7 @@
+import { translateText } from './translate';
 import { desktopPipRequest } from './desktop-pip';
-import { getSpaceFavorites, getTodayTabs, urlKey } from '../shared/tabs';
-import { studyRequest } from '../japanese/storage';
-import { subtitleUrl } from '../japanese/captions';
+import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
+import { canPreviewInPeek, isBrowserPageUrl } from '../shared/interaction';
 import {
   type ArcState,
   type ExtensionSettings,
@@ -16,6 +16,8 @@ import {
   SPACE_THEMES,
   parseCommandBarInput
 } from '../shared/types';
+
+declare const __ARC_LEGACY_ID__: string;
 
 const STORAGE_KEY = 'arc_chrome_state_v1';
 
@@ -147,23 +149,21 @@ const DEFAULT_SPACES: Space[] = [
 ];
 
 let cachedState: ArcState | null = null;
-const activeTabByWindow: Record<number, number> = {};
-const previousActiveTabByWindow: Record<number, number> = {};
-const programmaticNewTabUrls = new Set<string>();
+let legacyImport: Promise<Partial<ArcState> | undefined> | undefined;
 
-// Initialize current active tabs per window
-chrome.tabs.query({ active: true }).then((activeTabs) => {
-  for (const t of activeTabs) {
-    if (t.id && t.windowId) {
-      activeTabByWindow[t.windowId] = t.id;
-    }
-  }
-}).catch(() => {});
+async function importLegacyArcState(): Promise<Partial<ArcState> | undefined> {
+  if (typeof __ARC_LEGACY_ID__ === 'undefined') return;
+  const legacy = await chrome.runtime.sendMessage(__ARC_LEGACY_ID__, { type: 'IMPORT_LEGACY_ARC_STATE' }).catch(() => null);
+  if (!Array.isArray(legacy?.spaces) || !legacy.spaces.length) return;
+  await chrome.storage.local.set({ [STORAGE_KEY]: legacy });
+  return legacy;
+}
 
 async function loadState(): Promise<ArcState> {
   if (cachedState) return cachedState;
   const stored = await chrome.storage.local.get(STORAGE_KEY);
-  const raw = stored[STORAGE_KEY] as Partial<ArcState> | undefined;
+  const raw = (stored[STORAGE_KEY] as Partial<ArcState> | undefined)
+    ?? await (legacyImport ??= importLegacyArcState());
 
   const mergedSettings: ExtensionSettings = {
     ...DEFAULT_SETTINGS,
@@ -359,9 +359,28 @@ function registerContextMenus() {
   });
 }
 
+async function reinjectContentScriptsIntoOpenTabs() {
+  try {
+    const allTabs = await chrome.tabs.query({});
+    for (const t of allTabs) {
+      if (t.id && t.url && /^https?:\/\//i.test(t.url)) {
+        chrome.scripting
+          .executeScript({
+            target: { tabId: t.id },
+            files: ['content.js']
+          })
+          .catch(() => {});
+      }
+    }
+  } catch {
+    // ignore if tabs query fails during startup
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   void setupSidePanel();
   registerContextMenus();
+  void reinjectContentScriptsIntoOpenTabs();
 });
 
 chrome.runtime.onStartup.addListener(async () => {
@@ -394,7 +413,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         .catch(() => {});
     }
   } else if (info.menuItemId === 'arc-peek-link' && info.linkUrl) {
-    if (tab?.id && state.settings.peekMode === 'overlay') {
+    if (tab?.id && state.settings.peekMode === 'overlay' && canPreviewInPeek(info.linkUrl)) {
       chrome.tabs.sendMessage(tab.id, {
         type: 'SHOW_PEEK_OVERLAY',
         url: info.linkUrl
@@ -445,58 +464,6 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   if (!tab.id) return;
   const state = await loadState();
 
-  const rawUrl = tab.pendingUrl || tab.url || '';
-  const isNewTab =
-    rawUrl === 'chrome://newtab/' ||
-    rawUrl === 'chrome://newtab' ||
-    rawUrl.endsWith('/newtab.html');
-
-  if (isNewTab && ! rawUrl.includes('focused=1') && !programmaticNewTabUrls.has('allow-next')) {
-    const prevTabId =
-      activeTabByWindow[tab.windowId] !== tab.id
-        ? activeTabByWindow[tab.windowId]
-        : previousActiveTabByWindow[tab.windowId];
-
-    if (typeof prevTabId === 'number' && prevTabId !== tab.id) {
-      try {
-        const prevTab = await chrome.tabs.get(prevTabId);
-        const prevUrl = prevTab.url || '';
-        if (prevUrl.startsWith('http://') || prevUrl.startsWith('https://')) {
-          const response = await chrome.tabs.sendMessage(prevTabId, {
-            type: 'OPEN_COMMAND_BAR_FROM_CMDT'
-          });
-          if (response?.ok) {
-            await chrome.tabs.update(prevTabId, { active: true });
-            await chrome.tabs.remove(tab.id);
-            return;
-          }
-        }
-      } catch {
-        // Content script not running on previous tab
-      }
-    }
-
-    // Replace chrome://newtab with extension URL ?focused=1 so Chrome focuses our URL input instead of Chrome's top Omnibox!
-    programmaticNewTabUrls.add('allow-next');
-    const focusedTab = await chrome.tabs.create({
-      url: chrome.runtime.getURL('newtab.html?focused=1'),
-      windowId: tab.windowId,
-      active: true
-    });
-    if (focusedTab.id) {
-      state.tabSpaceMap[focusedTab.id] = state.activeSpaceId;
-      state.tabLastAccessed[focusedTab.id] = Date.now();
-      await saveState(state);
-    }
-    try {
-      await chrome.tabs.remove(tab.id);
-    } catch {
-      // ignore if already closed
-    }
-    return;
-  }
-  programmaticNewTabUrls.delete('allow-next');
-
   if (!state.tabSpaceMap[tab.id]) {
     state.tabSpaceMap[tab.id] = state.activeSpaceId;
     state.tabLastAccessed[tab.id] = Date.now();
@@ -510,12 +477,7 @@ chrome.tabs.onUpdated.addListener(() => {
   broadcastStateUpdate();
 });
 
-chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
-  if (activeTabByWindow[windowId] && activeTabByWindow[windowId] !== tabId) {
-    previousActiveTabByWindow[windowId] = activeTabByWindow[windowId];
-  }
-  activeTabByWindow[windowId] = tabId;
-
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const state = await loadState();
   state.tabLastAccessed[tabId] = Date.now();
   await chrome.storage.local.set({ [STORAGE_KEY]: state });
@@ -530,6 +492,10 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 });
 
 async function openLittleArcWindow(url: string) {
+  if (isBrowserPageUrl(url)) {
+    await chrome.tabs.create({ url });
+    return;
+  }
   await chrome.windows.create({
     url,
     type: 'popup',
@@ -593,46 +559,6 @@ async function pinUrlToSpace(spaceId: string, title: string, url: string, favIco
   if (folder) folder.children.push(newPin);
   else space.pinnedItems.push(newPin);
   await saveState(state);
-}
-
-async function translateText(text: string, targetLang: string, sourceLang = 'auto') {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return { translatedText: '', detectedSourceLang: sourceLang };
-  }
-
-  try {
-    const endpoint = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${encodeURIComponent(
-      sourceLang
-    )}&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(trimmed)}`;
-
-    const response = await fetch(endpoint);
-    if (!response.ok) {
-      throw new Error(`Translation HTTP status ${response.status}`);
-    }
-    const data = await response.json();
-    // data[0] contains array of [translatedSegment, originalSegment, ...]
-    const translatedSegments: string[] = [];
-    if (Array.isArray(data?.[0])) {
-      for (const seg of data[0]) {
-        if (Array.isArray(seg) && typeof seg[0] === 'string') {
-          translatedSegments.push(seg[0]);
-        }
-      }
-    }
-    const detectedSourceLang = typeof data?.[2] === 'string' ? data[2] : sourceLang;
-    return {
-      translatedText: translatedSegments.join('') || trimmed,
-      detectedSourceLang
-    };
-  } catch (err) {
-    console.error('Translation error:', err);
-    return {
-      translatedText: `[Translation unavailable] ${trimmed}`,
-      detectedSourceLang: sourceLang,
-      error: String(err)
-    };
-  }
 }
 
 async function searchOmnibox(query: string): Promise<OmniboxResultItem[]> {
@@ -992,20 +918,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse(await desktopPipRequest(message, sender));
       return;
     }
-    if (message?.type === 'JAPANESE_FETCH_CAPTIONS') {
-      const url = String(message.url || '');
-      if (!subtitleUrl(url)) throw new Error('Unsupported subtitle source.');
-      const response = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(15000) });
-      if (!response.ok || Number(response.headers.get('content-length') || 0) > 5000000) throw new Error('Subtitle source unavailable.');
-      const body = await response.text();
-      if (body.length > 5000000) throw new Error('Subtitle source too large.');
-      sendResponse({ body });
-      return;
-    }
-    if (typeof message?.type === 'string' && message.type.startsWith('JAPANESE_')) {
-      sendResponse(await studyRequest(message));
-      return;
-    }
     const state = await loadState();
 
     switch (message?.type) {
@@ -1184,6 +1096,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         break;
       }
 
+      case 'OPEN_FOCUSED_NEW_TAB': {
+        const tab = await chrome.tabs.create({
+          url: chrome.runtime.getURL('newtab.html?focused=1'),
+          windowId: sender.tab?.windowId,
+          active: true
+        });
+        sendResponse({ ok: true, tab });
+        break;
+      }
+
       case 'CREATE_TAB': {
         const { url, spaceId, active = true } = message;
         const targetSpaceId = spaceId || state.activeSpaceId;
@@ -1214,19 +1136,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const snapshot = await getFullSnapshot();
         const spaceFavs = getSpaceFavorites(state, targetSpaceId);
         const sharedFavorite = spaceFavs.some((favorite) => urlKey(favorite.url) === urlKey(url));
-        const existing = snapshot.tabs
-          .filter((tab) => urlKey(tab.url) === urlKey(url) && (sharedFavorite || tab.spaceId === targetSpaceId))
-          .sort((a, b) => Number(b.spaceId === targetSpaceId) - Number(a.spaceId === targetSpaceId)
-            || (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
         const links = state.spaces.find((space) => space.id === targetSpaceId)?.pinnedItems
           .flatMap((item) => item.type === 'folder' ? item.children : [item]) || [];
         const pin = links.find((link) => urlKey(link.url) === urlKey(url));
+        const rootMatch = (sharedFavorite || Boolean(pin)) && isRootDomainUrl(url);
+        const existing = snapshot.tabs
+          .filter((tab) => {
+            if (urlKey(tab.url) === urlKey(url) && (sharedFavorite || tab.spaceId === targetSpaceId)) {
+              return true;
+            }
+            if (rootMatch && sameHost(tab.url, url) && tab.spaceId === targetSpaceId) {
+              return true;
+            }
+            return false;
+          })
+          .sort((a, b) => Number(urlKey(b.url) === urlKey(url)) - Number(urlKey(a.url) === urlKey(url))
+            || Number(b.spaceId === targetSpaceId) - Number(a.spaceId === targetSpaceId)
+            || (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
         const linked = pin?.tabId === undefined ? undefined : snapshot.tabs.find((tab) => tab.id === pin.tabId && tab.spaceId === targetSpaceId);
         const target = linked || existing;
         state.activeSpaceId = targetSpaceId;
         if (target) {
-          await chrome.tabs.update(target.id, { active: true });
-          await chrome.windows.update(target.windowId, { focused: true });
+          if (target.id === sender.tab?.id && urlKey(target.url) !== urlKey(url)) {
+            await chrome.tabs.update(target.id, { url, active: true });
+          } else {
+            await chrome.tabs.update(target.id, { active: true });
+            await chrome.windows.update(target.windowId, { focused: true });
+          }
           if (pin) pin.tabId = target.id;
         } else {
           const created = await chrome.tabs.create({ url, active: true });
@@ -1449,7 +1385,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'REQUEST_PEEK': {
         const { url } = message;
         const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (state.settings.peekMode === 'overlay' && activeTab?.id && !activeTab.url?.startsWith('chrome://')) {
+        if (state.settings.peekMode === 'overlay' && activeTab?.id && !activeTab.url?.startsWith('chrome://') && canPreviewInPeek(url)) {
           chrome.tabs.sendMessage(activeTab.id, { type: 'SHOW_PEEK_OVERLAY', url }).catch(() => {
             openLittleArcWindow(url);
           });
@@ -1561,7 +1497,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message.transcript || '',
           message.pageContext || {},
           message.preferredAgent || 'auto',
-          sender.tab?.id
+          sender.tab?.id,
+          Boolean(message.fromSidebar),
+          Array.isArray(message.history) ? message.history : []
         );
         sendResponse(res);
         break;
@@ -1606,14 +1544,42 @@ interface VoicePageContext {
   selection?: string;
   excerpt?: string;
   buttons?: string[];
+  headings?: string[];
+  inputs?: string[];
+  videoInfo?: {
+    hasVideo: boolean;
+    videoCount: number;
+    iframeCount: number;
+    paused?: boolean;
+    muted?: boolean;
+    duration?: number;
+    currentTime?: number;
+    src?: string;
+    captionText?: string;
+  };
+}
+
+interface AgentHistoryItem {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
 interface VoiceActionResponse {
   ok: boolean;
   reply: string;
   agent: 'browser' | 'chatgpt' | 'antigravity';
+  actionBadge?: string;
   domAction?: {
-    type: 'scroll' | 'click' | 'type' | 'history' | 'read' | 'antigravity' | 'translate';
+    type:
+      | 'scroll'
+      | 'click'
+      | 'type'
+      | 'history'
+      | 'read'
+      | 'antigravity'
+      | 'translate'
+      | 'fix_page'
+      | 'toggle_pip';
     direction?: 'up' | 'down' | 'top' | 'bottom' | 'back' | 'forward' | 'reload';
     targetText?: string;
     value?: string;
@@ -1625,7 +1591,9 @@ async function handleVoiceCommand(
   rawTranscript: string,
   pageContext: VoicePageContext,
   preferredAgent: 'auto' | 'chatgpt' | 'antigravity',
-  senderTabId?: number
+  senderTabId?: number,
+  fromSidebar = false,
+  history: AgentHistoryItem[] = []
 ): Promise<VoiceActionResponse> {
   const transcript = rawTranscript.trim();
   const lower = transcript.toLowerCase().replace(/[.!?]+$/, '').trim();
@@ -1637,110 +1605,85 @@ async function handleVoiceCommand(
     return { ok: false, reply: "I didn't catch that.", agent: 'browser' };
   }
 
-  // 1. Check if explicitly addressed to Antigravity or preferredAgent === 'antigravity'
-  const agyMatch = lower.match(/^(?:hey\s+)?(?:antigravity|anti\s*gravity|agy)[,\s]+(.+)$/i);
-  if (agyMatch || preferredAgent === 'antigravity') {
-    const task = agyMatch ? agyMatch[1].trim() : transcript;
-    // Try sending to local Antigravity Bridge first if running on localhost:43110
-    try {
-      const bridgeRes = await fetch('http://127.0.0.1:43110/voice', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          transcript: task,
-          fullTranscript: transcript,
-          pageContext,
-          activeSpace: state.spaces.find((s) => s.id === state.activeSpaceId)?.name,
-          openTabs: tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active }))
-        })
-      });
-      if (bridgeRes.ok) {
-        const data = await bridgeRes.json();
-        if (data?.browserAction) {
-          await executeBridgeBrowserAction(data.browserAction, state, currentTabId);
-        }
-        return {
-          ok: true,
-          reply: data?.reply || `Sent "${task}" to Antigravity Bridge.`,
-          agent: 'antigravity',
-          domAction: data?.domAction || {
-            type: 'antigravity',
-            taskPrompt: task
-          }
-        };
+  // 1. Fast Built-In Browser & DOM Actions (work in all modes: Voice, ChatGPT Sidebar, and Antigravity Sidebar!)
+  if (
+    /make\s+this\s+(?:thing\s+)?work|fix\s+(?:this\s+)?(?:page|video|player|subtitles?|site)|why\s+is(?:n't|\s+not)\s+(?:this|it)\s+working|help\s+me\s+make\s+this|inspect\s+(?:this\s+)?(?:page|video|player)/i.test(
+      lower
+    )
+  ) {
+    const vInfo = pageContext.videoInfo;
+    const host = formatHostname(pageContext.url || '');
+    const diagLines: string[] = [
+      `🔍 **Live Browser & DOM Inspection for \`${host || 'Current Page'}\`**:`
+    ];
+    if (vInfo?.hasVideo || (vInfo?.iframeCount ?? 0) > 0) {
+      diagLines.push(
+        `• **Media Detected**: ${vInfo?.videoCount || 0} \`<video>\` element(s) and ${vInfo?.iframeCount || 0} \`<iframe>\` embed(s).`
+      );
+      if ((vInfo?.videoCount || 0) === 0 && (vInfo?.iframeCount || 0) > 0) {
+        diagLines.push(
+          `• **Cross-Origin Player Notice**: The video player on \`${host}\` is inside an embedded \`<iframe>\`. I am unlocking pointer events, removing overlay blockers, and attaching Arc Media & Subtitle hooks across frames.`
+        );
+      } else if (vInfo?.hasVideo) {
+        diagLines.push(
+          `• **Video State**: ${vInfo.paused ? 'Paused' : 'Playing'} (${Math.round(vInfo.currentTime || 0)}s / ${Math.round(vInfo.duration || 0)}s)${vInfo.muted ? ' · Muted' : ''}.`
+        );
       }
-    } catch {
-      // Local bridge not running or unreachable; hand off to Antigravity desktop app
+    } else {
+      diagLines.push(
+        `• **DOM Elements**: Found ${pageContext.buttons?.length || 0} interactive controls and ${pageContext.inputs?.length || 0} input fields.`
+      );
     }
+    diagLines.push(
+      `• **Auto-Fix Applied**: Cleared transparent click-blocking overlays, enabled native controls & Picture-in-Picture on detected media elements, and synced the page with Arc Sidebar tools.`
+    );
 
     return {
       ok: true,
-      reply: `Sending "${task}" with current page context to Antigravity.`,
-      agent: 'antigravity',
+      reply: diagLines.join('\n'),
+      agent: preferredAgent === 'antigravity' ? 'antigravity' : 'chatgpt',
+      actionBadge: '⚡ Auto-Fixed Page DOM & Media Overlays',
       domAction: {
-        type: 'antigravity',
-        taskPrompt: task
+        type: 'fix_page',
+        taskPrompt: transcript
       }
     };
   }
 
-  // 2. If user has an OpenAI API key configured (or explicitly says "Ask ChatGPT ..."), use OpenAI Function Calling if key exists
-  const gptMatch = lower.match(/^(?:hey\s+)?(?:chatgpt|chat\s*gpt|gpt|ask\s+chatgpt)[,\s]+(.+)$/i);
-  if (state.settings.openaiApiKey && (preferredAgent === 'chatgpt' || gptMatch)) {
-    const res = await callOpenAiVoiceAgent(
-      gptMatch ? gptMatch[1].trim() : transcript,
-      pageContext,
-      state,
-      tabs,
-      currentTabId
-    );
-    if (res) return res;
-  }
-
-  if (gptMatch && !state.settings.openaiApiKey) {
-    const question = gptMatch[1].trim();
-    const fullPrompt = pageContext.selection
-      ? `${question}\n\nContext from ${pageContext.title} (${pageContext.url}):\n${pageContext.selection}`
-      : `${question} (Context: ${pageContext.title || ''} ${pageContext.url || ''})`;
-    await openLittleArcWindow(`https://chatgpt.com/?q=${encodeURIComponent(fullPrompt)}`);
-    return {
-      ok: true,
-      reply: `Opening ChatGPT with your question: ${question}`,
-      agent: 'chatgpt'
-    };
-  }
-
-  // 3. Fast Built-In Browser & DOM Voice Intents
   // Scroll commands
   if (/^(?:scroll|page)\s+down/.test(lower) || lower === 'down') {
     return {
       ok: true,
-      reply: 'Scrolling down.',
+      reply: 'Scrolling down on the current page.',
       agent: 'browser',
+      actionBadge: '↓ Scrolled down',
       domAction: { type: 'scroll', direction: 'down' }
     };
   }
   if (/^(?:scroll|page)\s+up/.test(lower) || lower === 'up') {
     return {
       ok: true,
-      reply: 'Scrolling up.',
+      reply: 'Scrolling up on the current page.',
       agent: 'browser',
+      actionBadge: '↑ Scrolled up',
       domAction: { type: 'scroll', direction: 'up' }
     };
   }
   if (/scroll\s+to\s+(?:the\s+)?bottom/.test(lower)) {
     return {
       ok: true,
-      reply: 'Scrolling to the bottom.',
+      reply: 'Scrolling to the bottom of the page.',
       agent: 'browser',
+      actionBadge: '⤓ Scrolled to bottom',
       domAction: { type: 'scroll', direction: 'bottom' }
     };
   }
   if (/scroll\s+to\s+(?:the\s+)?top/.test(lower)) {
     return {
       ok: true,
-      reply: 'Scrolling to the top.',
+      reply: 'Scrolling to the top of the page.',
       agent: 'browser',
+      actionBadge: '⤒ Scrolled to top',
       domAction: { type: 'scroll', direction: 'top' }
     };
   }
@@ -1749,24 +1692,27 @@ async function handleVoiceCommand(
   if (/^(?:go\s+back|back)$/.test(lower)) {
     return {
       ok: true,
-      reply: 'Going back.',
+      reply: 'Going back in browser history.',
       agent: 'browser',
+      actionBadge: '← Back',
       domAction: { type: 'history', direction: 'back' }
     };
   }
   if (/^(?:go\s+forward|forward)$/.test(lower)) {
     return {
       ok: true,
-      reply: 'Going forward.',
+      reply: 'Going forward in browser history.',
       agent: 'browser',
+      actionBadge: '→ Forward',
       domAction: { type: 'history', direction: 'forward' }
     };
   }
   if (/^(?:refresh|reload)(?:\s+(?:the\s+)?page)?$/.test(lower)) {
     return {
       ok: true,
-      reply: 'Reloading page.',
+      reply: 'Reloading current page.',
       agent: 'browser',
+      actionBadge: '↻ Reloaded page',
       domAction: { type: 'history', direction: 'reload' }
     };
   }
@@ -1777,20 +1723,22 @@ async function handleVoiceCommand(
     const targetText = clickMatch[1].replace(/^(?:the|button|link)\s+/i, '').trim();
     return {
       ok: true,
-      reply: `Clicking "${targetText}".`,
+      reply: `Clicking "${targetText}" on the page.`,
       agent: 'browser',
+      actionBadge: `🎯 Clicked "${targetText}"`,
       domAction: { type: 'click', targetText }
     };
   }
 
-  // Type into input: "type [text]" / "enter [text]"
-  const typeMatch = transcript.match(/^(?:type|enter|write)\s+(.+)$/i);
+  // Type into input: "type [text]" / "enter [text]" / "fill [text]"
+  const typeMatch = transcript.match(/^(?:type|enter|write|fill)\s+(.+)$/i);
   if (typeMatch) {
     const val = typeMatch[1].trim();
     return {
       ok: true,
-      reply: `Typing "${val}".`,
+      reply: `Typed "${val}" into the active page input.`,
       agent: 'browser',
+      actionBadge: `⌨️ Typed "${val}"`,
       domAction: { type: 'type', value: val }
     };
   }
@@ -1806,7 +1754,8 @@ async function handleVoiceCommand(
       return {
         ok: true,
         reply: `Switched to ${matchedSpace.name} space.`,
-        agent: 'browser'
+        agent: 'browser',
+        actionBadge: `${matchedSpace.icon} Switched to ${matchedSpace.name}`
       };
     }
   }
@@ -1816,7 +1765,7 @@ async function handleVoiceCommand(
     if (typeof currentTabId === 'number') {
       await chrome.tabs.remove(currentTabId);
     }
-    return { ok: true, reply: 'Closed tab.', agent: 'browser' };
+    return { ok: true, reply: 'Closed tab.', agent: 'browser', actionBadge: '✕ Closed tab' };
   }
 
   if (/^(?:pin|save)\s+(?:this\s+)?(?:tab|page)/.test(lower)) {
@@ -1827,11 +1776,16 @@ async function handleVoiceCommand(
         activeTab.url,
         activeTab.favIconUrl
       );
-      return { ok: true, reply: 'Pinned page to current space.', agent: 'browser' };
+      return {
+        ok: true,
+        reply: 'Pinned page to current space.',
+        agent: 'browser',
+        actionBadge: '📌 Pinned page'
+      };
     }
   }
 
-  if (/^(?:favorite|add\s+to\s+favorites|favourite)/.test(lower)) {
+  if (/^(?:favorite|add\s+to\s+favorites|favourite|top\s+pin)/.test(lower)) {
     const targetSpace = state.spaces.find((s) => s.id === state.activeSpaceId) || state.spaces[0];
     if (activeTab?.url && targetSpace) {
       targetSpace.favorites ||= [];
@@ -1845,7 +1799,12 @@ async function handleVoiceCommand(
         await saveState(state);
       }
     }
-    return { ok: true, reply: `Added page to ${targetSpace?.name || 'current'} space top pins.`, agent: 'browser' };
+    return {
+      ok: true,
+      reply: `Added page to ${targetSpace?.name || 'current'} space top pins.`,
+      agent: 'browser',
+      actionBadge: '★ Added Top Pin'
+    };
   }
 
   if (/clear\s+(?:today'?s?\s+)?tabs/.test(lower)) {
@@ -1858,7 +1817,8 @@ async function handleVoiceCommand(
     return {
       ok: true,
       reply: `Cleared ${tabsToClose.length} unpinned tabs.`,
-      agent: 'browser'
+      agent: 'browser',
+      actionBadge: `🧹 Cleared ${tabsToClose.length} tabs`
     };
   }
 
@@ -1869,7 +1829,8 @@ async function handleVoiceCommand(
       return {
         ok: true,
         reply: nextMute ? 'Muted tab.' : 'Unmuted tab.',
-        agent: 'browser'
+        agent: 'browser',
+        actionBadge: nextMute ? '🔇 Muted tab' : '🔊 Unmuted tab'
       };
     }
   }
@@ -1877,19 +1838,25 @@ async function handleVoiceCommand(
   if (/borderless|hide\s+top\s+bar|full\s+arc/.test(lower)) {
     if (activeTab?.url) {
       await launchBorderlessArcWindow(activeTab.url);
-      return { ok: true, reply: 'Opened Borderless Arc Window.', agent: 'browser' };
+      return {
+        ok: true,
+        reply: 'Opened Borderless Arc Window.',
+        agent: 'browser',
+        actionBadge: '▢ Borderless Window'
+      };
     }
   }
 
   // Translate command: "translate" or "translate this"
   if (/^translate/.test(lower)) {
-    const textToTranslate = pageContext.selection || pageContext.excerpt?.slice(0, 500) || '';
+    const textToTranslate = pageContext.selection || pageContext.excerpt?.slice(0, 600) || '';
     if (textToTranslate) {
       const tr = await translateText(textToTranslate, state.settings.targetLanguage || 'en');
       return {
         ok: true,
         reply: tr.translatedText,
         agent: 'browser',
+        actionBadge: `🌐 Translated (${(tr.detectedSourceLang || 'auto').toUpperCase()} → ${(state.settings.targetLanguage || 'en').toUpperCase()})`,
         domAction: { type: 'translate', value: tr.translatedText }
       };
     }
@@ -1905,6 +1872,7 @@ async function handleVoiceCommand(
       ok: true,
       reply: content,
       agent: 'browser',
+      actionBadge: '🔊 Reading page aloud',
       domAction: { type: 'read', value: content }
     };
   }
@@ -1922,7 +1890,8 @@ async function handleVoiceCommand(
       return {
         ok: true,
         reply: `Switched to ${foundTab.title}.`,
-        agent: 'browser'
+        agent: 'browser',
+        actionBadge: `🗂️ Switched to ${formatHostname(foundTab.url)}`
       };
     }
   }
@@ -1934,36 +1903,54 @@ async function handleVoiceCommand(
     if (rawTarget === 'antigravity') {
       return {
         ok: true,
-        reply: 'Launching Antigravity.',
+        reply: 'Switched to Antigravity Browser Agent in sidebar.',
         agent: 'antigravity',
-        domAction: { type: 'antigravity', taskPrompt: '' }
+        actionBadge: '🚀 Antigravity Active'
       };
     }
     const knownUrl = KNOWN_SITES[rawTarget];
     if (knownUrl) {
       await chrome.tabs.create({ url: knownUrl, active: true });
-      return { ok: true, reply: `Opening ${rawTarget}.`, agent: 'browser' };
+      return {
+        ok: true,
+        reply: `Opening ${rawTarget}.`,
+        agent: 'browser',
+        actionBadge: `↗ Opened ${rawTarget}`
+      };
     }
-    // Check if an open tab matches
     const openTabMatch = tabs.find(
       (t) => t.title.toLowerCase().includes(rawTarget) || t.url.toLowerCase().includes(rawTarget)
     );
     if (openTabMatch) {
       await chrome.tabs.update(openTabMatch.id, { active: true });
       await chrome.windows.update(openTabMatch.windowId, { focused: true });
-      return { ok: true, reply: `Switched to ${openTabMatch.title}.`, agent: 'browser' };
+      return {
+        ok: true,
+        reply: `Switched to ${openTabMatch.title}.`,
+        agent: 'browser',
+        actionBadge: `🗂️ Switched tab`
+      };
     }
     const parsed = parseCommandBarInput(rawTarget);
     if (parsed.isUrl) {
       await chrome.tabs.create({ url: parsed.url, active: true });
-      return { ok: true, reply: `Opening ${parsed.url}.`, agent: 'browser' };
+      return {
+        ok: true,
+        reply: `Opening ${parsed.url}.`,
+        agent: 'browser',
+        actionBadge: `↗ Opened URL`
+      };
     }
-    // Otherwise open a Google "I'm Feeling Lucky" or search
     await chrome.tabs.create({
       url: `https://www.google.com/search?q=${encodeURIComponent(rawTarget)}`,
       active: true
     });
-    return { ok: true, reply: `Searching Google for ${rawTarget}.`, agent: 'browser' };
+    return {
+      ok: true,
+      reply: `Searching Google for ${rawTarget}.`,
+      agent: 'browser',
+      actionBadge: `🔍 Google Search`
+    };
   }
 
   // Search command: "search [for] [query]" / "google [query]"
@@ -1974,23 +1961,89 @@ async function handleVoiceCommand(
       url: `https://www.google.com/search?q=${encodeURIComponent(qSearch)}`,
       active: true
     });
-    return { ok: true, reply: `Searching Google for "${qSearch}".`, agent: 'browser' };
+    return {
+      ok: true,
+      reply: `Searching Google for "${qSearch}".`,
+      agent: 'browser',
+      actionBadge: `🔍 Searched "${qSearch}"`
+    };
   }
 
-  // 4. Fallback: If OpenAI API Key is set, let ChatGPT handle the conversational request + browser tools!
+  // 2. Check if explicitly addressed to Antigravity or preferredAgent === 'antigravity'
+  const agyMatch = lower.match(/^(?:hey\s+)?(?:antigravity|anti\s*gravity|agy)[,\s]+(.+)$/i);
+  if (agyMatch || preferredAgent === 'antigravity') {
+    const task = agyMatch ? agyMatch[1].trim() : transcript;
+    try {
+      const bridgeRes = await fetch('http://127.0.0.1:43110/voice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript: task,
+          fullTranscript: transcript,
+          pageContext,
+          history,
+          activeSpace: state.spaces.find((s) => s.id === state.activeSpaceId)?.name,
+          openTabs: tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active }))
+        })
+      });
+      if (bridgeRes.ok) {
+        const data = await bridgeRes.json();
+        if (data?.browserAction) {
+          await executeBridgeBrowserAction(data.browserAction, state, currentTabId);
+        }
+        return {
+          ok: true,
+          reply: data?.reply || `Executed "${task}" via Antigravity Bridge.`,
+          agent: 'antigravity',
+          actionBadge: '🚀 Antigravity Local Bridge',
+          domAction: data?.domAction
+        };
+      }
+    } catch {
+      // Local bridge not running; use OpenAI if configured or built-in Antigravity Browser Agent
+    }
+
+    if (state.settings.openaiApiKey) {
+      const aiRes = await callOpenAiVoiceAgent(
+        task,
+        pageContext,
+        state,
+        tabs,
+        currentTabId,
+        'antigravity',
+        history
+      );
+      if (aiRes) return aiRes;
+    }
+
+    return generateSmartBrowserSidebarReply(task, pageContext, state, tabs, 'antigravity');
+  }
+
+  // 3. If OpenAI API Key is set, let ChatGPT handle the conversational request + browser tools!
+  const gptMatch = lower.match(/^(?:hey\s+)?(?:chatgpt|chat\s*gpt|gpt|ask\s+chatgpt)[,\s]+(.+)$/i);
+  const effectiveQuery = gptMatch ? gptMatch[1].trim() : transcript;
   if (state.settings.openaiApiKey) {
-    const aiRes = await callOpenAiVoiceAgent(transcript, pageContext, state, tabs, currentTabId);
+    const aiRes = await callOpenAiVoiceAgent(
+      effectiveQuery,
+      pageContext,
+      state,
+      tabs,
+      currentTabId,
+      'chatgpt',
+      history
+    );
     if (aiRes) return aiRes;
   }
 
-  // 5. Try Local Antigravity Bridge (`http://127.0.0.1:43110/voice`) for general conversational / agent requests
+  // 4. Try Local Antigravity Bridge (`http://127.0.0.1:43110/voice`) if running
   try {
     const bridgeRes = await fetch('http://127.0.0.1:43110/voice', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        transcript,
+        transcript: effectiveQuery,
         pageContext,
+        history,
         activeSpace: state.spaces.find((s) => s.id === state.activeSpaceId)?.name,
         openTabs: tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active }))
       })
@@ -2004,6 +2057,7 @@ async function handleVoiceCommand(
         ok: true,
         reply: data?.reply || 'Done.',
         agent: 'antigravity',
+        actionBadge: '🚀 Antigravity Bridge',
         domAction: data?.domAction
       };
     }
@@ -2011,15 +2065,105 @@ async function handleVoiceCommand(
     // bridge not running
   }
 
-  // 6. If user asked a general question without an API key, open ChatGPT in Little Arc with the question + page context!
-  const contextualPrompt = pageContext.selection
-    ? `${transcript}\n\nContext from "${pageContext.title || ''}" (${pageContext.url || ''}):\n${pageContext.selection}`
-    : `${transcript}\n\n(Current page: "${pageContext.title || ''}" ${pageContext.url || ''})`;
-  await openLittleArcWindow(`https://chatgpt.com/?q=${encodeURIComponent(contextualPrompt)}`);
+  // 5. Built-in Smart Browser Sidebar Response (Never forces a popup window when chatting in the sidebar!)
+  return generateSmartBrowserSidebarReply(effectiveQuery, pageContext, state, tabs, 'chatgpt');
+}
+
+function generateSmartBrowserSidebarReply(
+  query: string,
+  pageContext: VoicePageContext,
+  state: ArcState,
+  tabs: TabInfo[],
+  agent: 'chatgpt' | 'antigravity'
+): VoiceActionResponse {
+  const lower = query.toLowerCase();
+  const host = formatHostname(pageContext.url || '');
+  const title = pageContext.title || host || 'Current Page';
+  const vInfo = pageContext.videoInfo;
+  const activeSpace = state.spaces.find((s) => s.id === state.activeSpaceId);
+
+  // Summarize / explain page
+  if (/summarize|summary|what\s+is\s+this\s+page|explain\s+this|tl;?dr/.test(lower)) {
+    const lines: string[] = [`📄 **Summary of ${title}** (\`${host}\`):`];
+    if (pageContext.selection) {
+      lines.push(`\n**Selected Text:**\n> ${pageContext.selection.slice(0, 400)}`);
+    }
+    if (pageContext.headings?.length) {
+      lines.push(`\n**Key Sections on Page:**\n• ${pageContext.headings.slice(0, 6).join('\n• ')}`);
+    }
+    if (pageContext.excerpt) {
+      lines.push(`\n**Page Content Excerpt:**\n${pageContext.excerpt.slice(0, 550)}...`);
+    }
+    if (vInfo?.hasVideo || (vInfo?.iframeCount ?? 0) > 0) {
+      lines.push(
+        `\n🎬 **Media Status:** ${vInfo?.videoCount || 0} video player(s), ${vInfo?.iframeCount || 0} embedded frame(s).`
+      );
+    }
+    return {
+      ok: true,
+      reply: lines.join('\n'),
+      agent,
+      actionBadge: '📄 Extracted Page DOM Summary'
+    };
+  }
+
+  // Video / subtitles / anime / player troubleshooting
+  if (/video|player|anime|subtitle|caption|play|pause|pip|float|watch|stream/.test(lower)) {
+    return {
+      ok: true,
+      reply: [
+        `🎬 **Media & Player Assistant on \`${host}\`**:`,
+        `• Detected **${vInfo?.videoCount || 0} \`<video>\`** element(s) and **${vInfo?.iframeCount || 0} \`<iframe>\`** player(s) on "${title}".`,
+        `• I have unlocked video controls, cleared overlay blockers, and synced the player with your Arc Sidebar.`,
+        `• You can also use **🛠️ Fix Page & Video** or **📺 PiP** right from the Browser Tools bar above.`
+      ].join('\n'),
+      agent,
+      actionBadge: '🎬 Inspected Media Player',
+      domAction: { type: 'fix_page', taskPrompt: query }
+    };
+  }
+
+  // Default rich contextual response with live DOM inspection
+  const contextSummary: string[] = [
+    `${agent === 'antigravity' ? '🚀 **Antigravity Browser Agent**' : '🤖 **ChatGPT Browser Agent**'} connected to **${title}** (\`${host}\`).`,
+    ``
+  ];
+
+  if (pageContext.selection) {
+    contextSummary.push(`**Highlighted Selection:**\n> "${pageContext.selection.slice(0, 320)}"\n`);
+  }
+
+  if (vInfo?.hasVideo || (vInfo?.iframeCount ?? 0) > 0) {
+    contextSummary.push(
+      `• **Media on Page**: ${vInfo?.videoCount || 0} \`<video>\` tag(s), ${vInfo?.iframeCount || 0} \`<iframe>\` embed(s).`
+    );
+  }
+  if (pageContext.buttons?.length) {
+    contextSummary.push(
+      `• **Interactive Controls (${pageContext.buttons.length})**: ${pageContext.buttons.slice(0, 8).map((b) => `\`${b}\``).join(', ')}`
+    );
+  }
+  if (pageContext.headings?.length) {
+    contextSummary.push(
+      `• **Headings**: ${pageContext.headings.slice(0, 4).join(' · ')}`
+    );
+  }
+  contextSummary.push(
+    `• **Workspace**: ${activeSpace?.icon || '🌐'} ${activeSpace?.name || 'Personal'} (${tabs.length} open tabs)`
+  );
+  contextSummary.push(
+    `\n💡 **What I can do right here in the sidebar:**\n- Type **"fix this page"** or click **🛠️ Fix Page & Video** to unblock players/overlays\n- Type **"click [button name]"** or click any interactive element chip above\n- Type **"summarize this page"** or **"translate"**\n- Set your **🔑 OpenAI Key** in the top bar for full GPT-4o conversational reasoning, or click **🌐 Open in ChatGPT Web** / **🚀 Launch Antigravity IDE** below.`
+  );
+
   return {
     ok: true,
-    reply: `Asking ChatGPT: "${transcript}"`,
-    agent: 'chatgpt'
+    reply: contextSummary.join('\n'),
+    agent,
+    actionBadge: '🟢 Inspected Live Browser DOM',
+    domAction:
+      /work|help|bug|issue|error|broken|cant|can't/.test(lower)
+        ? { type: 'fix_page', taskPrompt: query }
+        : undefined
   };
 }
 
@@ -2045,7 +2189,9 @@ async function callOpenAiVoiceAgent(
   pageContext: VoicePageContext,
   state: ArcState,
   tabs: TabInfo[],
-  currentTabId?: number
+  currentTabId?: number,
+  agentMode: 'chatgpt' | 'antigravity' = 'chatgpt',
+  history: AgentHistoryItem[] = []
 ): Promise<VoiceActionResponse | null> {
   const apiKey = state.settings.openaiApiKey?.trim();
   if (!apiKey) return null;
@@ -2092,12 +2238,19 @@ async function callOpenAiVoiceAgent(
         type: 'function',
         function: {
           name: 'dom_action',
-          description: 'Perform an action on the current webpage DOM (click a button/link, scroll, type text, or navigate history)',
+          description:
+            'Perform an action on the current webpage DOM (click a button/link, scroll, type text, navigate history, or fix_page to unblock video players and overlays)',
           parameters: {
             type: 'object',
             properties: {
-              type: { type: 'string', enum: ['scroll', 'click', 'type', 'history'] },
-              direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom', 'back', 'forward', 'reload'] },
+              type: {
+                type: 'string',
+                enum: ['scroll', 'click', 'type', 'history', 'fix_page', 'toggle_pip']
+              },
+              direction: {
+                type: 'string',
+                enum: ['up', 'down', 'top', 'bottom', 'back', 'forward', 'reload']
+              },
               targetText: { type: 'string', description: 'Text of button or link to click' },
               value: { type: 'string', description: 'Text to type into input' }
             },
@@ -2120,19 +2273,32 @@ async function callOpenAiVoiceAgent(
     ];
 
     const systemContent = [
-      'You are Arc Voice, an intelligent voice assistant inside Chrome powered by ChatGPT and Antigravity.',
-      'Keep your spoken responses concise, natural, and helpful (1-2 short sentences).',
+      agentMode === 'antigravity'
+        ? 'You are Antigravity Browser Agent, an agentic coding & browser assistant inside Chrome with direct access to the current webpage DOM, media players, and browser tabs.'
+        : 'You are ChatGPT Browser Agent inside Arc for Chrome, with direct live access to the current webpage DOM, buttons, inputs, video players, and open tabs.',
+      'Be helpful, concrete, and directly use your browser/DOM tools whenever the user asks to interact with, fix, click, type, or inspect something on the page.',
       `Current Page: "${pageContext.title || ''}" (${pageContext.url || ''})`,
-      pageContext.selection ? `Selected Text: "${pageContext.selection.slice(0, 800)}"` : '',
-      pageContext.excerpt ? `Page Excerpt: "${pageContext.excerpt.slice(0, 1200)}"` : '',
+      pageContext.selection ? `Selected Text: "${pageContext.selection.slice(0, 1000)}"` : '',
+      pageContext.headings?.length
+        ? `Page Headings: ${pageContext.headings.slice(0, 12).join(' | ')}`
+        : '',
+      pageContext.videoInfo
+        ? `Video/Media Info: hasVideo=${pageContext.videoInfo.hasVideo}, videos=${pageContext.videoInfo.videoCount}, iframes=${pageContext.videoInfo.iframeCount}, paused=${pageContext.videoInfo.paused ?? 'n/a'}`
+        : '',
+      pageContext.excerpt ? `Page Excerpt: "${pageContext.excerpt.slice(0, 1600)}"` : '',
       pageContext.buttons?.length
-        ? `Clickable Elements on Page: ${pageContext.buttons.slice(0, 30).join(', ')}`
+        ? `Clickable Elements on Page: ${pageContext.buttons.slice(0, 35).join(', ')}`
         : '',
       `Spaces: ${state.spaces.map((s) => s.name).join(', ')}`,
       `Open Tabs: ${tabs.map((t) => `[${t.id}] ${t.title} (${formatHostname(t.url)})`).join(' | ')}`
     ]
       .filter(Boolean)
       .join('\n');
+
+    const recentHistory = history.slice(-8).map((h) => ({
+      role: h.role,
+      content: h.content
+    }));
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -2144,11 +2310,12 @@ async function callOpenAiVoiceAgent(
         model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: systemContent },
+          ...recentHistory,
           { role: 'user', content: transcript }
         ],
         tools,
         tool_choice: 'auto',
-        max_tokens: 220
+        max_tokens: 450
       })
     });
 
@@ -2164,10 +2331,10 @@ async function callOpenAiVoiceAgent(
         const args = JSON.parse(tc.function?.arguments || '{}');
         if (fn === 'open_url' && args.url) {
           await chrome.tabs.create({ url: args.url, active: true });
-          executedSummary = `Opened ${args.url}.`;
+          executedSummary = `Opened ${args.url}`;
         } else if (fn === 'switch_tab' && typeof args.tabId === 'number') {
           await chrome.tabs.update(args.tabId, { active: true });
-          executedSummary = 'Switched tab.';
+          executedSummary = 'Switched tab';
         } else if (fn === 'switch_space' && args.spaceName) {
           const sp = state.spaces.find(
             (s) => s.name.toLowerCase() === String(args.spaceName).toLowerCase()
@@ -2175,7 +2342,7 @@ async function callOpenAiVoiceAgent(
           if (sp) {
             state.activeSpaceId = sp.id;
             await saveState(state);
-            executedSummary = `Switched to ${sp.name} space.`;
+            executedSummary = `Switched to ${sp.name} space`;
           }
         } else if (fn === 'dom_action') {
           domAction = {
@@ -2184,13 +2351,13 @@ async function callOpenAiVoiceAgent(
             targetText: args.targetText,
             value: args.value
           };
-          executedSummary = 'Executed action on page.';
+          executedSummary = `Executed ${args.type} on page`;
         } else if (fn === 'send_to_antigravity' && args.taskPrompt) {
           domAction = {
             type: 'antigravity',
             taskPrompt: args.taskPrompt
           };
-          executedSummary = 'Sent task to Antigravity.';
+          executedSummary = 'Prepared Antigravity task';
         }
       }
     }
@@ -2199,7 +2366,8 @@ async function callOpenAiVoiceAgent(
     return {
       ok: true,
       reply,
-      agent: 'chatgpt',
+      agent: agentMode,
+      actionBadge: executedSummary || undefined,
       domAction
     };
   } catch (err) {

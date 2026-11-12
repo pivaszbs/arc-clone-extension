@@ -19,7 +19,7 @@ const checks=[];
 try{
   context=await chromium.launchPersistentContext(profile,{channel:process.env.PIP_BROWSER||'chromium',headless:false,ignoreDefaultArgs:['--disable-extensions'],args:['--enable-unsafe-extension-debugging'],viewport:{width:1100,height:800}});
   const cdp=await context.browser().newBrowserCDPSession();
-  const {id}=await cdp.send('Extensions.loadUnpacked',{path:path.resolve('dist')});
+  const {id}=await cdp.send('Extensions.loadUnpacked',{path:path.resolve('dist-arc')});
   await registerHost(path.join(profile,'NativeMessagingHosts'),id);
   const panel=await context.newPage();await panel.goto(`chrome-extension://${id}/sidepanel.html`);
   const page=await context.newPage();await page.goto(`http://127.0.0.1:${server.address().port}/`);

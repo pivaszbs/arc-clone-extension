@@ -1,9 +1,16 @@
-import { mount } from 'svelte';
+import { mount, unmount } from 'svelte';
 import Overlay from './Overlay.svelte';
+
+const contentScope = globalThis as typeof globalThis & { arcOverlayHost?: HTMLElement };
+const shutdownEvent = 'arc-overlay-shutdown';
 
 function initArcContentOverlay() {
   const ROOT_ID = 'arc-chrome-extension-root';
-  if (document.getElementById(ROOT_ID)) return;
+  const existing = document.getElementById(ROOT_ID);
+  if (existing && contentScope.arcOverlayHost === existing) return;
+  const previous = contentScope.arcOverlayHost || existing;
+  previous?.dispatchEvent(new Event(shutdownEvent));
+  previous?.remove();
 
   const host = document.createElement('div');
   host.id = ROOT_ID;
@@ -15,9 +22,12 @@ function initArcContentOverlay() {
 
   (document.documentElement || document.body).appendChild(host);
 
-  mount(Overlay, {
-    target: container
-  });
+  const overlay = mount(Overlay, { target: container });
+  contentScope.arcOverlayHost = host;
+  host.addEventListener(shutdownEvent, () => {
+    void unmount(overlay).catch(() => {});
+    if (contentScope.arcOverlayHost === host) delete contentScope.arcOverlayHost;
+  }, { once: true });
 }
 
 if (document.readyState === 'loading') {
