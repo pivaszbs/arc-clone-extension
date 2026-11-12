@@ -382,6 +382,7 @@
   async function toggleFullscreen(hideControls = false) {
     if (!player) return;
     fullscreenError = false;
+    if (hideControls) hideOverlay();
     try {
       if (document.fullscreenElement === player) await document.exitFullscreen();
       else await player.requestFullscreen();
@@ -424,6 +425,11 @@
     if (overlayHidden && performance.now() >= revealOverlayAfter) overlayHidden = false;
   }
 
+  function handleFullscreenChange() {
+    fullscreen = document.fullscreenElement === player;
+    if (overlayHidden) revealOverlayAfter = Math.max(revealOverlayAfter, performance.now() + 500);
+  }
+
   onDestroy(() => {
     scanQueue?.stop();
     if (desktopStream?.active) desktopStream.stop();
@@ -432,7 +438,7 @@
   });
 </script>
 
-<svelte:document onfullscreenchange={() => { fullscreen = document.fullscreenElement === player; }} />
+<svelte:document onfullscreenchange={handleFullscreenChange} />
 <svelte:window onpagehide={() => saveProgress(true)} onpointermove={revealOverlayOnPointerMove} />
 
 <h1>Offline study</h1>

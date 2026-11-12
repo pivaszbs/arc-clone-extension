@@ -40,6 +40,8 @@
   let detected = $state<Cue | null>(null);
   let now = $state(Date.now());
   let lastActivity = $state(Date.now());
+  let siteOverlayHidden = $state(false);
+  let suppressRevealUntil = 0;
   let busy = $state(false);
   let status = $state('');
   let skipUndo = $state<{ time: number; expiresAt: number } | null>(null);
@@ -136,8 +138,28 @@
     }
   });
 
+  function hideSiteOverlay() {
+    video?.focus({ preventScroll: true });
+    suppressRevealUntil = performance.now() + 500;
+    siteOverlayHidden = true;
+  }
+
   function revealControls() {
+    if (siteOverlayHidden) {
+      if (performance.now() < suppressRevealUntil) return;
+      siteOverlayHidden = false;
+    }
     if (showPlayback) lastActivity = Date.now();
+  }
+
+  async function toggleSiteFullscreen() {
+    if (!video) return;
+    hideSiteOverlay();
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen();
+      hideSiteOverlay();
+    } catch { /* Keep the overlay hidden even if the frame blocks fullscreen. */ }
   }
 
   $effect(() => {
@@ -295,17 +317,26 @@
   }
 
   function handlePlayerKey(event: KeyboardEvent) {
-    revealControls();
-    if (!inline || !open) return;
+    if (event.key !== 'f' && event.key !== 'F') revealControls();
+    if (!showPlayback || !open) return;
     if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
     const target = event.target;
     if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input:not(.seek), textarea, select, summary'))) return;
 
-    if (event.key === 'f' && onToggleFullscreen) {
-      event.preventDefault();
-      if (!event.repeat) onToggleFullscreen();
-      return;
+    if (event.key === 'f' || event.key === 'F') {
+      if (onToggleFullscreen) {
+        event.preventDefault();
+        if (!event.repeat) onToggleFullscreen();
+        return;
+      }
+      if (combined) {
+        event.preventDefault();
+        if (!event.repeat) void toggleSiteFullscreen();
+        return;
+      }
     }
+
+    if (!inline) return;
 
     if (!video || video.readyState < 1 || captured || challenge || mode === 'review') return;
     if (event.key === ' ' && !(target instanceof HTMLElement && target.closest('button, a[href]'))) {
@@ -700,6 +731,9 @@
   }
 </script>
 
+<svelte:document onfullscreenchange={() => {
+  if (siteOverlayHidden) suppressRevealUntil = Math.max(suppressRevealUntil, performance.now() + 500);
+}} />
 <svelte:window onpointermove={revealControls} onpointerdown={revealControls} onkeydown={handlePlayerKey} />
 
 {#snippet timelineControls()}
@@ -725,7 +759,7 @@
         <button onclick={undoSkip}>Undo skip</button>
       </div>
     {/if}
-    <section aria-label="Japanese learning" class="panel" hidden={overlayHidden}>
+    <section aria-label="Japanese learning" class="panel" hidden={overlayHidden || siteOverlayHidden}>
       {#if !challenge && mode !== 'review' && !captured && ((studyPlayer && !combined) || detected || (mode === 'learn' && !sourceCues.length))}
         <div class="caption-row">
           {#if studyPlayer && !combined}
