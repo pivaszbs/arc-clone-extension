@@ -17,6 +17,31 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from native.cast.airplay import lan_address
+
+# Who may talk to the server when it listens on every interface: this Mac, the home network,
+# and devices on your Tailscale tailnet (100.64.0.0/10). Everything else is dropped before parsing.
+ALLOWED_CLIENTS = [ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
+TAILSCALE_CLI = ("/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+
+
+def tailscale_self():
+    """This Mac's Tailscale name and IPv4 address, or (None, None) when Tailscale isn't running."""
+    import subprocess
+    for cli in TAILSCALE_CLI:
+        if not Path(cli).exists():
+            continue
+        try:
+            status = json.loads(subprocess.run([cli, "status", "--json"], capture_output=True, timeout=3).stdout or b"{}")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None, None
+        if status.get("BackendState") != "Running":
+            return None, None
+        me = status.get("Self") or {}
+        ipv4 = next((ip for ip in me.get("TailscaleIPs") or [] if ":" not in ip), None)
+        name = (me.get("DNSName") or "").rstrip(".") or None
+        return name, ipv4
+    return None, None
 from native.tv.queue_store import QueueStore
 from native.tv.replica import Replica
 
@@ -333,6 +358,34 @@ class TVHandler(BaseHTTPRequestHandler):
 
 
 class TVServer(ThreadingHTTPServer):
+    def verify_request(self, request, client_address):
+        try:
+            client = ipaddress.ip_address(client_address[0])
+        except ValueError:
+            return False
+        return any(client in network for network in ALLOWED_CLIENTS)
+
+    _addresses_cache = (0.0, [])
+
+    def addresses(self):
+        """Base URLs this server answers on, best first: Tailscale name (works anywhere), Tailscale IP,
+        then the home network. Clients keep the list and fall back between them on their own."""
+        at, cached = self._addresses_cache
+        if time.time() - at < 60:
+            return cached
+        port, urls = self.server_port, []
+        name, ts_ip = tailscale_self()
+        if name:
+            urls.append(f"http://{name}:{port}/{self.token}/")
+        if ts_ip:
+            urls.append(f"http://{ts_ip}:{port}/{self.token}/")
+        try:
+            urls.append(f"http://{lan_address()}:{port}/{self.token}/")
+        except (OSError, ValueError):
+            pass
+        self._addresses_cache = (time.time(), urls)
+        return urls
+
     def __init__(self, address, folder, metadata, verbose=False, token=None, queue_db=None):
         self.folder = folder
         self.metadata = metadata
@@ -678,6 +731,7 @@ class TVServer(ThreadingHTTPServer):
         self.refresh_series()
         return {
             "version": 1,
+            "addresses": self.addresses(),
             "autoplay": self.get_autoplay(),
             "tvState": self.get_tv_state(),
             "series": [self.library(index) for index in range(len(self.series))],
@@ -1380,7 +1434,8 @@ def main():
     parser.add_argument("folder", nargs="?", type=Path, default=DEFAULT_FOLDER,
                         help="Series or library folder (defaults to ~/Downloads/Arc Anime)")
     parser.add_argument("--metadata", type=Path, help="Optional Anime Study TV playback data JSON")
-    parser.add_argument("--host", type=ipaddress.IPv4Address, help="Private LAN address to listen on (defaults to the active route)")
+    parser.add_argument("--host", type=ipaddress.IPv4Address,
+                        help="Address to listen on. Defaults to every interface, answering only this Mac, private networks and Tailscale.")
     parser.add_argument("--port", type=int, default=46158)
     parser.add_argument("--token", help="Optional 16-hex-character URL token for stable TV bookmarking")
     parser.add_argument("--verbose", action="store_true", help="Log request types and HTTP statuses")
@@ -1388,15 +1443,17 @@ def main():
     options = parser.parse_args()
     if options.token and not re.fullmatch(r"[a-f0-9]{16}", options.token):
         parser.error("Use a 16-character lowercase hex token.")
-    host = options.host or ipaddress.IPv4Address(lan_address())
-    if not (host.is_loopback or any(host in ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))):
-        parser.error("Use a private network address.")
+    host = options.host or ipaddress.IPv4Address("0.0.0.0")
+    if not (host.is_unspecified or any(host in network for network in ALLOWED_CLIENTS)):
+        parser.error("Use a private or Tailscale address.")
     folder = options.folder.expanduser().resolve()
     metadata = options.metadata.expanduser() if options.metadata else None
     try:
         queue_db = options.queue_db.expanduser() if options.queue_db else None
         with TVServer((str(host), options.port), folder, metadata, options.verbose, options.token, queue_db) as server:
-            print(f"Anime Study TV: http://{host}:{server.server_port}/{server.token}/", flush=True)
+            urls = server.addresses() if host.is_unspecified else [f"http://{host}:{server.server_port}/{server.token}/"]
+            for url in urls or [f"http://127.0.0.1:{server.server_port}/{server.token}/"]:
+                print(f"Anime Study TV: {url}", flush=True)
             count = sum(len(episodes) for _, episodes in server.series)
             print(f"{len(server.series)} series · {count} episodes. Keep this command running while watching.", flush=True)
             server.serve_forever()

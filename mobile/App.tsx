@@ -13,6 +13,7 @@ import { AutoSync, installCrashLog, type AutoSyncState } from './src/lib/auto-sy
 import { haptics } from './src/lib/haptics';
 import { importFiles, importFolder, readLibrary, type Episode, type Series } from './src/lib/library';
 import { fetchRemoteCatalog } from './src/lib/server';
+import { findReachableAddress } from './src/lib/server-address';
 import { localEpisodeKeys, onRemoteChange, scheduleSync, setSyncer, syncWith } from './src/lib/replica';
 import { allProgress, applyReplicatedProgress, mergeProgress, progressFor, saveProgress, saveSettings, settings as savedSettings, type Progress } from './src/lib/storage';
 import {
@@ -186,6 +187,17 @@ function Study() {
       setServerError(null);
       tvSyncRef.current?.log('Catalog', `Loaded ${remote.length} series (HTTP ${statusCode})`);
     } catch (error) {
+      // The Mac may just be on another address (Tailscale vs home network): switch if one answers.
+      const alternative = await findReachableAddress(url).catch(() => null);
+      if (alternative && alternative !== url) {
+        setServerDraft(alternative);
+        setServerUrl(alternative);
+        serverUrlRef.current = alternative;
+        saveSettings({ tvServerUrl: alternative });
+        tvSyncRef.current?.log('Server', `Switched to ${alternative}`);
+        tvSyncRef.current?.connect();
+        return;
+      }
       const msg = error instanceof Error ? error.message : String(error);
       setHttpStatus({ state: 'error', error: msg });
       if (sourceRef.current === 'server') {

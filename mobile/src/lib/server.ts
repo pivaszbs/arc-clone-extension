@@ -1,6 +1,7 @@
 import { animeCore } from 'react-native-anime-core';
 import type { Episode, Series } from './library';
 import { registerSeriesAlias } from './replica';
+import { rememberAddresses } from './server-address';
 import type { Progress } from './storage';
 import { skipRanges } from './theme-sidecar';
 import { DEFAULT_TV_SERVER_URL, normalizeTvServerUrl, type TvPlaybackState } from './tv-sync';
@@ -8,6 +9,7 @@ import { DEFAULT_TV_SERVER_URL, normalizeTvServerUrl, type TvPlaybackState } fro
 export { DEFAULT_TV_SERVER_URL as DEFAULT_MAC_SERVER_URL, normalizeTvServerUrl as normalizeServerUrl };
 
 type CatalogResponse = {
+  addresses?: string[];
   autoplay?: boolean;
   tvState?: TvPlaybackState;
   series?: {
@@ -31,9 +33,19 @@ export async function fetchRemoteCatalog(baseUrl: string): Promise<{
   statusCode: number;
 }> {
   const url = normalizeTvServerUrl(baseUrl);
-  const res = await fetch(`${url}catalog.json`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const payload = (await res.json()) as CatalogResponse;
+  // A timeout, so an address that stopped answering fails fast and another can be tried.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  let payload: CatalogResponse;
+  let res: Response;
+  try {
+    res = await fetch(`${url}catalog.json`, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    payload = (await res.json()) as CatalogResponse;
+  } finally {
+    clearTimeout(timer);
+  }
+  rememberAddresses(payload.addresses);
   const list = Array.isArray(payload.series) ? payload.series : [];
   const progress: Record<string, Progress> = {};
   const series = list
