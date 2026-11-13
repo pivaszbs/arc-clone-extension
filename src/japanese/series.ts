@@ -2,17 +2,29 @@ import { japaneseCaptions, parseCaptionResponse } from './captions';
 import { findEpisodeDownloads, isAnimeSubtitleSite } from './page-captions';
 import { parse, defaultTreeAdapter, type DefaultTreeAdapterTypes } from 'parse5';
 
+export const AUTO_FALLBACK = '__auto__';
+
+export interface SeriesEpisodeVariant {
+  team: string;
+  page: string;
+  video?: { url: string; height: number };
+  subtitle?: string;
+}
+
 export interface SeriesEpisode {
   page: string;
   label: string;
+  team?: string;
   video?: { url: string; height: number };
   subtitle?: string;
+  variants?: SeriesEpisodeVariant[];
 }
 
 export interface SeriesPlan {
   series: string;
   title: string;
   edition?: string;
+  primaryTeam?: string;
   episodes: SeriesEpisode[];
 }
 
@@ -69,21 +81,28 @@ export async function currentEpisodeDownloads(value: string) {
   return findEpisodeDownloads(links, url);
 }
 
-function editionLink(page: CatalogPage & { url: URL }, episode: URL, category: string, team?: string) {
+function allEditionLinks(page: CatalogPage & { url: URL }, episode: URL, category: string): { url: URL; label: string }[] {
   const prefix = `${episode.pathname}/${category}-`;
-  let fallback: { url: URL; label: string } | null = null;
+  const byPath = new Map<string, { url: URL; label: string; preferred: boolean }>();
   for (const anchor of page.links) {
     let link: URL;
     try { link = new URL(anchor.href, page.url); } catch { continue; }
     if (link.origin !== episode.origin || !link.pathname.startsWith(prefix) || !/^\d+\/?$/.test(link.pathname.slice(prefix.length))) continue;
     const label = anchor.textContent;
     if (!label) continue;
-    if (team && label.toLowerCase() === team.toLowerCase()) return { url: link, label };
-    if (team || link.pathname !== page.url.pathname) continue;
-    if (anchor.className.split(/\s+/).includes('truncate')) return { url: link, label };
-    fallback ??= { url: link, label };
+    const preferred = anchor.className.split(/\s+/).includes('truncate');
+    const existing = byPath.get(link.pathname);
+    if (!existing || (preferred && !existing.preferred)) {
+      byPath.set(link.pathname, { url: link, label, preferred });
+    }
   }
-  return fallback;
+  return [...byPath.values()].map(({ url, label }) => ({ url, label }));
+}
+
+function editionLink(page: CatalogPage & { url: URL }, episode: URL, category: string, team?: string) {
+  const links = allEditionLinks(page, episode, category);
+  if (team) return links.find(link => link.label.toLowerCase() === team.toLowerCase()) || null;
+  return links.find(link => link.url.pathname === page.url.pathname) || null;
 }
 
 export async function planSeries(value: string, onProgress: (checked: number, total: number) => void): Promise<SeriesPlan> {
@@ -121,6 +140,22 @@ export async function planSeries(value: string, onProgress: (checked: number, to
       const isSelectedEpisode = sourceEpisode && episodeUrl.pathname === sourceEpisode.pathname;
       if (exactEdition && isDub && !team && !isSelectedEpisode) continue;
       let page = isSelectedEpisode && selected ? selected : await readPage(variant);
+      const variants: SeriesEpisodeVariant[] = !studyEdition
+        ? allEditionLinks(page, episodeUrl, category).map(link => ({ team: link.label, page: link.url.href }))
+        : [];
+      const cacheDownloads = (loaded: CatalogPage & { url: URL }) => {
+        const found = findEpisodeDownloads(loaded.links, loaded.url);
+        if (!found?.video) return null;
+        const active = variants.find(item => new URL(item.page).pathname === loaded.url.pathname);
+        if (active) {
+          active.video = found.video;
+          active.subtitle = found.subtitle;
+        }
+        return { downloads: found, team: active?.team || editionLink(loaded, episodeUrl, category)?.label };
+      };
+      const initialCached = !studyEdition ? cacheDownloads(page) : null;
+      if (variants.length) episode.variants = variants;
+
       if (team && !isSelectedEpisode) {
         const match = editionLink(page, episodeUrl, category, team);
         if (!match) continue;
@@ -130,10 +165,12 @@ export async function planSeries(value: string, onProgress: (checked: number, to
       const { links, url } = page;
       if (url.pathname !== variant.pathname && !url.pathname.startsWith(variant.pathname + '-')) continue;
       if (isSelectedEpisode && exactEdition && url.pathname !== source.pathname) continue;
-      const downloads = findEpisodeDownloads(links, url);
+      const resolved = !studyEdition ? cacheDownloads(page) : null;
+      const downloads = resolved?.downloads || findEpisodeDownloads(links, url);
       if (!downloads?.video) continue;
       if (!studyEdition) {
         episode.video = downloads.video;
+        episode.team = resolved?.team || initialCached?.team || editionLink(page, episodeUrl, category)?.label;
         continue;
       }
       if (!downloads.subtitle) continue;
@@ -146,5 +183,103 @@ export async function planSeries(value: string, onProgress: (checked: number, to
     } catch { /* Keep the episode visible as unavailable. */ }
   }
   onProgress(list.length, list.length);
-  return { series: series.href, title: catalog.title || series.pathname.split('/').at(-1)!, edition, episodes: list };
+  return { series: series.href, title: catalog.title || series.pathname.split('/').at(-1)!, edition, primaryTeam: team, episodes: list };
+}
+
+async function loadVariant(variant: SeriesEpisodeVariant): Promise<SeriesEpisodeVariant> {
+  if (variant.video) return variant;
+  const target = new URL(variant.page);
+  const page = await readPage(target);
+  if (page.url.pathname !== target.pathname) return variant;
+  const downloads = findEpisodeDownloads(page.links, page.url);
+  if (downloads?.video) {
+    variant.video = downloads.video;
+    variant.subtitle = downloads.subtitle;
+  }
+  return variant;
+}
+
+export async function resolveSeriesTeam(
+  plan: SeriesPlan,
+  fallbackTeam: string | undefined,
+  onProgress?: (checked: number, total: number) => void
+): Promise<SeriesPlan> {
+  const primaryTeam = plan.primaryTeam;
+  const counts = new Map<string, number>();
+  for (const episode of plan.episodes) {
+    for (const variant of episode.variants || []) {
+      const key = variant.team.toLowerCase();
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+
+  const targets: { episode: SeriesEpisode; variant?: SeriesEpisodeVariant }[] = [];
+  for (const episode of plan.episodes) {
+    const variants = episode.variants || [];
+    if (!variants.length) continue;
+    let chosen = primaryTeam
+      ? variants.find(v => v.team.toLowerCase() === primaryTeam.toLowerCase())
+      : undefined;
+    if (!chosen && fallbackTeam) {
+      if (fallbackTeam === AUTO_FALLBACK) {
+        chosen = [...variants].sort((a, b) =>
+          (counts.get(b.team.toLowerCase()) || 0) - (counts.get(a.team.toLowerCase()) || 0)
+        )[0];
+      } else {
+        chosen = variants.find(v => v.team.toLowerCase() === fallbackTeam.toLowerCase());
+      }
+    }
+    targets.push({ episode, variant: chosen });
+  }
+
+  const toFetch = targets.filter(item => item.variant && !item.variant.video);
+  let checked = 0;
+  for (const { episode, variant } of targets) {
+    if (!variant) {
+      episode.video = undefined;
+      episode.subtitle = undefined;
+      episode.team = undefined;
+      continue;
+    }
+    if (!variant.video) {
+      onProgress?.(checked, toFetch.length);
+      try { await loadVariant(variant); } catch { /* Keep unavailable if fetch fails. */ }
+      checked += 1;
+    }
+    if (variant.video) {
+      episode.video = variant.video;
+      episode.subtitle = variant.subtitle;
+      episode.team = variant.team;
+    } else {
+      episode.video = undefined;
+      episode.subtitle = undefined;
+      episode.team = undefined;
+    }
+  }
+  if (toFetch.length) onProgress?.(toFetch.length, toFetch.length);
+  return { ...plan, episodes: [...plan.episodes] };
+}
+
+export async function resolveEpisodeVariant(
+  plan: SeriesPlan,
+  episodePage: string,
+  team: string
+): Promise<SeriesPlan> {
+  const episode = plan.episodes.find(item => item.page === episodePage);
+  if (!episode) return plan;
+  if (!team) {
+    episode.video = undefined;
+    episode.subtitle = undefined;
+    episode.team = undefined;
+    return { ...plan, episodes: [...plan.episodes] };
+  }
+  const variant = episode.variants?.find(v => v.team.toLowerCase() === team.toLowerCase());
+  if (!variant) return plan;
+  try { await loadVariant(variant); } catch { /* Keep unavailable if fetch fails. */ }
+  if (variant.video) {
+    episode.video = variant.video;
+    episode.subtitle = variant.subtitle;
+    episode.team = variant.team;
+  }
+  return { ...plan, episodes: [...plan.episodes] };
 }

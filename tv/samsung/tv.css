@@ -16,7 +16,14 @@ button:focus, input:focus { outline: none; border-color: #ff6a2b; background: #f
 input:focus { background: #1d1c22; color: #fff; font-weight: 400; transform: none; box-shadow: 0 0 0 3px rgba(255, 106, 43, 0.45); }
 .library-bar { display: flex; gap: 0.5em; margin-top: 1.5vh; }
 ol { margin: 2vh 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(3, 1fr); grid-gap: 0.7em; }
+ol.titles-grid { grid-template-columns: repeat(4, 1fr); grid-gap: 0.9em; }
 ol button { width: 100%; min-height: 3.3em; text-align: left; border-radius: 0.55em; padding: 0.6em 0.9em; }
+ol button.title-card { padding: 0; overflow: hidden; display: flex; flex-direction: column; height: 100%; background: rgba(26, 26, 33, 0.95); }
+ol button.title-card:focus { background: rgba(34, 34, 44, 0.98); color: #f8f5f2; border-color: #ff6a2b; box-shadow: 0 0 0 3px rgba(255, 106, 43, 0.55); }
+ol button.title-card:focus small { color: #ffad88; }
+.title-poster { width: 100%; aspect-ratio: 3 / 4; object-fit: cover; display: block; background: #16161c; }
+.title-meta { padding: 0.65em 0.8em; width: 100%; }
+.title-name { display: block; font-weight: 600; line-height: 1.25; }
 ol small { display: block; margin-top: 0.25em; color: #d8b6a9; font-size: 0.8em; }
 ol button:focus small { color: #2a140c; }
 
