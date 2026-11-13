@@ -18,7 +18,8 @@
     "cast:setup": "python3 -m venv native/cast/.venv && native/cast/.venv/bin/python -m pip install -r native/cast/requirements.txt",
     "cast:serve": "native/cast/.venv/bin/python native/cast/serve.py",
     "build:tv": "node scripts/build-tv.mjs",
-    "tv:serve": "npm run build:tv && python3 -m native.tv.serve"
+    "tv:serve": "npm run build:tv && python3 -m native.tv.serve",
+    "mac:up": "bash scripts/mac-up.sh"
   },
   "devDependencies": {
     "@cucumber/cucumber": "^13.3.0",
