@@ -705,15 +705,23 @@ class TVServer(ThreadingHTTPServer):
                         pass
                 elif isinstance(sidecars.get(file.name), dict):
                     ep_saved["themes"] = sidecars[file.name]
+            try:
+                size = file.stat().st_size
+            except OSError:
+                size = None
             result_episodes.append({
                 "name": file.name,
                 "video": f"{prefix}{number}/video",
                 "subtitles": f"{prefix}{number}/subtitles" if subtitle else None,
+                # Phones download episodes under the same names, so synced keys line up.
+                "subtitleName": subtitle.name if subtitle else None,
+                "size": size,
                 "saved": ep_saved
             })
         poster = f"{index}/poster" if (folder / "poster.jpg").is_file() or SERIES_ID_RE.search(folder.name) else None
         return {
             "id": hashlib.sha256(str(folder).encode()).hexdigest()[:16],
+            "folder": folder.name,
             "title": saved.get("title") or folder.name,
             "poster": poster,
             "autoSkip": saved.get("autoSkip", {}),

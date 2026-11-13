@@ -1,5 +1,8 @@
 import { Directory, File, Paths } from 'expo-file-system';
 
+import * as replica from './replica';
+import { syncSoon } from './remote';
+
 export type Progress = { position: number; duration: number; watchedAt: number; finished: boolean };
 export type Settings = { autoSkip: boolean; subtitles: boolean };
 type State = { progress: Record<string, Progress>; settings: Settings };
@@ -32,11 +35,32 @@ function persist() {
   }, 300);
 }
 
-export const progressFor = (key: string): Progress | undefined => load().progress[key];
-export const allProgress = () => load().progress;
+// Progress for "<series folder>/<video>" is shared with the Mac (and through it the TV) as
+// ep/<series folder>/<video>/progress. The most recently watched position wins.
+const replicaKey = (key: string) => (key.includes('/') ? `ep/${key}/progress` : undefined);
+
+function newest(key: string): Progress | undefined {
+  const local = load().progress[key];
+  const id = replicaKey(key);
+  const shared = id ? replica.get<Progress>(id) : undefined;
+  if (!shared || typeof shared.position !== 'number' || typeof shared.watchedAt !== 'number') return local;
+  return !local || shared.watchedAt > local.watchedAt ? { position: shared.position, watchedAt: shared.watchedAt, duration: shared.duration ?? 0, finished: !!shared.finished } : local;
+}
+
+export const progressFor = (key: string): Progress | undefined => newest(key);
+export function allProgress(): Record<string, Progress> {
+  const merged: Record<string, Progress> = { ...load().progress };
+  for (const key of Object.keys(merged)) merged[key] = newest(key)!;
+  return merged;
+}
+/** Progress for any key, including episodes only the Mac has watched so far. */
+export const sharedProgressFor = (key: string) => newest(key);
+
 export function saveProgress(key: string, progress: Progress) {
   load().progress[key] = progress;
   persist();
+  const id = replicaKey(key);
+  if (id && replica.setLocal(id, progress, progress.watchedAt)) syncSoon();
 }
 export const settings = () => load().settings;
 export function saveSettings(next: Partial<Settings>) {

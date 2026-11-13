@@ -1,6 +1,8 @@
 import { Directory, File, Paths } from 'expo-file-system';
 import { animeCore, type EpisodePair, type SkipRanges } from 'react-native-anime-core';
 
+import * as replica from './replica';
+
 export type Episode = EpisodePair & {
   /** Path relative to the series folder, also the progress key inside it. */
   key: string;
@@ -39,7 +41,10 @@ function skipRanges(value: unknown): SkipRanges {
  * Frame predictions come from the extension's video-themes queue. The app reads them from
  * either `video-themes.json` ({ "<file name>": { op, ed, recap } }) or `<episode>.themes.json`.
  */
-function framesFor(folder: Directory, videoName: string, shared: Record<string, unknown>) {
+function framesFor(folder: Directory, seriesName: string, videoName: string, shared: Record<string, unknown>) {
+  // Timings synced from the Mac (desktop, worker or TV edits) win over exported files.
+  const synced = seriesName ? replica.get(`ep/${seriesName}/${videoName}/themes`) : undefined;
+  if (synced && typeof synced === 'object') return skipRanges(synced);
   const stem = videoName.replace(/\.[^.]+$/, '');
   const own = readJson(new File(folder, `${stem}.themes.json`));
   return skipRanges(own ?? shared[videoName]);
@@ -61,7 +66,7 @@ function readSeries(folder: Directory, name: string): Series | null {
       key: name ? `${name}/${pair.video}` : pair.video,
       videoUri: byName.get(pair.video)!.uri,
       subtitleUri: pair.subtitle ? byName.get(pair.subtitle)?.uri : undefined,
-      frames: framesFor(folder, pair.video, shared),
+      frames: framesFor(folder, name, pair.video, shared),
     })),
   };
 }

@@ -6,9 +6,11 @@ import { ActionSheetIOS, Alert, AppState, Platform, Pressable, ScrollView, Style
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import { EpisodeList } from './src/components/EpisodeList';
+import { MacLibrary } from './src/components/MacLibrary';
 import { Player } from './src/components/Player';
 import { haptics } from './src/lib/haptics';
 import { importFiles, importFolder, readLibrary, type Episode, type Series } from './src/lib/library';
+import * as remote from './src/lib/remote';
 import { allProgress, saveSettings, settings as savedSettings } from './src/lib/storage';
 import { colors, radius, space } from './src/theme';
 
@@ -42,6 +44,8 @@ function Study() {
   const [episodeKey, setEpisodeKey] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [settings, setSettings] = useState(savedSettings);
+  const [macOpen, setMacOpen] = useState(false);
+  const [sync, setSync] = useState(remote.syncStatus());
   const [, setRevision] = useState(0);
   const refreshProgress = useCallback(() => setRevision(value => value + 1), []);
 
@@ -49,12 +53,23 @@ function Study() {
     try { setLibrary(readLibrary()); } catch (error) { console.warn('Could not read the library', error); }
   }, []);
 
+  // Sync with the Mac in the background of the app's own work. Everything shown comes from this
+  // iPhone; synced progress and skip timings are folded in when they arrive.
+  const syncNow = useCallback(async () => {
+    const changed = await remote.sync();
+    if (changed.length) { scan(); refreshProgress(); }
+  }, [scan, refreshProgress]);
+
   useEffect(() => {
     scan();
+    void syncNow();
     // Files dropped in through the Files app or Finder show up when the app comes back.
-    const subscription = AppState.addEventListener('change', state => { if (state === 'active') scan(); });
-    return () => subscription.remove();
-  }, [scan]);
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active') { scan(); void syncNow(); }
+    });
+    const unsubscribe = remote.onStatus(setSync);
+    return () => { subscription.remove(); unsubscribe(); };
+  }, [scan, syncNow]);
 
   const series = library.find(item => item.folder === folder) ?? library[0];
   const episode = series?.episodes.find(item => item.key === episodeKey) ?? (series ? latestEpisode(series) : undefined);
@@ -114,6 +129,13 @@ function Study() {
             <View style={styles.credit}><Text style={styles.creditText} numberOfLines={1}>{series.credit}</Text></View>
           )}
         </View>
+        <Pressable accessibilityRole="button" accessibilityLabel="Mac library" onPress={() => setMacOpen(true)} hitSlop={10} style={styles.addButton}>
+          <SymbolView
+            name={sync.state === 'offline' ? 'desktopcomputer.trianglebadge.exclamationmark' : 'desktopcomputer'}
+            size={18}
+            tintColor={sync.state === 'unpaired' ? colors.textSecondary : colors.accent}
+          />
+        </Pressable>
         <Pressable accessibilityRole="button" accessibilityLabel="Add episodes" onPress={pickSource} hitSlop={10} style={styles.addButton}>
           <SymbolView name="plus" size={20} tintColor={colors.accent} />
         </Pressable>
@@ -166,10 +188,11 @@ function Study() {
       <SymbolView name="film.stack" size={48} tintColor={colors.textTertiary} />
       <Text style={styles.emptyTitle}>No episodes yet</Text>
       <Text style={styles.emptyText}>
-        Import a downloads folder, or copy one into Files › On My {Platform.OS === 'ios' && Platform.isPad ? 'iPad' : 'iPhone'} › Anime Study.
+        Download series from the Mac to watch them anywhere, or copy a downloads folder into Files › On My {Platform.OS === 'ios' && Platform.isPad ? 'iPad' : 'iPhone'} › Anime Study.
         Episodes pair with .ass or .srt subtitles that share their name.
       </Text>
-      <Pressable onPress={pickSource} style={styles.emptyButton}><Text style={styles.emptyButtonText}>Add episodes</Text></Pressable>
+      <Pressable onPress={() => setMacOpen(true)} style={styles.emptyButton}><Text style={styles.emptyButtonText}>Get episodes from Mac</Text></Pressable>
+      <Pressable onPress={pickSource} hitSlop={8}><Text style={styles.emptyLink}>Import from Files</Text></Pressable>
     </View>
   );
 
@@ -205,6 +228,7 @@ function Study() {
           </View>
         )}
       </SafeAreaView>
+      <MacLibrary visible={macOpen} onClose={() => { setMacOpen(false); scan(); }} onLibraryChanged={() => { scan(); refreshProgress(); }} />
     </View>
   );
 }
@@ -238,4 +262,5 @@ const styles = StyleSheet.create({
   emptyText: { color: colors.textSecondary, fontSize: 15, textAlign: 'center', lineHeight: 21, maxWidth: 420 },
   emptyButton: { backgroundColor: colors.accent, borderRadius: radius.pill, paddingHorizontal: 22, paddingVertical: 12, marginTop: space.s },
   emptyButtonText: { color: colors.background, fontSize: 16, fontWeight: '700' },
+  emptyLink: { color: colors.accent, fontSize: 15, fontWeight: '600' },
 });

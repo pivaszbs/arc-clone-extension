@@ -2,7 +2,7 @@
   "expo": {
     "name": "Anime Study",
     "slug": "anime-study",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -16,7 +16,11 @@
         "UIBackgroundModes": [
           "audio"
         ],
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        },
+        "NSLocalNetworkUsageDescription": "Anime Study connects to your Mac to download episodes and sync progress and skip timings."
       }
     },
     "android": {
