@@ -90,6 +90,9 @@ function Study() {
     setSettings(current => ({ ...current, ...next }));
   };
 
+  const closeMac = useCallback(() => { setMacOpen(false); scan(); }, [scan]);
+  const libraryChanged = useCallback(() => { scan(); refreshProgress(); }, [scan, refreshProgress]);
+
   const pickSource = () => {
     const run = async (task: () => Promise<string | null>) => {
       try {
@@ -228,7 +231,7 @@ function Study() {
           </View>
         )}
       </SafeAreaView>
-      <MacLibrary visible={macOpen} onClose={() => { setMacOpen(false); scan(); }} onLibraryChanged={() => { scan(); refreshProgress(); }} />
+      <MacLibrary visible={macOpen} onClose={closeMac} onLibraryChanged={libraryChanged} />
     </View>
   );
 }

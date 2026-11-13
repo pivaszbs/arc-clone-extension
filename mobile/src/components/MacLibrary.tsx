@@ -40,6 +40,10 @@ export function MacLibrary({ visible, onClose, onLibraryChanged }: Props) {
   const [, setRevision] = useState(0);
   const running = useRef(false);
   const abort = useRef<AbortController | null>(null);
+  // Held in a ref: the parent passes a new function on every render, and effects keyed on it
+  // would re-run (and re-sync) each time the sync status re-renders the parent.
+  const libraryChanged = useRef(onLibraryChanged);
+  libraryChanged.current = onLibraryChanged;
 
   useEffect(() => remote.onStatus(setStatus), []);
 
@@ -47,9 +51,10 @@ export function MacLibrary({ visible, onClose, onLibraryChanged }: Props) {
     if (!remote.serverUrl()) return;
     try { setSeries(await remote.fetchCatalog()); } catch { /* The cached list stays. */ }
     const changed = await remote.sync(true);
-    if (changed.length) onLibraryChanged();
-  }, [onLibraryChanged]);
+    if (changed.length) libraryChanged.current();
+  }, []);
 
+  // Once each time the sheet opens.
   useEffect(() => { if (visible) void refresh(); }, [visible, refresh]);
 
   // One download at a time keeps the Wi-Fi and the phone cool.
@@ -65,7 +70,7 @@ export function MacLibrary({ visible, onClose, onLibraryChanged }: Props) {
       shown = Date.now();
       setProgress(current => ({ ...current, [key]: total ? written / total : 0 }));
     }, controller.signal)
-      .then(() => { haptics.select(); onLibraryChanged(); })
+      .then(() => { haptics.select(); libraryChanged.current(); })
       .catch(error => {
         if (!controller.signal.aborted) Alert.alert('Download stopped', `${job.episode.name}\n${String(error?.message ?? error)}`);
       })
@@ -75,7 +80,7 @@ export function MacLibrary({ visible, onClose, onLibraryChanged }: Props) {
         setProgress(current => { const next = { ...current }; delete next[jobKey(job)]; return next; });
         setQueue(current => current.filter(item => jobKey(item) !== jobKey(job)));
       });
-  }, [queue, onLibraryChanged]);
+  }, [queue]);
 
   const connect = async () => {
     setConnecting(true);
@@ -104,7 +109,7 @@ export function MacLibrary({ visible, onClose, onLibraryChanged }: Props) {
   const remove = (job: Job) => {
     Alert.alert('Remove from this iPhone?', job.episode.name, [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Remove', style: 'destructive', onPress: () => { remote.removeDownload(job.series, job.episode); setRevision(n => n + 1); onLibraryChanged(); } },
+      { text: 'Remove', style: 'destructive', onPress: () => { remote.removeDownload(job.series, job.episode); setRevision(n => n + 1); libraryChanged.current(); } },
     ]);
   };
 
