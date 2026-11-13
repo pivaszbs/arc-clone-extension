@@ -7,6 +7,7 @@
   import type { Cue } from './study';
   import { THEME_DETECTOR_VERSION, overlapsRecap, type VideoThemes } from './video-themes';
   import { exportVideoThemes } from './theme-export';
+  import { parseEpisodeKey, recordChange, replica } from './replica';
   import { forgetFrameChecks, VideoThemeQueue, type ScanStatus } from './video-theme-queue';
   import { DesktopVideoStream } from '../video/desktop-stream';
   import { directoryPicker, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, type DownloadFolder, type EpisodeFolder } from './offline-library';
@@ -70,7 +71,10 @@
   let tvAutoplay = $state(true);
   let pipelineEvents = $state<PipelineEvent[]>([]);
   const tvSync = new TvSyncClient(
-    state => { tvWsState = state; },
+    state => {
+      tvWsState = state;
+      if (state === 'connected') replica.scheduleSync(0);
+    },
     events => { pipelineEvents = events; },
     undefined,
     msg => {
@@ -83,7 +87,36 @@
     void tvSync.pushSync({ autoplay: next });
   };
   const sendTvSocket = (payload: Record<string, unknown>) => tvSync.sendSocket(payload);
-  const pushTvSync = (payload: Record<string, unknown>) => tvSync.pushSync(payload);
+  // Changes go to the shared replica too, so they reach the Mac later if it's away right now.
+  const pushTvSync = (payload: Record<string, unknown>) => {
+    try { recordChange(payload); } catch { /* The live push below still runs. */ }
+    return tvSync.pushSync(payload);
+  };
+
+  // Registered during setup: Svelte only accepts onDestroy while the component initialises.
+  onDestroy(replica.onRemoteChange((key, value) => applyRemoteChange(key, value)));
+
+  /** Write a change made on another device (phone, TV, Mac worker) into this page's own storage. */
+  function applyRemoteChange(key: string, value: unknown) {
+    const parsed = parseEpisodeKey(key);
+    if (!parsed || !value || typeof value !== 'object') return;
+    const file = episodeFolders.find(entry => entry.name === parsed.series)?.files.find(item => item.name === parsed.episode)
+      ?? (seriesFolderName === parsed.series ? episodes.find(item => item.video.name === parsed.episode)?.video : undefined);
+    if (!file) return;
+    const id = fileIdentity(file);
+    if (parsed.field === 'themes') {
+      const themes = value as VideoThemes;
+      try { localStorage.setItem(themeStorageKey(id), JSON.stringify(themes)); } catch { /* Storage full. */ }
+      if (id === localSource) videoThemes = themes;
+    } else if (parsed.field === 'progress') {
+      const incoming = value as Partial<Progress>;
+      if (typeof incoming.position !== 'number' || typeof incoming.watchedAt !== 'number') return;
+      const existing = episodeProgress(file);
+      if (existing && existing.watchedAt >= incoming.watchedAt) return;
+      writeEpisodeProgress(file, { position: incoming.position, watchedAt: incoming.watchedAt, finished: !!incoming.finished });
+      progressRevision++;
+    }
+  }
   const connectTvSocket = () => tvSync.connect();
   let localBody = $state('');
   let localSource = $state('');
@@ -914,6 +947,7 @@
     let mounted = true;
     pendingSavedJobs = readSavedParallelJobs();
     connectTvSocket();
+    replica.scheduleSync(0);
     if (directoryPicker) void rememberedFolder().then(async handle => {
       if (!mounted || folder || folderBusy || !handle) return;
       folder = handle;
