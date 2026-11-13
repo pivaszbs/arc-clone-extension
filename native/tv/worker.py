@@ -12,6 +12,11 @@ from urllib.error import URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+try:
+    from . import audio_print
+except ImportError:  # run as a script: python3 native/tv/worker.py
+    import audio_print
+
 FRAME_WIDTH = 12
 FRAME_HEIGHT = 8
 FRAME_BYTES = FRAME_WIDTH * FRAME_HEIGHT * 3  # RGB24 = 288 bytes
@@ -136,8 +141,12 @@ def fingerprint_video(video_url, duration_hint, ffmpeg_bin, ffprobe_bin, progres
         progress_cb(0.55)
     ed = sample_window(video_url, ending_start, duration - 0.5, ffmpeg_bin)
     if progress_cb:
+        progress_cb(0.85)
+    # Soundtrack of the ending window, for matching the ending song (None without numpy).
+    ed_audio = audio_print.encode(audio_print.audio_print(video_url, ending_start, duration - 0.5, ffmpeg_bin))
+    if progress_cb:
         progress_cb(1.0)
-    return {"op": op, "ed": ed}
+    return {"op": op, "ed": ed, "edAudio": ed_audio}
 
 
 def decode_samples(window):
@@ -265,6 +274,20 @@ def match_video_themes(current_fp, reference_fp):
         best = match_window(subsampled, ref_frames, min_sec)
         if best:
             themes[part] = refine_window(cur_frames, ref_frames, best)
+    # Join with the song match: the song can start under the last scene (only the picture repeats)
+    # and credits can run over new footage (only the song repeats). Same rule as mergeEndings() in
+    # src/japanese/video-themes.ts.
+    song = audio_print.match_prints(
+        audio_print.decode(current_fp.get("edAudio")),
+        audio_print.decode(reference_fp.get("edAudio")),
+    )
+    if song:
+        picture, sung = themes.get("ed"), song[0]
+        if not picture or picture["start"] >= sung["end"] or sung["start"] >= picture["end"]:
+            themes["ed"] = sung
+        else:
+            joined = {"start": min(picture["start"], sung["start"]), "end": max(picture["end"], sung["end"])}
+            themes["ed"] = joined if joined["end"] - joined["start"] <= 130 else picture
     return themes
 
 

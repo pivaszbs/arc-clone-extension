@@ -358,6 +358,7 @@ class TVServer(ThreadingHTTPServer):
         self.episode_state = self.store.load_episodes()   # (series, episode) -> {state, attempts, notBefore, error}
         self.stage_state = self.store.load_stages()      # kind -> {(series, episode) -> {..., result}}
         self.series_samples = self.store.load_samples()
+        self._requeue_outdated_fingerprints()
         self.store.log_event("coordinator_start", data={"resumedJobs": len(self.worker_jobs)})
         # Master-master library state shared with phones (replica.py).
         self.replica = Replica(queue_db or default_queue_path(folder))
@@ -750,6 +751,18 @@ class TVServer(ThreadingHTTPServer):
     # ---- stage state (PIPELINE.md steps 1–2) ---------------------------------
     # fingerprint keeps its original table/dict (`episode_state`); other stages live in `stage_state[kind]`.
     STAGE_KINDS = ("probe", "fingerprint")
+    # Bump when worker.py's OP/ED detection changes so finished episodes are processed again.
+    # v2: ending songs matched by soundtrack (audio_print.py).
+    FINGERPRINT_DETECTOR_VERSION = 2
+
+    def _requeue_outdated_fingerprints(self):
+        outdated = [key for key, info in self.episode_state.items()
+                    if info.get("state") == "done" and int(info.get("detector", 1)) < self.FINGERPRINT_DETECTOR_VERSION]
+        for key in outdated:
+            self.episode_state.pop(key, None)
+            self.store.delete_episode(key)
+        if outdated:
+            self.store.log_event("detector_requeue", data={"episodes": len(outdated), "version": self.FINGERPRINT_DETECTOR_VERSION})
 
     def _stage_map(self, kind):
         if kind == "fingerprint":
@@ -786,6 +799,8 @@ class TVServer(ThreadingHTTPServer):
         states = self._stage_map(kind)
         prev = states.get(key) or {}
         info = {"state": "done", "attempts": int(prev.get("attempts", 0)), "notBefore": 0, "error": None}
+        if kind == "fingerprint":
+            info["detector"] = self.FINGERPRINT_DETECTOR_VERSION
         if result is not None:
             info["result"] = result
         states[key] = info
@@ -1152,11 +1167,14 @@ class TVServer(ThreadingHTTPServer):
             }
             if kind == "fingerprint":
                 # Prefer cached reference samples from another episode in the same series.
+                # Samples saved before soundtrack matching lack "edAudio"; sample a fresh reference instead.
                 ref_samples = None
                 for (s_name, r_name), cached in self.series_samples.items():
-                    if s_name == series_name and r_name != ep_name:
-                        ref_samples = cached
-                        break
+                    if s_name == series_name and r_name != ep_name and "edAudio" in cached:
+                        if cached.get("edAudio") or ref_samples is None:
+                            ref_samples = cached
+                        if cached.get("edAudio"):
+                            break
                 ref_episode = None
                 if ref_samples is None:
                     ref_idx = 0 if ep_idx != 0 else 1

@@ -86,6 +86,10 @@ class QueueStore:
         cols = {row[1] for row in self._db.execute("PRAGMA table_info(jobs)")}
         if "kind" not in cols:
             self._db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'fingerprint'")
+        # Which OP/ED detector version finished the episode; rows from before versioning count as 1.
+        episode_cols = {row[1] for row in self._db.execute("PRAGMA table_info(episodes)")}
+        if "detector" not in episode_cols:
+            self._db.execute("ALTER TABLE episodes ADD COLUMN detector INTEGER NOT NULL DEFAULT 1")
 
     def close(self):
         with self._lock:
@@ -113,10 +117,10 @@ class QueueStore:
     def load_episodes(self):
         with self._lock:
             rows = self._db.execute(
-                "SELECT series_name, episode, state, attempts, not_before, last_error FROM episodes"
+                "SELECT series_name, episode, state, attempts, not_before, last_error, detector FROM episodes"
             ).fetchall()
         return {
-            (r[0], r[1]): {"state": r[2], "attempts": r[3], "notBefore": r[4], "error": r[5]}
+            (r[0], r[1]): {"state": r[2], "attempts": r[3], "notBefore": r[4], "error": r[5], "detector": r[6]}
             for r in rows
         }
 
@@ -186,11 +190,13 @@ class QueueStore:
     def save_episode(self, key, info):
         with self._lock:
             self._db.execute(
-                "INSERT INTO episodes (series_name, episode, state, attempts, not_before, last_error, updated_at)"
-                " VALUES (?,?,?,?,?,?,?)"
+                "INSERT INTO episodes (series_name, episode, state, attempts, not_before, last_error, detector, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(series_name, episode) DO UPDATE SET state=excluded.state, attempts=excluded.attempts,"
-                " not_before=excluded.not_before, last_error=excluded.last_error, updated_at=excluded.updated_at",
-                (key[0], key[1], info["state"], info["attempts"], info.get("notBefore", 0), info.get("error"), time.time()),
+                " not_before=excluded.not_before, last_error=excluded.last_error, detector=excluded.detector,"
+                " updated_at=excluded.updated_at",
+                (key[0], key[1], info["state"], info["attempts"], info.get("notBefore", 0), info.get("error"),
+                 int(info.get("detector", 1)), time.time()),
             )
 
     def delete_episode(self, key):

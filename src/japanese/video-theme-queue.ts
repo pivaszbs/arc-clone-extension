@@ -1,5 +1,5 @@
 import { detectAnimeOpEdIntervals, parseCaptionResponse } from './captions';
-import { confirmLateOpening, fingerprintVideo, matchAudioEndings, matchEarlySparseOpening, matchKnownEnding, matchKnownOpening, matchLateOpening, matchRecap, matchVideoThemes, overlapsRecap, refineThemeEdges, type VideoThemes } from './video-themes';
+import { confirmLateOpening, fingerprintVideo, matchAudioEndings, matchEarlySparseOpening, matchKnownEnding, matchKnownOpening, matchLateOpening, matchRecap, matchVideoThemes, mergeEndings, overlapsRecap, refineThemeEdges, type VideoThemes } from './video-themes';
 
 type Fingerprint = Awaited<ReturnType<typeof fingerprintVideo>>;
 type Comparison = {
@@ -179,8 +179,7 @@ export class VideoThemeQueue {
           const { themes, lateOpening, earlyOpening, audioEnding } = comparison.episodes[side];
           const candidate = lateOpening ?? earlyOpening;
           const recap = this.recaps.get(item.id) ?? this.savedThemes(item.id).recap;
-          // The shared song marks the ending more reliably than the credits footage.
-          const matched = { ...themes, ed: audioEnding ?? themes.ed };
+          const matched = { ...themes, ed: mergeEndings(themes.ed, audioEnding) };
           if (overlapsRecap(matched.op, recap)) matched.op = undefined;
           if (!matched.op && candidate && !overlapsRecap(candidate, recap)) {
             const previous = this.sparseOpenings.get(item.id) ?? [];

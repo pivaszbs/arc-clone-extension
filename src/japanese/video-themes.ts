@@ -256,6 +256,18 @@ export function matchKnownEnding(current: Fingerprint, reference: Fingerprint, e
 }
 
 /**
+ * Combine the picture and soundtrack matches for an ending. The song can start under the episode's
+ * last scene, where only the picture repeats, and credits can run over new footage, where only the
+ * song repeats, so overlapping matches are joined.
+ */
+export function mergeEndings(picture: VideoThemes['ed'], song: VideoThemes['ed']): VideoThemes['ed'] {
+  if (!picture || !song) return song ?? picture;
+  if (picture.start >= song.end || song.start >= picture.end) return song;
+  const joined = { start: Math.min(picture.start, song.start), end: Math.max(picture.end, song.end) };
+  return joined.end - joined.start <= 130 ? joined : picture;
+}
+
+/**
  * Match the ending song between two episodes. This works when the credits run over episode-specific
  * footage, where the picture comparison finds nothing. Returns the range in each episode.
  */

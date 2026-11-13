@@ -198,6 +198,7 @@ function candidateOffsets(current: AudioPrint, reference: AudioPrint, limit = 12
 const wordBits = bandCount - 1;
 const blockErrorLimit = 0.3;
 const edgeErrorLimit = 0.35;
+const quietPadding = 3;
 
 /**
  * Find the longest stretch of shared soundtrack. Returns the stretch in both timelines.
@@ -271,16 +272,33 @@ export function matchAudioPrints(
   while (startWord < endWord && !matches(startWord)) startWord++;
   while (matches(endWord + 1)) endWord++;
   while (endWord > startWord && !matches(endWord)) endWord--;
-
-  const start = current.start + (startWord - 0.5) * current.step;
-  const end = current.start + (endWord + 0.5) * current.step;
-  if (end - start < minimumSeconds || end - start > maximumSeconds) return undefined;
-  const shift = reference.start - current.start + offset * current.step;
+  // Songs are padded by a moment of silence that the skip should cover too. Each episode uses its
+  // own silence: look just past the matched edge, then run to the far side of the quiet stretch.
   const round = (value: number) => Number(value.toFixed(2));
-  return {
-    current: { start: round(Math.max(current.start, start)), end: round(end) },
-    reference: { start: round(Math.max(reference.start, start + shift)), end: round(end + shift) }
+  const pad = (print: AudioPrint, firstWord: number, lastWord: number): AudioRange => {
+    const size = print.bits.length;
+    const reach = Math.round(0.5 / print.step);
+    const limit = Math.round(quietPadding / print.step);
+    const inside = (k: number) => k >= 0 && k < size;
+    const extend = (edge: number, direction: number) => {
+      let k = edge + direction;
+      for (let n = 0; n < reach && inside(k) && print.loud[k]; n++) k += direction;
+      if (!inside(k) || print.loud[k]) return edge;
+      for (let n = 0; n < limit && inside(k + direction) && !print.loud[k + direction]; n++) k += direction;
+      return k;
+    };
+    const first = extend(firstWord, -1);
+    const last = extend(lastWord, 1);
+    return {
+      start: round(Math.max(print.start, print.start + (first - 0.5) * print.step)),
+      end: round(print.start + (last + 0.5) * print.step)
+    };
   };
+  const mine = pad(current, startWord, endWord);
+  const theirs = pad(reference, startWord + offset, endWord + offset);
+  const length = mine.end - mine.start;
+  if (length < minimumSeconds || length > maximumSeconds + 2 * quietPadding) return undefined;
+  return { current: mine, reference: theirs };
 }
 
 /** Find a known ending's song (taken from another episode) inside this episode's ending window. */

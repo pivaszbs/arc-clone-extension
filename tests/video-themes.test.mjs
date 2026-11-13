@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { build } from 'esbuild';
 
 const { outputFiles } = await build({ entryPoints: ['src/japanese/video-themes.ts'], bundle: true, write: false, format: 'esm' });
-const { binarySearchFrameCut, confirmLateOpening, matchKnownEnding, matchKnownOpening, matchLateOpening, matchRecap, matchVideoThemes, overlapsRecap } = await import('data:text/javascript;base64,' + Buffer.from(outputFiles[0].text).toString('base64'));
+const { binarySearchFrameCut, confirmLateOpening, matchKnownEnding, matchKnownOpening, matchLateOpening, matchRecap, matchVideoThemes, mergeEndings, overlapsRecap } = await import('data:text/javascript;base64,' + Buffer.from(outputFiles[0].text).toString('base64'));
 const audioBuild = await build({ entryPoints: ['src/japanese/mp4-audio.ts'], bundle: true, write: false, format: 'esm' });
 const { findAudioSwitch } = await import('data:text/javascript;base64,' + Buffer.from(audioBuild.outputFiles[0].text).toString('base64'));
 
@@ -112,4 +112,14 @@ test('findAudioSwitch detects music entry and silence dip transitions', () => {
   const stepSwitch = findAudioSwitch(stepSamples, 11.5, 1.5);
   assert.ok(stepSwitch && Math.abs(stepSwitch.time - 11.6) <= 0.15, `got ${stepSwitch?.time}`);
   assert.ok(stepSwitch.strength >= 0.45);
+});
+
+test('joins overlapping picture and song endings, and falls back to whichever exists', () => {
+  // Song intro under the last scene: only the picture repeats there.
+  assert.deepEqual(mergeEndings({ start: 1341.75, end: 1431.85 }, { start: 1372.8, end: 1432.2 }), { start: 1341.75, end: 1432.2 });
+  assert.deepEqual(mergeEndings(undefined, { start: 1302, end: 1392.9 }), { start: 1302, end: 1392.9 });
+  assert.deepEqual(mergeEndings({ start: 1300, end: 1390 }, undefined), { start: 1300, end: 1390 });
+  // Separate matches: trust the song. A join longer than any ending keeps the picture match.
+  assert.deepEqual(mergeEndings({ start: 1200, end: 1260 }, { start: 1300, end: 1390 }), { start: 1300, end: 1390 });
+  assert.deepEqual(mergeEndings({ start: 1250, end: 1340 }, { start: 1300, end: 1390 }), { start: 1250, end: 1340 });
 });
