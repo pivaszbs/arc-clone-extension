@@ -22,6 +22,7 @@ namespace margelo::nitro::animecore {
       prototype.registerHybridMethod("episodeLabel", &HybridAnimeCoreSpec::episodeLabel);
       prototype.registerHybridMethod("pairEpisodes", &HybridAnimeCoreSpec::pairEpisodes);
       prototype.registerHybridMethod("cueIndexAt", &HybridAnimeCoreSpec::cueIndexAt);
+      prototype.registerHybridMethod("matchVideoThemes", &HybridAnimeCoreSpec::matchVideoThemes);
     });
   }
 

@@ -1,7 +1,7 @@
+import { getRegister } from './replica';
+import { skipRanges } from './theme-sidecar';
 import { Directory, File, Paths } from 'expo-file-system';
 import { animeCore, type EpisodePair, type SkipRanges } from 'react-native-anime-core';
-
-import * as replica from './replica';
 
 export type Episode = EpisodePair & {
   /** Path relative to the series folder, also the progress key inside it. */
@@ -26,25 +26,14 @@ function readJson(file: File): unknown {
   try { return file.exists ? JSON.parse(file.textSync()) : undefined; } catch { return undefined; }
 }
 
-function range(value: unknown) {
-  const item = value as { start?: unknown; end?: unknown } | undefined;
-  return item && typeof item.start === 'number' && typeof item.end === 'number' && item.end > item.start
-    ? { start: item.start, end: item.end } : undefined;
-}
-
-function skipRanges(value: unknown): SkipRanges {
-  const item = (value ?? {}) as Record<string, unknown>;
-  return { op: range(item.op), ed: range(item.ed), recap: range(item.recap) };
-}
-
 /**
  * Frame predictions come from the extension's video-themes queue. The app reads them from
  * either `video-themes.json` ({ "<file name>": { op, ed, recap } }) or `<episode>.themes.json`.
  */
-function framesFor(folder: Directory, seriesName: string, videoName: string, shared: Record<string, unknown>) {
-  // Timings synced from the Mac (desktop, worker or TV edits) win over exported files.
-  const synced = seriesName ? replica.get(`ep/${seriesName}/${videoName}/themes`) : undefined;
-  if (synced && typeof synced === 'object') return skipRanges(synced);
+function framesFor(folder: Directory, videoName: string, shared: Record<string, unknown>, seriesName: string) {
+  // Timings shared from the Mac (or found by any worker) win over sidecar files.
+  const replicated = seriesName ? getRegister(`ep/${seriesName}/${videoName}/themes`) : undefined;
+  if (replicated && typeof replicated === 'object') return skipRanges(replicated);
   const stem = videoName.replace(/\.[^.]+$/, '');
   const own = readJson(new File(folder, `${stem}.themes.json`));
   return skipRanges(own ?? shared[videoName]);
@@ -66,7 +55,7 @@ function readSeries(folder: Directory, name: string): Series | null {
       key: name ? `${name}/${pair.video}` : pair.video,
       videoUri: byName.get(pair.video)!.uri,
       subtitleUri: pair.subtitle ? byName.get(pair.subtitle)?.uri : undefined,
-      frames: framesFor(folder, name, pair.video, shared),
+      frames: framesFor(folder, pair.video, shared, name),
     })),
   };
 }
@@ -111,7 +100,11 @@ export async function importFiles() {
 }
 
 export async function readText(uri: string) {
+  if (/^https?:\/\//i.test(uri)) {
+    const res = await fetch(uri);
+    return res.ok ? await res.text() : '';
+  }
   const file = new File(uri);
   if ((file.size ?? 0) > 5_000_000) return '';
-  return file.text();
+  return file.textSync();
 }

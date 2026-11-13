@@ -447,7 +447,7 @@ bool letterOrNumber(char32_t c) {
 std::pair<std::string, size_t> normalizeKey(const std::string& text) {
   std::u32string out;
   size_t length = 0;
-  for (char32_t c : decode(text)) {
+  for (char32_t c : lower32(decode(text))) {
     if (c >= 0xFF01 && c <= 0xFF5E) c -= 0xFEE0;  // full-width ASCII
     if (c >= 'A' && c <= 'Z') c += 32;
     if (!letterOrNumber(c)) continue;
@@ -816,6 +816,191 @@ int cueIndexAt(const std::vector<Cue>& cues, double time) {
   for (auto index = it - cues.begin() - 1; index >= 0 && index >= (it - cues.begin()) - 8; index--)
     if (time < cues[index].end) return static_cast<int>(index);
   return -1;
+}
+
+namespace {
+
+constexpr size_t kFrameBytes = 12 * 8 * 3;
+constexpr int kThemeInterval = 2;
+
+struct FrameSample {
+  double time = 0;
+  const uint8_t* pixels = nullptr;
+};
+
+std::vector<uint8_t> decodeBase64(const std::string& input) {
+  static const int kLookup[256] = {
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+      52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+      -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+      15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+      -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+      41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  };
+  std::vector<uint8_t> out;
+  out.reserve((input.size() / 4) * 3);
+  int val = 0;
+  int valb = -8;
+  for (unsigned char c : input) {
+    int d = kLookup[c];
+    if (d == -1) continue;
+    val = (val << 6) + d;
+    valb += 6;
+    if (valb >= 0) {
+      out.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+      valb -= 8;
+    }
+  }
+  return out;
+}
+
+double frameDistance(const uint8_t* a, const uint8_t* b) {
+  int total = 0;
+  for (size_t i = 0; i < kFrameBytes; i++) {
+    total += std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i]));
+  }
+  return static_cast<double>(total) / static_cast<double>(kFrameBytes);
+}
+
+double alignedDistance(const uint8_t* sample, const std::vector<FrameSample>& reference, int aligned, int tolerance = 1) {
+  double best = std::numeric_limits<double>::infinity();
+  int refSize = static_cast<int>(reference.size());
+  for (int nearby = aligned - tolerance; nearby <= aligned + tolerance; nearby++) {
+    if (nearby >= 0 && nearby < refSize) {
+      best = std::min(best, frameDistance(sample, reference[nearby].pixels));
+    }
+  }
+  return best;
+}
+
+struct WindowMatch {
+  double start = 0;
+  double end = 0;
+  int hits = 0;
+  double mean = 0;
+  int offset = 0;
+};
+
+std::optional<WindowMatch> matchWindow(const std::vector<FrameSample>& current,
+                                       const std::vector<FrameSample>& reference,
+                                       double minimumSeconds) {
+  if (current.empty() || reference.empty()) return std::nullopt;
+  std::optional<WindowMatch> best;
+  const double maximumSeconds = 150.0;
+  const double minimumCoverage = 0.75;
+  const int maximumGap = 3;
+  const double maximumDistance = 30.0;
+  const int curLen = static_cast<int>(current.size());
+  const int refLen = static_cast<int>(reference.size());
+
+  for (int offset = -(curLen - 1) * kThemeInterval; offset < refLen; offset++) {
+    int first = 0, last = 0, hits = 0, changes = 0;
+    double total = 0.0;
+    auto consider = [&]() {
+      if (hits <= 0) return;
+      int span = last - first + 1;
+      double seconds = static_cast<double>((span - 1) * kThemeInterval);
+      double mean = total / static_cast<double>(hits);
+      if (seconds >= minimumSeconds && seconds <= maximumSeconds &&
+          static_cast<double>(hits) / static_cast<double>(span) >= minimumCoverage &&
+          changes >= 5 && mean <= 19.0 &&
+          (!best || hits > best->hits || (hits == best->hits && mean < best->mean))) {
+        best = WindowMatch{current[first].time, current[last].time, hits, mean, offset};
+      }
+    };
+    int from = std::max(0, static_cast<int>(std::ceil(-static_cast<double>(offset) / kThemeInterval)));
+    int to = std::min(curLen, static_cast<int>(std::ceil(static_cast<double>(refLen - offset) / kThemeInterval)));
+    for (int idx = from; idx < to; idx++) {
+      if (hits && idx - last > maximumGap) {
+        consider();
+        hits = 0;
+        changes = 0;
+        total = 0.0;
+      }
+      double diff = alignedDistance(current[idx].pixels, reference, idx * kThemeInterval + offset);
+      if (diff > maximumDistance) continue;
+      if (hits) {
+        if (frameDistance(current[idx].pixels, current[last].pixels) > 14.0) changes++;
+      } else {
+        first = idx;
+      }
+      last = idx;
+      hits++;
+      total += diff;
+    }
+    consider();
+  }
+  return best;
+}
+
+Range refineWindow(const std::vector<FrameSample>& current,
+                   const std::vector<FrameSample>& reference,
+                   const WindowMatch& best) {
+  int first = -1, last = -1;
+  for (int i = 0; i < static_cast<int>(current.size()); i++) {
+    if (first < 0 && current[i].time == best.start) first = i;
+    if (current[i].time == best.end) last = i;
+  }
+  if (first < 0 || last < 0) return {best.start, best.end};
+  auto matches = [&](int idx) {
+    return alignedDistance(current[idx].pixels, reference, idx + best.offset) <= 30.0;
+  };
+  while (first > 0 && matches(first - 1)) first--;
+  while (last < static_cast<int>(current.size()) - 1 && matches(last + 1)) last++;
+  double start = first > 0 ? (current[first - 1].time + current[first].time) / 2.0
+                           : std::max(0.0, current[first].time - 0.5);
+  double end = last < static_cast<int>(current.size()) - 1
+                   ? (current[last].time + current[last + 1].time) / 2.0
+                   : current[last].time + 0.5;
+  return {std::round(start * 100.0) / 100.0, std::round(end * 100.0) / 100.0};
+}
+
+std::optional<Range> matchPart(const FrameWindow& curWin, const FrameWindow& refWin, double minSeconds) {
+  auto curBytes = decodeBase64(curWin.dataBase64);
+  auto refBytes = decodeBase64(refWin.dataBase64);
+  size_t curCount = std::min(curWin.times.size(), curBytes.size() / kFrameBytes);
+  size_t refCount = std::min(refWin.times.size(), refBytes.size() / kFrameBytes);
+  if (curCount == 0 || refCount == 0) return std::nullopt;
+
+  std::vector<FrameSample> curSamples;
+  curSamples.reserve(curCount);
+  for (size_t i = 0; i < curCount; i++) {
+    curSamples.push_back({curWin.times[i], curBytes.data() + i * kFrameBytes});
+  }
+  std::vector<FrameSample> refSamples;
+  refSamples.reserve(refCount);
+  for (size_t i = 0; i < refCount; i++) {
+    refSamples.push_back({refWin.times[i], refBytes.data() + i * kFrameBytes});
+  }
+
+  std::vector<FrameSample> subsampled;
+  subsampled.reserve((curCount + 1) / kThemeInterval);
+  for (size_t i = 0; i < curCount; i += kThemeInterval) {
+    subsampled.push_back(curSamples[i]);
+  }
+
+  auto best = matchWindow(subsampled, refSamples, minSeconds);
+  if (!best) return std::nullopt;
+  return refineWindow(curSamples, refSamples, *best);
+}
+
+}  // namespace
+
+Skips matchVideoThemes(const VideoFingerprint& current, const VideoFingerprint& reference) {
+  Skips out;
+  out.op = matchPart(current.op, reference.op, 70.0);
+  out.ed = matchPart(current.ed, reference.ed, 60.0);
+  return out;
 }
 
 }  // namespace animecore::logic

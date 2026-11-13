@@ -23,6 +23,8 @@
   },
   "devDependencies": {
     "@types/react": "~19.3.0",
+    "eslint": "^9.0.0",
+    "eslint-config-expo": "~58.0.4",
     "nitrogen": "^0.37.2",
     "typescript": "~6.0.3"
   },
@@ -34,7 +36,8 @@
     "typecheck": "tsc --noEmit",
     "test:core": "npm --prefix modules/react-native-anime-core run test:core",
     "specs": "npm --prefix modules/react-native-anime-core run specs",
-    "doctor": "expo-doctor"
+    "doctor": "expo-doctor",
+    "lint": "expo lint"
   },
   "private": true
 }

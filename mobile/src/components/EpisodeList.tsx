@@ -12,10 +12,11 @@ type Props = {
   current?: string;
   progress: Record<string, Progress>;
   onSelect: (episode: Episode) => void;
+  onToggleWatched?: (episode: Episode) => void;
   header?: React.ReactElement;
 };
 
-export function EpisodeList({ episodes, current, progress, onSelect, header }: Props) {
+export function EpisodeList({ episodes, current, progress, onSelect, onToggleWatched, header }: Props) {
   const list = useRef<FlatList<Episode>>(null);
   const currentIndex = episodes.findIndex(episode => episode.key === current);
 
@@ -44,6 +45,7 @@ export function EpisodeList({ episodes, current, progress, onSelect, header }: P
             accessibilityRole="button"
             accessibilityState={{ selected: active }}
             onPress={() => onSelect(item)}
+            onLongPress={() => onToggleWatched?.(item)}
             style={({ pressed }) => [styles.row, active && styles.rowActive, pressed && styles.rowPressed]}
           >
             <View style={styles.text}>
@@ -53,8 +55,27 @@ export function EpisodeList({ episodes, current, progress, onSelect, header }: P
                 <View style={styles.progress}><View style={[styles.progressFill, { width: `${fraction * 100}%` }]} /></View>
               )}
             </View>
-            {saved?.finished ? <SymbolView name="checkmark.circle.fill" size={20} tintColor={colors.textTertiary} />
-              : active ? <SymbolView name="play.circle.fill" size={22} tintColor={colors.accent} /> : null}
+            {active ? <SymbolView name="play.circle.fill" size={22} tintColor={colors.accent} /> : null}
+            {onToggleWatched ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={saved?.finished ? `Mark ${item.label} unwatched` : `Mark ${item.label} watched`}
+                hitSlop={10}
+                onPress={event => {
+                  event.stopPropagation();
+                  onToggleWatched(item);
+                }}
+                style={({ pressed }) => [styles.watchedBtn, pressed && styles.watchedBtnPressed]}
+              >
+                <SymbolView
+                  name={saved?.finished ? 'checkmark.circle.fill' : 'checkmark.circle'}
+                  size={22}
+                  tintColor={saved?.finished ? '#34d399' : colors.textTertiary}
+                />
+              </Pressable>
+            ) : saved?.finished ? (
+              <SymbolView name="checkmark.circle.fill" size={20} tintColor={colors.textTertiary} />
+            ) : null}
           </Pressable>
         );
       }}
@@ -72,5 +93,7 @@ const styles = StyleSheet.create({
   status: { color: colors.textSecondary, fontSize: 13 },
   progress: { height: 3, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.12)', marginTop: 6, overflow: 'hidden' },
   progressFill: { height: 3, backgroundColor: colors.accent },
+  watchedBtn: { padding: 4, borderRadius: 16 },
+  watchedBtnPressed: { opacity: 0.6 },
   separator: { height: StyleSheet.hairlineWidth, backgroundColor: colors.separator, marginLeft: space.l * 2 },
 });

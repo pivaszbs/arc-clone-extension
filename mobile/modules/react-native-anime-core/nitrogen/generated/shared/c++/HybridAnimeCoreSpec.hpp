@@ -23,6 +23,8 @@ namespace margelo::nitro::animecore { struct SkipRanges; }
 namespace margelo::nitro::animecore { struct FolderTitle; }
 // Forward declaration of `EpisodePair` to properly resolve imports.
 namespace margelo::nitro::animecore { struct EpisodePair; }
+// Forward declaration of `VideoFingerprint` to properly resolve imports.
+namespace margelo::nitro::animecore { struct VideoFingerprint; }
 
 #include "Cue.hpp"
 #include <vector>
@@ -31,6 +33,7 @@ namespace margelo::nitro::animecore { struct EpisodePair; }
 #include "SkipRanges.hpp"
 #include "FolderTitle.hpp"
 #include "EpisodePair.hpp"
+#include "VideoFingerprint.hpp"
 
 namespace margelo::nitro::animecore {
 
@@ -71,6 +74,7 @@ namespace margelo::nitro::animecore {
       virtual std::string episodeLabel(const std::string& fileName) = 0;
       virtual std::vector<EpisodePair> pairEpisodes(const std::vector<std::string>& paths) = 0;
       virtual double cueIndexAt(const std::vector<Cue>& cues, double time) = 0;
+      virtual SkipRanges matchVideoThemes(const VideoFingerprint& current, const VideoFingerprint& reference) = 0;
 
     protected:
       // Hybrid Setup

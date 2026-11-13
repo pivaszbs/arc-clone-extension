@@ -50,6 +50,16 @@ struct EpisodePair {
   std::string label;
 };
 
+struct FrameWindow {
+  std::vector<double> times;
+  std::string dataBase64;
+};
+
+struct VideoFingerprint {
+  FrameWindow op;
+  FrameWindow ed;
+};
+
 // SRT / WebVTT, then ASS / SSA. Cues are sorted by start time.
 std::vector<Cue> parseSubtitles(const std::string& body);
 
@@ -77,5 +87,8 @@ std::vector<EpisodePair> pairEpisodes(const std::vector<std::string>& paths);
 
 // Index of the cue showing at `time`, or -1.
 int cueIndexAt(const std::vector<Cue>& cues, double time);
+
+// Match opening and ending frame fingerprints (12x8 RGB24) against a reference episode.
+Skips matchVideoThemes(const VideoFingerprint& current, const VideoFingerprint& reference);
 
 }  // namespace animecore::logic

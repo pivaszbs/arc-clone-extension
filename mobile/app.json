@@ -20,7 +20,7 @@
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
         },
-        "NSLocalNetworkUsageDescription": "Anime Study connects to your Mac to download episodes and sync progress and skip timings."
+        "NSLocalNetworkUsageDescription": "Anime Study connects to your Mac to stream, download and sync episodes, progress and skip timings."
       }
     },
     "android": {

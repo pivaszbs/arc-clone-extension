@@ -34,6 +34,10 @@ std::optional<ThemeSegment> fromCore(const std::optional<core::Segment>& segment
   return ThemeSegment(segment->start, segment->end, segment->source);
 }
 
+core::FrameWindow toCore(const FrameWindow& window) {
+  return core::FrameWindow{window.times, window.dataBase64};
+}
+
 }  // namespace
 
 std::vector<Cue> HybridAnimeCore::parseSubtitles(const std::string& body) {
@@ -78,6 +82,13 @@ std::vector<EpisodePair> HybridAnimeCore::pairEpisodes(const std::vector<std::st
 
 double HybridAnimeCore::cueIndexAt(const std::vector<Cue>& cues, double time) {
   return core::cueIndexAt(toCore(cues), time);
+}
+
+SkipRanges HybridAnimeCore::matchVideoThemes(const VideoFingerprint& current, const VideoFingerprint& reference) {
+  core::VideoFingerprint cur{toCore(current.op), toCore(current.ed)};
+  core::VideoFingerprint ref{toCore(reference.op), toCore(reference.ed)};
+  auto skips = core::matchVideoThemes(cur, ref);
+  return SkipRanges(fromCore(skips.op), fromCore(skips.ed), fromCore(skips.recap));
 }
 
 }  // namespace margelo::nitro::animecore
