@@ -95,8 +95,11 @@ export function unpair() {
 
 /** Series on the Mac. Falls back to the last copy, so the list still shows while the Mac is away. */
 export async function fetchCatalog(): Promise<RemoteSeries[]> {
-  const catalog = await request<{ series?: RemoteSeries[] }>('catalog.json');
-  const series = (catalog.series ?? []).filter(item => item && typeof item.folder === 'string' && item.folder);
+  const catalog = await request<{ series?: (Omit<RemoteSeries, 'folder'> & { folder?: string })[] }>('catalog.json');
+  // Servers from before v1.3.38 don't send `folder`; their title is the folder name unless renamed.
+  const series = (catalog.series ?? [])
+    .map(item => ({ ...item, folder: item?.folder || item?.title }))
+    .filter((item): item is RemoteSeries => typeof item.folder === 'string' && !!item.folder && Array.isArray(item.episodes));
   writeJson(catalogFile, series);
   return series;
 }
