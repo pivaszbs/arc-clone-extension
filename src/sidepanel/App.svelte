@@ -5,6 +5,7 @@
   import CommandPalette from '../shared/CommandPalette.svelte';
   import Icon from '../shared/Icon.svelte';
   import { containFocus, isActivationKey } from '../shared/focus';
+  import { findFolder, pinnedRows } from '../shared/pins';
   import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
   import {
     type ArcState,
@@ -78,6 +79,7 @@
   // New Folder inline prompt
   let showNewFolderInput = $state(false);
   let newFolderName = $state('');
+  let newFolderParentId = $state<string | undefined>(undefined);
 
   // Quick Translator drawer in Sidebar
   let showTranslator = $state(false);
@@ -132,6 +134,7 @@
     arcState.spaces.find((s) => s.id === arcState.activeSpaceId) || arcState.spaces[0]
   );
 
+  const newFolderParent = $derived(newFolderParentId && activeSpace ? findFolder(activeSpace.pinnedItems, newFolderParentId) : undefined);
   let spaceFavorites = $derived<FavoriteItem[]>(getSpaceFavorites(arcState, activeSpace?.id));
   let showAddFavForm = $state(false);
   let customFavUrl = $state('');
@@ -391,12 +394,20 @@
     if (!newFolderName.trim() || creatingFolder) return;
     creatingFolder = true;
     try {
-      const res = await requestArc({ type: 'CREATE_FOLDER', spaceId: activeSpace.id, title: newFolderName });
+      const res = await requestArc({ type: 'CREATE_FOLDER', spaceId: activeSpace.id, title: newFolderName, parentId: newFolderParentId });
       if (res?.state) arcState = res.state;
       newFolderName = '';
+      newFolderParentId = undefined;
       showNewFolderInput = false;
     } catch { notify('Could not create this folder. Try again.'); }
     finally { creatingFolder = false; }
+  }
+
+  function startNewFolder(parentId?: string) {
+    newFolderParentId = parentId;
+    newFolderName = '';
+    showNewFolderInput = parentId ? true : !showNewFolderInput;
+    showAddPinForm = false;
   }
 
   async function toggleFolder(folderId: string) {
@@ -626,10 +637,7 @@
         </button>
         <button
           class="mini-action-btn"
-          onclick={() => {
-            showNewFolderInput = !showNewFolderInput;
-            showAddPinForm = false;
-          }}
+          onclick={() => startNewFolder()}
           title="New Pinned Folder"
         >
           <Icon name="folder" size={14} />
@@ -676,10 +684,11 @@
       <div class="new-folder-box">
         <input
           type="text"
-          placeholder="Folder name"
+          placeholder={newFolderParent ? `Folder inside ${newFolderParent.title}` : 'Folder name'}
+          aria-label={newFolderParent ? `New folder inside ${newFolderParent.title}` : 'New folder name'}
           use:focusInput
           bind:value={newFolderName}
-          onkeydown={(e) => { if (e.key === 'Enter') createNewFolder(); if (e.key === 'Escape') { e.stopPropagation(); showNewFolderInput = false; } }}
+          onkeydown={(e) => { if (e.key === 'Enter') createNewFolder(); if (e.key === 'Escape') { e.stopPropagation(); showNewFolderInput = false; newFolderParentId = undefined; } }}
         />
         <button onclick={createNewFolder} disabled={creatingFolder || !newFolderName.trim()}>Add</button>
       </div>
@@ -688,94 +697,57 @@
     <!-- Pinned Tabs & Folders -->
     {#if activeSpace?.pinnedItems.length > 0}
       <section class="pinned-section">
-        {#each activeSpace.pinnedItems as item (item.id)}
+        {#each pinnedRows(activeSpace.pinnedItems, true) as { item, depth } (item.id)}
           {#if item.type === 'folder'}
-            <div class="folder-group">
-              <div
-                class="pinned-row folder-row" aria-expanded={!item.collapsed}
-                role="button"
-                tabindex="0"
-                onclick={() => toggleFolder(item.id)}
-                onkeydown={(e) => isActivationKey(e) && toggleFolder(item.id)}
-              >
-                <span class="folder-caret">{item.collapsed ? '▸' : '▾'}</span>
-                <span class="folder-icon"><Icon name="folder" size={16} /></span>
-                <span class="row-title">{item.title}</span>
-                <div class="row-hover-actions">
-                  <button class="row-btn" aria-label="Rename {item.title}" title="Rename" onclick={(event) => startRename(event, item.id, item.title)}>✎</button>
-                  {#if activeTab}
-                    <button
-                      class="row-btn"
-                      onclick={(e) => {
-                        e.stopPropagation();
-                        if (activeTab) pinTabToCurrentSpace(activeTab, item.id);
-                      }}
-                      title="Pin current tab into this folder"
-                    >
-                      +
-                    </button>
-                  {/if}
+            <div
+              class="pinned-row folder-row" aria-expanded={!item.collapsed}
+              style:padding-left={depth ? `${9 + depth * 16}px` : null}
+              role="button"
+              tabindex="0"
+              data-depth={depth}
+              onclick={() => toggleFolder(item.id)}
+              onkeydown={(e) => isActivationKey(e) && toggleFolder(item.id)}
+            >
+              <span class="folder-caret">{item.collapsed ? '▸' : '▾'}</span>
+              <span class="folder-icon"><Icon name="folder" size={16} /></span>
+              <span class="row-title">{item.title}</span>
+              <div class="row-hover-actions">
+                <button class="row-btn" aria-label="Rename {item.title}" title="Rename" onclick={(event) => startRename(event, item.id, item.title)}>✎</button>
+                <button
+                  class="row-btn"
+                  onclick={(e) => { e.stopPropagation(); startNewFolder(item.id); }}
+                  title="New folder inside {item.title}" aria-label="New folder inside {item.title}"
+                >
+                  <Icon name="folder" size={12} />
+                </button>
+                {#if activeTab}
                   <button
                     class="row-btn"
-                    onclick={(e) => removePinnedItem(e, item.id)}
-                    title="Delete folder" aria-label="Remove folder {item.title}"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      if (activeTab) pinTabToCurrentSpace(activeTab, item.id);
+                    }}
+                    title="Pin current tab into this folder"
                   >
-                    ×
+                    +
                   </button>
-                </div>
+                {/if}
+                <button
+                  class="row-btn"
+                  onclick={(e) => removePinnedItem(e, item.id)}
+                  title="Delete folder" aria-label="Remove folder {item.title}"
+                >
+                  ×
+                </button>
               </div>
-
-              {#if !item.collapsed}
-                <div class="folder-children">
-                  {#each item.children as child (child.id)}
-                    <div
-                      class="pinned-row child-row" class:active={isCurrentUrl(child.url) || activeTab?.id === child.tabId}
-                      role="button"
-                      tabindex="0"
-                      onclick={(e) => openUrlOrSwitch(child.url, e)}
-                      onkeydown={(e) => isActivationKey(e) && openUrlOrSwitch(child.url)}
-                      title="{child.title} ({child.url})"
-                    >
-                      {#if getFaviconUrl(child.url, child.favIconUrl)}
-                        <img
-                          src={getFaviconUrl(child.url, child.favIconUrl)}
-                          alt=""
-                          class="row-favicon"
-                        />
-                      {:else}
-                        <span class="row-favicon-fallback"><Icon name="globe" /></span>
-                      {/if}
-                      <span class="row-title">{child.title}</span>
-                      <div class="row-hover-actions">
-                        <button class="row-btn" aria-label="Rename {child.title}" title="Rename" onclick={(event) => startRename(event, child.id, child.title)}>✎</button>
-                        <button
-                          class="row-btn"
-                          onclick={(e) => {
-                            e.stopPropagation();
-                            chrome.runtime.sendMessage({ type: 'REQUEST_PEEK', url: child.url });
-                          }}
-                          title="Open in Peek / Little Arc"
-                        >
-                          <Icon name="eye" size={14} />
-                        </button>
-                        <button
-                          class="row-btn"
-                          onclick={(e) => removePinnedItem(e, child.id)}
-                          title="Unpin" aria-label="Unpin {child.title}"
-                        >
-                          ×
-                        </button>
-                      </div>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
             </div>
           {:else}
             <div
-              class="pinned-row" class:active={isCurrentUrl(item.url) || activeTab?.id === item.tabId}
+              class="pinned-row" class:child-row={depth > 0} class:active={isCurrentUrl(item.url) || activeTab?.id === item.tabId}
+              style:padding-left={depth ? `${9 + depth * 16}px` : null}
               role="button"
               tabindex="0"
+              data-depth={depth}
               onclick={(e) => openUrlOrSwitch(item.url, e)}
               onkeydown={(e) => isActivationKey(e) && openUrlOrSwitch(item.url)}
               title="{item.title} ({item.url}) — Shift+Click for Peek"
