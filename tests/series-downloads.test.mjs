@@ -173,6 +173,20 @@ test('plans combined fallback dubbing when primary team is missing episodes', as
   assert.equal(perEp.episodes[1].team, 'AniDUB');
   assert.equal(perEp.episodes[1].video.url, `${host}/translations/mp4/4002?height=720`);
 
+  const ordered = await resolveSeriesTeam(structuredClone(plan), ['AniDUB', 'AniLiberty']);
+  assert.equal(ordered.episodes[0].team, 'StudioBand Amediateka');
+  assert.equal(ordered.episodes[1].team, 'AniDUB', 'the secondary dubbing wins over the tertiary one');
+
+  const progress = [];
+  const planned = await planSeries(`${host}${ep1}/ozvuchka-3000`, (checked, total, partial) => progress.push([checked, total, !!partial]), { priorities: ['AniLiberty', 'AniDUB'] });
+  assert.equal(planned.episodes[0].team, 'StudioBand Amediateka');
+  assert.equal(planned.episodes[1].team, 'AniLiberty', 'saved priorities fill gaps in one check');
+  assert.equal(planned.episodes[1].video.url, `${host}/translations/mp4/4001?height=1080`);
+  assert.deepEqual(progress[0], [0, 2, true], 'the episode list shows before pages load');
+
+  const general = await planSeries(`${host}${ep1}/ozvuchka-3000`.replace('ozvuchka-3000', 'ozvuchka'), () => {}, { priorities: ['AniDUB'] });
+  assert.equal(general.episodes[1].team, 'AniDUB', 'a general dub link follows the saved primary');
+
   const cleared = await resolveSeriesTeam(structuredClone(combined), undefined);
   assert.equal(cleared.episodes[0].team, 'StudioBand Amediateka');
   assert.equal(cleared.episodes[1].video, undefined);

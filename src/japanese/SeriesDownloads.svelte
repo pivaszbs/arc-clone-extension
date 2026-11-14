@@ -4,11 +4,13 @@
   import {
     AUTO_FALLBACK,
     currentEpisodeDownloads,
+    normalizeTeamOrder,
     planSeries,
     resolveEpisodeVariant,
     resolveSeriesTeam,
     type SeriesPlan
   } from './series';
+  import { loadDubOrder, saveDubOrder } from './dub-order';
   import type { EpisodeDownloads } from './page-captions';
   import type { SeriesQueue } from '../background/series-downloads';
 
@@ -17,10 +19,13 @@
   let url = $state(source);
   let episode = $state<EpisodeDownloads | null>(null);
   let plan = $state<SeriesPlan>();
-  let fallbackTeam = $state('');
+  /** This series' dubbing order, primary first; AUTO_FALLBACK last means "then any other". */
+  let order = $state<string[]>([]);
+  let savedOrder: string[] = [];
   let selectedPages = $state<string[]>([]);
   let queue = $state<SeriesQueue>();
   let status = $state('');
+  let progress = $state<{ checked: number; total: number }>();
   let busy = $state(false);
   const ready = $derived(plan?.episodes.filter(episode => episode.video) || []);
   const activeTeams = $derived.by(() => {
@@ -31,26 +36,24 @@
     return teams;
   });
   const summaryEdition = $derived(activeTeams.length ? activeTeams.join(' + ') : plan?.edition || '');
-  const fallbackOptions = $derived.by(() => {
-    if (!plan?.primaryTeam) return [];
-    const primary = plan.primaryTeam.toLowerCase();
-    const missing = plan.episodes.filter(ep => !ep.variants?.some(v => v.team.toLowerCase() === primary));
-    if (!missing.length && !fallbackTeam) return [];
-    const stats = new Map<string, { team: string; fills: number; total: number }>();
-    for (const ep of plan.episodes) {
+  /** Every dubbing the series has, with how many episodes each one covers. */
+  const teamStats = $derived.by(() => {
+    const stats = new Map<string, { team: string; total: number }>();
+    for (const ep of plan?.episodes || []) {
       for (const variant of ep.variants || []) {
         const key = variant.team.toLowerCase();
-        if (key === primary) continue;
-        const entry = stats.get(key) || { team: variant.team, fills: 0, total: 0 };
+        const entry = stats.get(key) || { team: variant.team, total: 0 };
         entry.total += 1;
-        if (missing.includes(ep)) entry.fills += 1;
         stats.set(key, entry);
       }
     }
-    return [...stats.values()]
-      .filter(item => item.fills > 0)
-      .sort((a, b) => b.fills - a.fills || b.total - a.total);
+    return [...stats.values()].sort((a, b) => b.total - a.total || a.team.localeCompare(b.team));
   });
+  const isDubPlan = $derived(!!plan && plan.edition !== 'Japanese subtitles' && teamStats.length > 0);
+  const namedOrder = $derived(order.filter(team => team !== AUTO_FALLBACK));
+  const anyOther = $derived(order.includes(AUTO_FALLBACK));
+  const addable = $derived(teamStats.filter(item => !namedOrder.some(team => team.toLowerCase() === item.team.toLowerCase())));
+  const coverage = (team: string) => teamStats.find(item => item.team.toLowerCase() === team.toLowerCase())?.total || 0;
   const completed = $derived(queue?.files.filter(file => file.state === 'done').length || 0);
   const failed = $derived(queue?.files.filter(file => file.state === 'failed') || []);
   const activeFile = $derived(queue?.files.find(file => file.state === 'downloading'));
@@ -66,24 +69,34 @@
 
   onMount(() => {
     void refresh();
+    void loadDubOrder().then(saved => { savedOrder = saved; });
     if (source) void currentEpisodeDownloads(source).then(downloads => { episode = downloads; }).catch(() => {});
     const timer = setInterval(refresh, 2000);
     return () => clearInterval(timer);
   });
+
+  function track(checked: number, total: number, partial?: SeriesPlan) {
+    progress = { checked: Math.min(checked, total), total };
+    status = checked < total ? `Checking episodes · ${checked} of ${total}` : 'Picking dubbing…';
+    if (partial) plan = structuredClone(partial);
+  }
 
   async function checkSeries(event: SubmitEvent) {
     event.preventDefault();
     if (busy) return;
     busy = true;
     plan = undefined;
-    fallbackTeam = '';
     selectedPages = [];
-    status = 'Checking episodes…';
+    status = 'Opening the series…';
+    progress = undefined;
     try {
-      plan = await planSeries(url.trim(), (checked, total) => { status = `Checked ${checked} of ${total} episodes`; });
+      savedOrder = await loadDubOrder();
+      const loaded = await planSeries(url.trim(), track, { priorities: savedOrder });
+      plan = loaded;
+      order = normalizeTeamOrder([loaded.primaryTeam, ...savedOrder]);
       status = '';
     } catch (error) { status = error instanceof Error ? error.message : 'Could not check this series.'; }
-    finally { busy = false; }
+    finally { busy = false; progress = undefined; }
   }
 
   function pruneSelected(nextPlan: SeriesPlan) {
@@ -91,19 +104,42 @@
     selectedPages = selectedPages.filter(page => available.has(page));
   }
 
-  async function applyFallback() {
+  /** Change the dubbing order, remember it for every series, and re-pick each episode. */
+  async function setOrder(next: string[]) {
     if (busy || !plan) return;
+    order = normalizeTeamOrder(next);
+    savedOrder = order;
+    void saveDubOrder(order);
+    const effective = order.length ? order : [AUTO_FALLBACK];
     busy = true;
-    status = fallbackTeam ? 'Checking fallback episodes…' : '';
+    status = 'Picking dubbing…';
     try {
-      const updated = await resolveSeriesTeam($state.snapshot(plan), fallbackTeam || undefined, (checked, total) => {
-        status = `Checking fallback episodes (${checked} of ${total})`;
+      const primaryTeam = effective[0] === AUTO_FALLBACK ? undefined : effective[0];
+      const updated = await resolveSeriesTeam({ ...$state.snapshot(plan), primaryTeam }, effective, (checked, total) => {
+        progress = { checked, total };
+        status = `Loading other dubbing · ${checked} of ${total}`;
       });
       plan = updated;
       pruneSelected(updated);
       status = '';
-    } catch (error) { status = error instanceof Error ? error.message : 'Could not load fallback dubbing.'; }
-    finally { busy = false; }
+    } catch (error) { status = error instanceof Error ? error.message : 'Could not load that dubbing.'; }
+    finally { busy = false; progress = undefined; }
+  }
+
+  function move(index: number, by: number) {
+    const next = [...namedOrder];
+    const [team] = next.splice(index, 1);
+    next.splice(Math.max(0, Math.min(next.length, index + by)), 0, team);
+    void setOrder(anyOther ? [...next, AUTO_FALLBACK] : next);
+  }
+
+  function remove(index: number) {
+    const next = namedOrder.filter((_, i) => i !== index);
+    void setOrder(anyOther ? [...next, AUTO_FALLBACK] : next);
+  }
+
+  function add(team: string) {
+    if (team) void setOrder([...namedOrder, team, ...(anyOther ? [AUTO_FALLBACK] : [])]);
   }
 
   async function changeEpisodeTeam(episodePage: string, team: string) {
@@ -163,19 +199,42 @@
     </div>
   </form>
   {#if status}<p role="status">{status}</p>{/if}
+  {#if busy && progress}<progress aria-label="Checking progress" max={progress.total} value={progress.checked}></progress>{/if}
   {#if plan}
     <p><strong>{summaryEdition}</strong> · {ready.length} of {plan.episodes.length} episodes available</p>
-    {#if fallbackOptions.length}
-      <div class="row fallback">
-        <label for="fallback-team">Fallback dubbing</label>
-        <select id="fallback-team" bind:value={fallbackTeam} onchange={applyFallback} disabled={busy}>
-          <option value="">None ({plan.edition || 'Primary'} only)</option>
-          <option value={AUTO_FALLBACK}>Any available dubbing</option>
-          {#each fallbackOptions as option (option.team)}
-            <option value={option.team}>{option.team} ({option.fills} missing · {option.total}/{plan.episodes.length})</option>
-          {/each}
-        </select>
-      </div>
+    {#if isDubPlan}
+      <fieldset class="dub-order" disabled={busy}>
+        <legend>Dubbing order</legend>
+        <p class="hint">Each episode uses the first dubbing on this list that has it. The order is saved for every series.</p>
+        {#if namedOrder.length}
+          <ol aria-label="Dubbing order">
+            {#each namedOrder as team, index (team)}
+              <li>
+                <span class="rank">{['Primary', 'Secondary', 'Third'][index] || `#${index + 1}`}</span>
+                <span class="team">{team}</span>
+                <span class="count">{coverage(team)}/{plan.episodes.length}</span>
+                <button type="button" class="icon" aria-label={`Move ${team} up`} disabled={index === 0} onclick={() => move(index, -1)}>↑</button>
+                <button type="button" class="icon" aria-label={`Move ${team} down`} disabled={index === namedOrder.length - 1} onclick={() => move(index, 1)}>↓</button>
+                <button type="button" class="icon" aria-label={`Remove ${team}`} onclick={() => remove(index)}>×</button>
+              </li>
+            {/each}
+          </ol>
+        {/if}
+        <div class="row">
+          {#if addable.length}
+            <select aria-label="Add a dubbing" value="" onchange={(e) => { add(e.currentTarget.value); e.currentTarget.value = ''; }}>
+              <option value="">{namedOrder.length ? 'Add a fallback dubbing…' : 'Choose a dubbing…'}</option>
+              {#each addable as option (option.team)}
+                <option value={option.team}>{option.team} ({option.total}/{plan.episodes.length})</option>
+              {/each}
+            </select>
+          {/if}
+          <label class="any">
+            <input type="checkbox" checked={anyOther} onchange={(e) => setOrder(e.currentTarget.checked ? [...namedOrder, AUTO_FALLBACK] : namedOrder)} />
+            Then any other dubbing
+          </label>
+        </div>
+      </fieldset>
     {/if}
     {#if ready.length}
       <div class="row">
@@ -214,7 +273,7 @@
               </select>
             </div>
           {:else}
-            <span>{episode.label} · Unavailable</span>
+            <span>{episode.label} · {busy ? 'Checking…' : 'Unavailable'}</span>
           {/if}
         </li>
       {/each}
@@ -243,7 +302,18 @@
   summary { cursor: pointer; font-weight: 650; }
   form { margin-top: 12px; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; }
-  .fallback { align-items: center; margin-bottom: 8px; }
+  .dub-order { margin: 8px 0; padding: 10px 12px; border: 1px solid #ffffff1f; border-radius: 8px; }
+  .dub-order legend { padding: 0 4px; font-weight: 600; }
+  .dub-order .hint { margin: 0 0 8px; opacity: .7; font-size: .9em; }
+  .dub-order ol { list-style: none; margin: 0 0 8px; padding: 0; max-height: none; }
+  .dub-order li { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
+  .dub-order .rank { min-width: 72px; font-size: .8em; opacity: .65; text-transform: uppercase; letter-spacing: .03em; }
+  .dub-order .team { flex: 1; min-width: 0; }
+  .dub-order .count { font-size: .85em; opacity: .7; font-variant-numeric: tabular-nums; }
+  .dub-order .icon { padding: 1px 7px; line-height: 1.3; }
+  .dub-order .any { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .dub-order .row { align-items: center; }
+  progress { width: 100%; height: 6px; margin: 2px 0 8px; accent-color: var(--accent, #ff8248); }
   .ep-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .episode { margin-top: 12px; gap: 16px; }
   a { color: var(--accent, #ff8248); }

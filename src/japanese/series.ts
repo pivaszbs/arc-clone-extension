@@ -139,7 +139,48 @@ function editionLink(page: CatalogPage & { url: URL }, episode: URL, category: s
   return links.find(link => link.url.pathname === page.url.pathname) || null;
 }
 
-export async function planSeries(value: string, onProgress: (checked: number, total: number) => void): Promise<SeriesPlan> {
+/** Anime365 pages read at once; enough to be quick without looking like a flood. */
+const PARALLEL_PAGES = 4;
+
+async function eachLimited<T>(items: T[], run: (item: T) => Promise<void>) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const item = items[next++];
+      try { await run(item); } catch { /* Keep the episode visible as unavailable. */ }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PARALLEL_PAGES, items.length) }, worker));
+}
+
+/** Dubbing order without repeats (case-insensitive) or blanks; "any other dubbing" stays last. */
+export function normalizeTeamOrder(teams: (string | undefined)[]) {
+  const seen = new Set<string>();
+  const order: string[] = [];
+  let any = false;
+  for (const team of teams) {
+    const name = team?.trim();
+    if (!name) continue;
+    if (name === AUTO_FALLBACK) { any = true; continue; }
+    if (seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    order.push(name);
+  }
+  return any ? [...order, AUTO_FALLBACK] : order;
+}
+
+export type PlanProgress = (checked: number, total: number, partial?: SeriesPlan) => void;
+
+/**
+ * Reads every episode of the series. Dubbed editions then pick each episode's dubbing from
+ * `priorities` (primary first; AUTO_FALLBACK means "any other dubbing"), after the team of the
+ * edition the link points to. Pages load a few at a time and `onProgress` gets the plan so far.
+ */
+export async function planSeries(
+  value: string,
+  onProgress: PlanProgress,
+  options: { priorities?: string[] } = {}
+): Promise<SeriesPlan> {
   const series = seriesRoot(value);
   const source = new URL(value);
   const [, episodeSlug, editionSlug] = source.pathname.slice(series.pathname.length).split('/');
@@ -148,12 +189,11 @@ export async function planSeries(value: string, onProgress: (checked: number, to
   const isDub = category === 'ozvuchka' || category === 'angliyskaya-ozvuchka';
   const sourceEpisode = episodeSlug && new URL(`${series.pathname}/${episodeSlug}`, series);
   const exactEdition = !!sourceEpisode && !!editionSlug && /-\d+$/.test(editionSlug);
-  const selected = exactEdition ? await readPage(source) : null;
+  const [selected, catalog] = await Promise.all([exactEdition ? readPage(source) : null, readPage(series)]);
   const team = selected && sourceEpisode && isDub
     ? editionLink(selected, sourceEpisode, category)?.label : undefined;
   const edition = studyEdition ? 'Japanese subtitles'
     : team || selected?.editionTitle || category;
-  const catalog = await readPage(series);
   const episodes = new Map<string, SeriesEpisode>();
   for (const link of catalog.links) {
     let url: URL;
@@ -166,58 +206,60 @@ export async function planSeries(value: string, onProgress: (checked: number, to
   }
   const list = [...episodes.values()].sort((a, b) => a.page.localeCompare(b.page, undefined, { numeric: true }));
   if (!list.length) throw new Error('No episodes were listed on this series page.');
-  for (const [index, episode] of list.entries()) {
-    onProgress(index, list.length);
+  const plan: SeriesPlan = { series: series.href, title: catalog.title || series.pathname.split('/').at(-1)!, edition, primaryTeam: team, episodes: list };
+  // A link to one exact dub picks only that team unless other dubbings are allowed; a general dub
+  // link takes whatever each episode has.
+  const order = isDub ? normalizeTeamOrder([team, ...(options.priorities || []), ...(team ? [] : [AUTO_FALLBACK])]) : [];
+  const resolveDubs = order.length > 0 && (order.length > 1 || order[0] !== AUTO_FALLBACK || !!team);
+  let checked = 0;
+  onProgress(0, list.length, plan);
+
+  await eachLimited(list, async episode => {
     try {
       const episodeUrl = new URL(episode.page);
       const variant = new URL(`${episode.page}/${category}`);
       const isSelectedEpisode = sourceEpisode && episodeUrl.pathname === sourceEpisode.pathname;
-      if (exactEdition && isDub && !team && !isSelectedEpisode) continue;
-      let page = isSelectedEpisode && selected ? selected : await readPage(variant);
-      const variants: SeriesEpisodeVariant[] = !studyEdition
-        ? allEditionLinks(page, episodeUrl, category).map(link => ({ team: link.label, page: link.url.href }))
-        : [];
-      const cacheDownloads = (loaded: CatalogPage & { url: URL }) => {
-        const found = findEpisodeDownloads(loaded.links, loaded.url);
-        if (!found?.video) return null;
-        const active = variants.find(item => new URL(item.page).pathname === loaded.url.pathname);
-        if (active) {
-          active.video = found.video;
-          active.subtitle = found.subtitle;
-        }
-        return { downloads: found, team: active?.team || editionLink(loaded, episodeUrl, category)?.label };
-      };
-      const initialCached = !studyEdition ? cacheDownloads(page) : null;
-      if (variants.length) episode.variants = variants;
-
-      if (team && !isSelectedEpisode) {
-        const match = editionLink(page, episodeUrl, category, team);
-        if (!match) continue;
-        if (match.url.pathname !== page.url.pathname) page = await readPage(match.url);
-        if (page.url.pathname !== match.url.pathname) continue;
-      }
+      if (exactEdition && isDub && !team && !isSelectedEpisode) return;
+      const page = isSelectedEpisode && selected ? selected : await readPage(variant);
       const { links, url } = page;
-      if (url.pathname !== variant.pathname && !url.pathname.startsWith(variant.pathname + '-')) continue;
-      if (isSelectedEpisode && exactEdition && url.pathname !== source.pathname) continue;
-      const resolved = !studyEdition ? cacheDownloads(page) : null;
-      const downloads = resolved?.downloads || findEpisodeDownloads(links, url);
-      if (!downloads?.video) continue;
+      const onEdition = url.pathname === variant.pathname || url.pathname.startsWith(variant.pathname + '-');
       if (!studyEdition) {
+        const variants: SeriesEpisodeVariant[] = allEditionLinks(page, episodeUrl, category)
+          .map(link => ({ team: link.label, page: link.url.href }));
+        if (variants.length) episode.variants = variants;
+        if (!onEdition || (isSelectedEpisode && exactEdition && url.pathname !== source.pathname)) return;
+        const downloads = findEpisodeDownloads(links, url);
+        if (!downloads?.video) return;
+        const active = variants.find(item => new URL(item.page).pathname === url.pathname);
+        if (active) {
+          active.video = downloads.video;
+          active.subtitle = downloads.subtitle;
+        }
+        const loadedTeam = active?.team || editionLink(page, episodeUrl, category)?.label;
+        // With a dubbing order the second pass decides; keep the loaded one only when it is the primary.
+        if (resolveDubs && (variants.length || team) && loadedTeam?.toLowerCase() !== order[0]?.toLowerCase()) return;
         episode.video = downloads.video;
-        episode.team = resolved?.team || initialCached?.team || editionLink(page, episodeUrl, category)?.label;
-        continue;
+        episode.team = loadedTeam;
+        return;
       }
-      if (!downloads.subtitle) continue;
+      if (!onEdition) return;
+      const downloads = findEpisodeDownloads(links, url);
+      if (!downloads?.video || !downloads.subtitle) return;
       if (new URL(downloads.video.url).pathname.split('/').filter(Boolean).at(-1) !==
-          new URL(downloads.subtitle).pathname.split('/').filter(Boolean).at(-1)) continue;
+          new URL(downloads.subtitle).pathname.split('/').filter(Boolean).at(-1)) return;
       const response = await fetch(downloads.subtitle, { credentials: 'include', signal: AbortSignal.timeout(8000) });
-      if (!response.ok || Number(response.headers.get('content-length')) > 5000000) continue;
-      if (!japaneseCaptions(parseCaptionResponse(await response.text()))) continue;
+      if (!response.ok || Number(response.headers.get('content-length')) > 5000000) return;
+      if (!japaneseCaptions(parseCaptionResponse(await response.text()))) return;
       Object.assign(episode, downloads);
-    } catch { /* Keep the episode visible as unavailable. */ }
-  }
-  onProgress(list.length, list.length);
-  return { series: series.href, title: catalog.title || series.pathname.split('/').at(-1)!, edition, primaryTeam: team, episodes: list };
+    } finally {
+      checked += 1;
+      onProgress(checked, list.length, plan);
+    }
+  });
+  if (!resolveDubs) return { ...plan, episodes: [...list] };
+  return resolveSeriesTeam(plan, order.slice(team ? 1 : 0), (done, total) => {
+    onProgress(list.length + done, list.length + total, plan);
+  });
 }
 
 async function loadVariant(variant: SeriesEpisodeVariant): Promise<SeriesEpisodeVariant> {
@@ -233,12 +275,16 @@ async function loadVariant(variant: SeriesEpisodeVariant): Promise<SeriesEpisode
   return variant;
 }
 
+/**
+ * Picks each episode's dubbing: the plan's primary team, then `fallbacks` in order
+ * (AUTO_FALLBACK = the team that covers the most episodes). Missing pages load in parallel.
+ */
 export async function resolveSeriesTeam(
   plan: SeriesPlan,
-  fallbackTeam: string | undefined,
+  fallbacks: string | string[] | undefined,
   onProgress?: (checked: number, total: number) => void
 ): Promise<SeriesPlan> {
-  const primaryTeam = plan.primaryTeam;
+  const order = normalizeTeamOrder([plan.primaryTeam, ...(Array.isArray(fallbacks) ? fallbacks : [fallbacks])]);
   const counts = new Map<string, number>();
   for (const episode of plan.episodes) {
     for (const variant of episode.variants || []) {
@@ -246,51 +292,42 @@ export async function resolveSeriesTeam(
       counts.set(key, (counts.get(key) || 0) + 1);
     }
   }
+  const byCoverage = (variants: SeriesEpisodeVariant[]) => [...variants].sort((a, b) =>
+    (counts.get(b.team.toLowerCase()) || 0) - (counts.get(a.team.toLowerCase()) || 0));
 
-  const targets: { episode: SeriesEpisode; variant?: SeriesEpisodeVariant }[] = [];
-  for (const episode of plan.episodes) {
-    const variants = episode.variants || [];
-    if (!variants.length) continue;
-    let chosen = primaryTeam
-      ? variants.find(v => v.team.toLowerCase() === primaryTeam.toLowerCase())
-      : undefined;
-    if (!chosen && fallbackTeam) {
-      if (fallbackTeam === AUTO_FALLBACK) {
-        chosen = [...variants].sort((a, b) =>
-          (counts.get(b.team.toLowerCase()) || 0) - (counts.get(a.team.toLowerCase()) || 0)
-        )[0];
-      } else {
-        chosen = variants.find(v => v.team.toLowerCase() === fallbackTeam.toLowerCase());
-      }
+  /** Candidates for one episode, best first; later ones are tried when an earlier page has no video. */
+  const candidates = (variants: SeriesEpisodeVariant[]) => {
+    const picked: SeriesEpisodeVariant[] = [];
+    for (const team of order) {
+      const matches = team === AUTO_FALLBACK ? byCoverage(variants)
+        : variants.filter(v => v.team.toLowerCase() === team.toLowerCase());
+      for (const match of matches) if (!picked.includes(match)) picked.push(match);
     }
-    targets.push({ episode, variant: chosen });
-  }
+    return picked;
+  };
 
-  const toFetch = targets.filter(item => item.variant && !item.variant.video);
+  const targets = plan.episodes
+    .filter(episode => episode.variants?.length)
+    .map(episode => ({ episode, options: candidates(episode.variants!) }));
+  const total = targets.filter(item => item.options.length && !item.options[0].video).length;
   let checked = 0;
-  for (const { episode, variant } of targets) {
-    if (!variant) {
-      episode.video = undefined;
-      episode.subtitle = undefined;
-      episode.team = undefined;
-      continue;
+  if (total) onProgress?.(0, total);
+  await eachLimited(targets, async ({ episode, options }) => {
+    let chosen: SeriesEpisodeVariant | undefined;
+    let fetched = false;
+    for (const option of options) {
+      if (!option.video) {
+        fetched = true;
+        try { await loadVariant(option); } catch { /* Try the next dubbing. */ }
+      }
+      if (option.video) { chosen = option; break; }
     }
-    if (!variant.video) {
-      onProgress?.(checked, toFetch.length);
-      try { await loadVariant(variant); } catch { /* Keep unavailable if fetch fails. */ }
-      checked += 1;
-    }
-    if (variant.video) {
-      episode.video = variant.video;
-      episode.subtitle = variant.subtitle;
-      episode.team = variant.team;
-    } else {
-      episode.video = undefined;
-      episode.subtitle = undefined;
-      episode.team = undefined;
-    }
-  }
-  if (toFetch.length) onProgress?.(toFetch.length, toFetch.length);
+    episode.video = chosen?.video;
+    episode.subtitle = chosen?.subtitle;
+    episode.team = chosen?.team;
+    if (fetched) onProgress?.(++checked, total);
+  });
+  if (total) onProgress?.(total, total);
   return { ...plan, episodes: [...plan.episodes] };
 }
 
