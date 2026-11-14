@@ -2,7 +2,7 @@ import { useEventListener } from 'expo';
 import { SymbolView } from 'expo-symbols';
 import { isPictureInPictureSupported, useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Animated as RNAnimated, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
+import { ActivityIndicator, Animated as RNAnimated, Pressable, StyleSheet, Text, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
 import type { TimeRange } from 'react-native-anime-core';
 
@@ -284,7 +284,6 @@ export function Player(props: Props) {
 
   // Swipe down to leave fullscreen: the video follows the finger, shrinks and rounds its corners,
   // then either closes (far enough or flicked) or springs back.
-  const { height: screenHeight } = useWindowDimensions();
   const videoView = useRef<VideoView>(null);
   // Split View / Slide Over: a narrow window keeps only the essential controls.
   const narrow = width < 560;
@@ -293,10 +292,10 @@ export function Player(props: Props) {
   const [dragY] = useState(() => new RNAnimated.Value(0));
   const dismiss = useCallback(() => {
     haptics.tap();
-    props.onToggleFullscreen(false, true);
-    // With PiP on, the player stays mounted (hidden); put it back in place for when it returns.
-    setTimeout(() => dragY.setValue(0), 300);
-  }, [props, dragY]);
+    // Not "swiped": App shrinks the player back into the card it came from, while the drag offset
+    // eases back to 0, so it flies from where the finger left it into the card.
+    props.onToggleFullscreen(false, false);
+  }, [props]);
   const swipeDown = usePanGesture({
     enabled: fullscreen,
     runOnJS: true,
@@ -307,7 +306,7 @@ export function Player(props: Props) {
     },
     onDeactivate: event => {
       if (event.translationY > 140 || (event.velocityY > 900 && event.translationY > 40)) {
-        RNAnimated.timing(dragY, { toValue: screenHeight, duration: 220, useNativeDriver: true }).start();
+        RNAnimated.timing(dragY, { toValue: 0, duration: 280, useNativeDriver: true }).start();
         dismiss();
       } else {
         RNAnimated.spring(dragY, { toValue: 0, velocity: event.velocityY / 1000, bounciness: 4, useNativeDriver: true }).start();
