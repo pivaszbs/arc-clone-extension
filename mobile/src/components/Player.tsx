@@ -38,6 +38,14 @@ const DOUBLE_TAP_MS = 280;
 function isPlaying(player: { playing: boolean }) {
   try { return player.playing; } catch { return false; }
 }
+
+/**
+ * Run something on the video player, or fall back if the native player is already released.
+ * A released player throws on every call and would otherwise close the app.
+ */
+function safe<T>(action: () => T, fallback: T): T {
+  try { return action(); } catch { return fallback; }
+}
 const SKIP_SECONDS = 10;
 const HIDE_AFTER_MS = 3000;
 const skipOrder: SkipPart[] = ['recap', 'op', 'ed'];
@@ -99,9 +107,11 @@ export function Player(props: Props) {
   useEventListener(player, 'statusChange', ({ status }) => {
     if (status !== 'readyToPlay' || ready) return;
     setReady(true);
-    setDuration(player.duration);
-    if (resumeAt.current > 1) player.currentTime = resumeAt.current;
-    if (props.autoPlay) player.play();
+    safe(() => {
+      setDuration(player.duration);
+      if (resumeAt.current > 1) player.currentTime = resumeAt.current;
+      if (props.autoPlay) player.play();
+    }, undefined);
   });
   useEventListener(player, 'playingChange', ({ isPlaying }) => {
     setPlaying(isPlaying);
@@ -114,7 +124,7 @@ export function Player(props: Props) {
   });
   useEventListener(player, 'timeUpdate', ({ currentTime }) => {
     setTime(currentTime);
-    if (Date.now() - lastSaved.current > 5000 && player.playing) save();
+    if (Date.now() - lastSaved.current > 5000 && isPlaying(player)) save();
   });
 
   // ----- Controls visibility -----
@@ -139,22 +149,21 @@ export function Player(props: Props) {
   // ----- Playback actions -----
 
   const seekTo = useCallback((seconds: number) => {
-    const total = player.duration || duration;
+    const total = safe(() => player.duration, 0) || duration;
     const target = Math.max(0, total ? Math.min(total - 0.25, seconds) : seconds);
-    player.currentTime = target;
+    safe(() => { player.currentTime = target; }, undefined);
     setTime(target);
   }, [player, duration]);
 
   const togglePlay = useCallback(() => {
-    if (player.playing) player.pause();
-    else player.play();
+    safe(() => { if (player.playing) player.pause(); else player.play(); }, undefined);
     haptics.tap();
     poke();
   }, [player, poke]);
 
   const seekBy = useCallback((seconds: number, side: 'left' | 'right') => {
-    const total = player.duration || duration;
-    const at = player.currentTime;
+    const total = safe(() => player.duration, 0) || duration;
+    const at = safe(() => player.currentTime, 0);
     if ((seconds < 0 && at <= 0.5) || (seconds > 0 && total && at >= total - 1)) haptics.edge();
     else haptics.seek();
     seekTo(at + seconds);
@@ -194,7 +203,7 @@ export function Player(props: Props) {
   const playFullscreen = useCallback(() => {
     haptics.tap();
     props.onToggleFullscreen(true);
-    player.play();
+    safe(() => player.play(), undefined);
   }, [player, props]);
 
   // ----- Opening / ending / recap -----
@@ -209,14 +218,14 @@ export function Player(props: Props) {
 
   const skip = useCallback((part: SkipPart, range: TimeRange, automatic: boolean) => {
     dismissed.current.add(part);
-    const total = player.duration || duration;
+    const total = safe(() => player.duration, 0) || duration;
     // An ending that runs to the end of the file goes straight to the next episode.
     if (part === 'ed' && total && range.end >= total - 3 && props.hasNext) {
       save(true);
       props.onStep?.(1, true);
       return;
     }
-    setUndo({ part, from: player.currentTime });
+    setUndo({ part, from: safe(() => player.currentTime, range.start) });
     seekTo(range.end);
     haptics.skipped();
     if (!automatic) poke();
@@ -238,7 +247,7 @@ export function Player(props: Props) {
   const cueIndex = subtitlesOn ? cueAt(study.cues, time) : -1;
   const cue = cueIndex >= 0 ? study.cues[cueIndex] : undefined;
 
-  const total = duration || player.duration || 0;
+  const total = duration || safe(() => player.duration, 0) || 0;
   const showBigPlay = !started && !fullscreen && ready;
 
   // Swipe down to leave fullscreen: the video follows the finger, shrinks and rounds its corners,
