@@ -2,6 +2,10 @@ import { translateText } from './translate';
 import { desktopPipRequest } from './desktop-pip';
 import { findFolder, pinnedLinks, pinnedRows, removePin } from '../shared/pins';
 import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
+import {
+  type Boost, DEFAULT_SITE_SEARCHES, boostsFor, matchSiteSearch, normalizePattern, routeFor,
+  siteSearchUrl, suggestSiteSearches, validSiteSearchUrl
+} from '../shared/site-tools';
 import { canPreviewInPeek, isBrowserPageUrl } from '../shared/interaction';
 import {
   type ArcState,
@@ -21,6 +25,14 @@ import {
 declare const __ARC_LEGACY_ID__: string;
 
 const STORAGE_KEY = 'arc_chrome_state_v1';
+
+// Tabs the extension opens itself already have a Space chosen; Air Traffic Control leaves them alone.
+let ownTabCreates = 0;
+async function createTab(properties: chrome.tabs.CreateProperties): Promise<chrome.tabs.Tab> {
+  ownTabCreates++;
+  try { return await chrome.tabs.create(properties); }
+  finally { ownTabCreates--; }
+}
 
 const DEFAULT_SETTINGS: ExtensionSettings = {
   targetLanguage: 'en',
@@ -199,7 +211,10 @@ async function loadState(): Promise<ArcState> {
     archive: raw?.archive || [],
     tabSpaceMap: raw?.tabSpaceMap || {},
     tabLastAccessed: raw?.tabLastAccessed || {},
-    settings: mergedSettings
+    settings: mergedSettings,
+    routingRules: raw?.routingRules || [],
+    siteSearches: raw?.siteSearches || structuredClone(DEFAULT_SITE_SEARCHES),
+    boosts: raw?.boosts || []
   };
 
   if (!cachedState.spaces.some((space) => space.id === cachedState!.activeSpaceId)) {
@@ -463,9 +478,18 @@ chrome.commands.onCommand.addListener(async (command) => {
 // Tab lifecycle listeners
 chrome.tabs.onCreated.addListener(async (tab) => {
   if (!tab.id) return;
+  const own = ownTabCreates > 0;
   const state = await loadState();
 
-  if (!state.tabSpaceMap[tab.id]) {
+  // Air Traffic Control: a link opened by a page or another app goes to its Space.
+  const route = own ? undefined : routeFor(state.routingRules, tab.pendingUrl || tab.url || '');
+  const routedSpace = route && state.spaces.find((space) => space.id === route.spaceId);
+  if (routedSpace) {
+    state.tabSpaceMap[tab.id] = routedSpace.id;
+    state.tabLastAccessed[tab.id] = Date.now();
+    if (tab.active) state.activeSpaceId = routedSpace.id;
+    await saveState(state);
+  } else if (!state.tabSpaceMap[tab.id]) {
     state.tabSpaceMap[tab.id] = state.activeSpaceId;
     state.tabLastAccessed[tab.id] = Date.now();
     await saveState(state);
@@ -474,8 +498,29 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   }
 });
 
-chrome.tabs.onUpdated.addListener(() => {
+// Boosts: user CSS for a site, inserted as the page starts loading.
+const boostTarget = (tabId: number) => ({ tabId, allFrames: false });
+async function insertBoost(tabId: number, css: string) {
+  await chrome.scripting?.insertCSS({ target: boostTarget(tabId), css, origin: 'USER' }).catch(() => {});
+}
+async function removeBoost(tabId: number, css: string) {
+  await chrome.scripting?.removeCSS({ target: boostTarget(tabId), css, origin: 'USER' }).catch(() => {});
+}
+/** Swap one boost's CSS in every open tab it applies to. */
+async function refreshBoost(before: Boost | undefined, after: Boost | undefined) {
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    if (!tab.id || !tab.url) continue;
+    if (before && boostsFor([before], tab.url).length) await removeBoost(tab.id, before.css);
+    if (after && boostsFor([after], tab.url).length) await insertBoost(tab.id, after.css);
+  }
+}
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   broadcastStateUpdate();
+  if (changeInfo?.status !== 'loading' || !tab?.url) return;
+  const state = await loadState();
+  for (const boost of boostsFor(state.boosts, tab.url)) await insertBoost(tabId, boost.css);
 });
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
@@ -494,7 +539,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 
 async function openLittleArcWindow(url: string) {
   if (isBrowserPageUrl(url)) {
-    await chrome.tabs.create({ url });
+    await createTab({ url });
     return;
   }
   await chrome.windows.create({
@@ -834,8 +879,27 @@ async function searchOmnibox(query: string): Promise<OmniboxResultItem[]> {
         actionId: `ANTIGRAVITY_PROMPT:${prompt}`,
         shortcut: 'Antigravity'
       });
+    } else if (matchSiteSearch(state.siteSearches, rawTrimmed)) {
+      const { site, terms } = matchSiteSearch(state.siteSearches, rawTrimmed)!;
+      const url = siteSearchUrl(site, terms);
+      results.unshift({
+        id: `site-search-${site.id}`,
+        kind: 'search',
+        title: `Search ${site.name} for "${terms}"`,
+        subtitle: `Site Search · ${formatHostname(url)}`,
+        url,
+        shortcut: site.name
+      });
     } else {
       const parsed = parseCommandBarInput(query);
+      const siteHints = suggestSiteSearches(state.siteSearches, rawTrimmed).slice(0, 3).map((site): OmniboxResultItem => ({
+        id: `site-hint-${site.id}`,
+        kind: 'search',
+        title: `Search ${site.name}`,
+        subtitle: `Site Search · type "${site.shortcut} " and your query`,
+        url: siteSearchUrl(site, '').replace(/[?&][^?&=]+=$/, ''),
+        shortcut: site.shortcut
+      }));
       if (parsed.isUrl) {
         if (!results.some((result) => result.kind === 'tab' && urlKey(result.url || '') === urlKey(parsed.url))) results.unshift({
           id: 'direct-url',
@@ -854,6 +918,7 @@ async function searchOmnibox(query: string): Promise<OmniboxResultItem[]> {
           url: parsed.url,
           shortcut: 'Search'
         });
+        results.splice(Math.min(results.length, 6), 0, ...siteHints);
         results.push({
           id: 'ask-chatgpt-query',
           kind: 'search',
@@ -905,7 +970,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const entry = state.archive?.find((entry) => entry.id === message.archiveId);
         if (!entry) throw new Error('Archived tab no longer exists');
         const spaceId = state.spaces.some((space) => space.id === entry.spaceId) ? entry.spaceId : state.activeSpaceId;
-        const tab = await chrome.tabs.create({ url: entry.url, active: true });
+        const tab = await createTab({ url: entry.url, active: true });
         if (tab.id !== undefined) {
           state.tabSpaceMap[tab.id] = spaceId;
           state.tabLastAccessed[tab.id] = Date.now();
@@ -962,7 +1027,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (activeTab?.id) {
             await chrome.tabs.update(activeTab.id, { url });
           } else {
-            await chrome.tabs.create({ url, active: true });
+            await createTab({ url, active: true });
           }
         }
         sendResponse({ ok: true });
@@ -1071,7 +1136,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       case 'OPEN_FOCUSED_NEW_TAB': {
-        const tab = await chrome.tabs.create({
+        const tab = await createTab({
           url: chrome.runtime.getURL('newtab.html?focused=1'),
           windowId: sender.tab?.windowId,
           active: true
@@ -1089,7 +1154,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: true });
           break;
         }
-        const created = await chrome.tabs.create({
+        const created = await createTab({
           url: url || 'chrome://newtab',
           active
         });
@@ -1138,7 +1203,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
           if (pin) pin.tabId = target.id;
         } else {
-          const created = await chrome.tabs.create({ url, active: true });
+          const created = await createTab({ url, active: true });
           if (created.id) {
             state.tabSpaceMap[created.id] = targetSpaceId;
             state.tabLastAccessed[created.id] = Date.now();
@@ -1335,6 +1400,80 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const { settings } = message;
         state.settings = { ...state.settings, ...settings };
         await saveState(state);
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'SAVE_ROUTING_RULE': {
+        const pattern = normalizePattern(String(message.pattern || ''));
+        if (!pattern || !pattern.split('/')[0].includes('.') && !pattern.startsWith('localhost')) throw new Error('Enter a site such as github.com');
+        if (!state.spaces.some((space) => space.id === message.spaceId)) throw new Error('Choose a Space');
+        state.routingRules ||= [];
+        const existing = state.routingRules.find((rule) => rule.id === message.id)
+          || state.routingRules.find((rule) => normalizePattern(rule.pattern) === pattern);
+        if (existing) Object.assign(existing, { pattern, spaceId: message.spaceId });
+        else state.routingRules.push({ id: crypto.randomUUID(), pattern, spaceId: message.spaceId });
+        await saveState(state);
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'REMOVE_ROUTING_RULE': {
+        state.routingRules = (state.routingRules || []).filter((rule) => rule.id !== message.id);
+        await saveState(state);
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'SAVE_SITE_SEARCH': {
+        const name = String(message.name || '').trim();
+        const shortcut = String(message.shortcut || '').trim().toLowerCase();
+        const url = String(message.url || '').trim();
+        if (!name) throw new Error('Name the site');
+        if (!shortcut || /\s/.test(shortcut)) throw new Error('The shortcut is one word, such as yt');
+        if (!validSiteSearchUrl(url)) throw new Error('The search URL needs %s where the query goes');
+        state.siteSearches ||= [];
+        if (state.siteSearches.some((site) => site.id !== message.id && site.shortcut.toLowerCase() === shortcut)) {
+          throw new Error(`"${shortcut}" is already used by another site`);
+        }
+        const existing = state.siteSearches.find((site) => site.id === message.id);
+        if (existing) Object.assign(existing, { name, shortcut, url });
+        else state.siteSearches.push({ id: crypto.randomUUID(), name, shortcut, url });
+        await saveState(state);
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'REMOVE_SITE_SEARCH': {
+        state.siteSearches = (state.siteSearches || []).filter((site) => site.id !== message.id);
+        await saveState(state);
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'SAVE_BOOST': {
+        const host = normalizePattern(String(message.host || '')).split('/')[0];
+        const css = String(message.css || '');
+        if (!host) throw new Error('Enter a site such as github.com');
+        if (!css.trim()) throw new Error('Write some CSS for this Boost');
+        state.boosts ||= [];
+        const existing = state.boosts.find((boost) => boost.id === message.id)
+          || state.boosts.find((boost) => boost.host === host);
+        const before = existing && { ...existing };
+        const after: Boost = { id: existing?.id || crypto.randomUUID(), host, css, enabled: message.enabled !== false };
+        if (existing) Object.assign(existing, after);
+        else state.boosts.push(after);
+        await saveState(state);
+        await refreshBoost(before, after);
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'REMOVE_BOOST': {
+        const before = (state.boosts || []).find((boost) => boost.id === message.id);
+        state.boosts = (state.boosts || []).filter((boost) => boost.id !== message.id);
+        await saveState(state);
+        await refreshBoost(before, undefined);
         sendResponse(await getFullSnapshot());
         break;
       }
@@ -1876,7 +2015,7 @@ async function handleVoiceCommand(
     }
     const knownUrl = KNOWN_SITES[rawTarget];
     if (knownUrl) {
-      await chrome.tabs.create({ url: knownUrl, active: true });
+      await createTab({ url: knownUrl, active: true });
       return {
         ok: true,
         reply: `Opening ${rawTarget}.`,
@@ -1899,7 +2038,7 @@ async function handleVoiceCommand(
     }
     const parsed = parseCommandBarInput(rawTarget);
     if (parsed.isUrl) {
-      await chrome.tabs.create({ url: parsed.url, active: true });
+      await createTab({ url: parsed.url, active: true });
       return {
         ok: true,
         reply: `Opening ${parsed.url}.`,
@@ -1907,7 +2046,7 @@ async function handleVoiceCommand(
         actionBadge: `↗ Opened URL`
       };
     }
-    await chrome.tabs.create({
+    await createTab({
       url: `https://www.google.com/search?q=${encodeURIComponent(rawTarget)}`,
       active: true
     });
@@ -1923,7 +2062,7 @@ async function handleVoiceCommand(
   const searchMatch = lower.match(/^(?:search(?:\s+google)?(?:\s+for)?|google|find)\s+(.+)$/);
   if (searchMatch) {
     const qSearch = searchMatch[1].trim();
-    await chrome.tabs.create({
+    await createTab({
       url: `https://www.google.com/search?q=${encodeURIComponent(qSearch)}`,
       active: true
     });
@@ -2139,7 +2278,7 @@ async function executeBridgeBrowserAction(
   currentTabId?: number
 ) {
   if (action.type === 'open_url' && action.url) {
-    await chrome.tabs.create({ url: action.url, active: true });
+    await createTab({ url: action.url, active: true });
   } else if (action.type === 'switch_tab' && typeof action.tabId === 'number') {
     await chrome.tabs.update(action.tabId, { active: true });
   } else if (action.type === 'close_tab' && typeof currentTabId === 'number') {
@@ -2296,7 +2435,7 @@ async function callOpenAiVoiceAgent(
         const fn = tc.function?.name;
         const args = JSON.parse(tc.function?.arguments || '{}');
         if (fn === 'open_url' && args.url) {
-          await chrome.tabs.create({ url: args.url, active: true });
+          await createTab({ url: args.url, active: true });
           executedSummary = `Opened ${args.url}`;
         } else if (fn === 'switch_tab' && typeof args.tabId === 'number') {
           await chrome.tabs.update(args.tabId, { active: true });

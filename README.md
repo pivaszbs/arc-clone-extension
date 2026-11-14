@@ -24,6 +24,14 @@ See [the functionality inventory and alternatives](docs/arc-parity.md) for Arcif
 
 New sidebar controls provide archived-tab search/restore, pinned-item renaming, auto-archive settings, pinned URL reset, and native Split View where the browser supports its extension API.
 
+## Routes, Site Search and Boosts
+
+Open **Settings → Routes, Site Search and Boosts** in the sidebar.
+
+- **Routes** (Arc's Air Traffic Control): give a site such as `github.com` or `google.com/maps` a Space. A link to it opened from a page or another app lands in that Space, and the sidebar switches there when the tab opens in front. Tabs you open from the sidebar or command bar stay where you opened them.
+- **Site Search**: in the command bar type a shortcut, a space, and a query. `yt lofi` searches YouTube. YouTube, Wikipedia, GitHub, Reddit and DuckDuckGo are set up; add your own with a URL containing `%s`.
+- **Boosts**: your own CSS for a site, applied each time it loads, subdomains included. Editing, turning off or removing a Boost updates open tabs at once.
+
 ## Video picture in picture
 
 Standard HTML videos have a browser **Picture in picture** button. On macOS they also have an **Across desktops** button, which uses the local desktop companion to remain above other applications' full-screen Spaces.
