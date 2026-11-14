@@ -8,8 +8,9 @@ Feature: Anime365 series downloads
   Scenario: Offline preserves the dub selected on the episode page
     Given a catalog where the current dub is available for three episodes
     When I check the series for offline viewing
-    Then only episodes with the selected dub are offered
+    Then episodes with the selected dub are offered first
     And unchecking the first two episodes submits only episode three
+    And adding a fallback makes episode four available
 
   Scenario: A downloaded series folder pairs video and subtitles offline
     Given the offline study page is open without a network connection

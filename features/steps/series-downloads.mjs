@@ -31,6 +31,7 @@ Given('a catalog with two downloadable episodes and one without Japanese subtitl
 });
 
 When('I check the series for offline viewing', async function () {
+  await this.videoPage.getByRole('link', { name: 'Downloads', exact: true }).click();
   await this.videoPage.getByRole('button', { name: 'Check episodes' }).click();
 });
 
@@ -76,13 +77,26 @@ Given('a catalog where the current dub is available for three episodes', async f
   await this.videoPage.goto(`chrome-extension://${this.animeExtensionId}/offline.html?series=${encodeURIComponent(selected)}`);
 });
 
-Then('only episodes with the selected dub are offered', async function () {
+Then('episodes with the selected dub are offered first', async function () {
   await expect(this.videoPage.getByText(/Fixture Dub.*3 of 4 episodes available/)).toBeVisible();
-  await expect(this.videoPage.getByRole('list', { name: 'Episode availability' }).locator('li')).toHaveText([
-    'Episode 1 · 1080p', 'Episode 2 · 1080p', 'Episode 3 · 1080p', 'Episode 4 · Unavailable'
-  ]);
+  const episodes = this.videoPage.getByRole('list', { name: 'Episode availability' });
+  for (const episode of [1, 2, 3]) {
+    await expect(episodes.getByRole('checkbox', { name: `Episode ${episode} · 1080p · Fixture Dub` })).toBeEnabled();
+  }
+  await expect(episodes.getByText('Episode 4 · Unavailable')).toBeVisible();
   await expect(this.videoPage.getByRole('link', { name: 'Download this episode · 1080p' })).toHaveAttribute('href', /\/mp4\/50001\?/);
   expect(this.catalogCspErrors).toEqual([]);
+});
+
+Then('adding a fallback makes episode four available', async function () {
+  const page = this.videoPage;
+  await page.getByRole('combobox', { name: 'Add a dubbing' }).selectOption('Other dub');
+  await expect(page.getByRole('checkbox', { name: 'Episode 4 · 1080p · Other dub' })).toBeEnabled();
+  await expect(page.getByRole('checkbox', { name: 'Episode 3 · 1080p · Fixture Dub' })).toBeChecked();
+  await page.reload();
+  await page.getByRole('link', { name: 'Downloads', exact: true }).click();
+  await page.getByRole('button', { name: 'Check episodes' }).click();
+  await expect(page.getByRole('checkbox', { name: 'Episode 4 · 1080p · Other dub' })).toBeEnabled();
 });
 
 Then('unchecking the first two episodes submits only episode three', async function () {
