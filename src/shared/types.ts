@@ -1,3 +1,7 @@
+import type { Boost, RoutingRule, SiteSearch } from './site-tools';
+
+export type { Boost, RoutingRule, SiteSearch };
+
 export type SpaceThemeId = 'indigo' | 'sunset' | 'emerald' | 'ocean' | 'rose' | 'midnight';
 
 export interface SpaceTheme {
@@ -149,6 +153,10 @@ export interface ArcState {
   tabSpaceMap: Record<number, string>;
   tabLastAccessed: Record<number, number>;
   settings: ExtensionSettings;
+  /** Air Traffic Control: links matching a pattern open in a chosen Space. */
+  routingRules?: RoutingRule[];
+  siteSearches?: SiteSearch[];
+  boosts?: Boost[];
 }
 
 export interface OmniboxResultItem {

@@ -38,9 +38,9 @@ Arc behavior was checked against its [official command list](https://start.arc.n
 | Copy link | Existing clipboard action | Existing UI; not part of the current automated comparison. |
 | Tab mute, duplicate and ordering | Existing handlers and controls | Existing code; not all interactions covered by Cucumber. |
 | Profiles/account isolation | Host browser profile only | Separate per-Space cookies, history, passwords, and extensions are not implemented. An extension cannot create Chrome profiles. |
-| Air Traffic Control | No URL-to-Space routing rules | Not implemented. |
-| Site Search | No saved site-search templates | Not implemented. |
-| Boosts | No per-site style editor | Not implemented. |
+| Air Traffic Control | Routes: a host or host-and-path pattern sends a newly opened link to a chosen Space; the most specific pattern wins | Unit tests cover matching, saving, and Space assignment through the background worker. Applies to tabs opened by pages or other apps, at creation. Tabs opened from the sidebar or command bar keep the Space chosen there. Later navigations inside a tab are not re-routed. Not yet exercised in Cucumber. |
+| Site Search | Saved search templates with a shortcut (`yt lofi`); five defaults, editable in the sidebar | Unit tests cover the command-bar result, suggestions while typing, and validation. Arc's Tab-to-search key is not reproduced; a space after the shortcut is used instead. Not yet exercised in Cucumber. |
+| Boosts | Per-site CSS, inserted as the page starts loading and swapped in open tabs when edited, turned off, or removed | Unit tests cover insertion and removal against a stand-in scripting API; not checked on live sites in a real browser. CSS only: no visual colour/font picker, Zap element removal, custom JavaScript, or Boost sharing. Top frame only. |
 | Easels, captures, library | No corresponding authoring or media library | Not implemented. |
 | Favorite app previews | No authenticated Gmail/calendar/etc. preview integrations | Not implemented. |
 | Sync across devices | Local extension storage | No Arc account or encrypted sync service. |
@@ -78,4 +78,4 @@ Some setup and state assertions use the real extension messaging API. These are 
 
 ## Native comparison still required
 
-For exact native parity, run matching scenarios against a dedicated Arc test profile using a native macOS automation driver. Compare behavior separately from visual geometry. Do not reuse a personal profile or infer a pass from documentation. Additional work is needed for profiles, routing, nesting, Boosts, Easels, sync, app previews, native frame controls, and the differences listed above.
+For exact native parity, run matching scenarios against a dedicated Arc test profile using a native macOS automation driver. Compare behavior separately from visual geometry. Do not reuse a personal profile or infer a pass from documentation. Additional work is needed for profiles, nesting, Boost pickers and Zap, Easels, sync, app previews, native frame controls, and the differences listed above.

@@ -291,3 +291,98 @@ test('Split View returns an explicit capability error on older browsers', async 
   const result = await harness().message({ type: 'CREATE_SPLIT_VIEW', firstTabId: 1, secondTabId: 2 });
   assert.equal(result.ok, false); assert.match(result.error, /does not expose the Split View API/);
 });
+
+function routingHarness(state, initialTabs = []) {
+  const events = {};
+  const css = [];
+  const app = harness(state, initialTabs, chrome => {
+    chrome.tabs.onCreated.addListener = listener => { events.created = listener; };
+    chrome.tabs.onUpdated.addListener = listener => { events.updated = listener; };
+    chrome.scripting = {
+      insertCSS: async ({ target, css: text }) => { css.push(`+${target.tabId}:${text}`); },
+      removeCSS: async ({ target, css: text }) => { css.push(`-${target.tabId}:${text}`); }
+    };
+  });
+  return { ...app, events, css };
+}
+
+test('a link opened by a page or another app lands in its routed Space', async () => {
+  const state = fixture();
+  state.routingRules = [{ id: 'r', pattern: 'github.com', spaceId: 'work' }];
+  const app = routingHarness(state);
+  await app.events.created({ id: 50, pendingUrl: 'https://github.com/org/repo', active: true });
+  await app.events.created({ id: 51, pendingUrl: 'https://github.com/other', active: false });
+  await app.events.created({ id: 52, pendingUrl: 'https://elsewhere.test/', active: true });
+  const { state: loaded } = await app.message({ type: 'GET_SNAPSHOT' });
+  assert.equal(loaded.tabSpaceMap[50], 'work');
+  assert.equal(loaded.tabSpaceMap[51], 'work');
+  assert.equal(loaded.tabSpaceMap[52], 'work', 'an unrouted tab joins the Space that is now active');
+  assert.equal(loaded.activeSpaceId, 'work');
+});
+
+test('a background routed link does not switch Space, and a tab the sidebar opens keeps its chosen Space', async () => {
+  const state = fixture();
+  state.routingRules = [{ id: 'r', pattern: 'github.com', spaceId: 'work' }];
+  const app = routingHarness(state);
+  await app.events.created({ id: 51, pendingUrl: 'https://github.com/other', active: false });
+  let loaded = (await app.message({ type: 'GET_SNAPSHOT' })).state;
+  assert.equal(loaded.tabSpaceMap[51], 'work');
+  assert.equal(loaded.activeSpaceId, 'personal');
+
+  const realCreate = app.created;
+  await app.message({ type: 'CREATE_TAB', url: 'https://github.com/mine', spaceId: 'personal' });
+  loaded = (await app.message({ type: 'GET_SNAPSHOT' })).state;
+  assert.equal(loaded.tabSpaceMap[realCreate[0].id], 'personal');
+});
+
+test('routes are saved once per site, need a real Space, and can be removed', async () => {
+  const app = harness();
+  await app.message({ type: 'SAVE_ROUTING_RULE', pattern: 'https://www.GitHub.com/', spaceId: 'work' });
+  const { state } = await app.message({ type: 'SAVE_ROUTING_RULE', pattern: 'github.com', spaceId: 'personal' });
+  assert.equal(state.routingRules.map(({ pattern, spaceId }) => `${pattern}>${spaceId}`).join(), 'github.com>personal');
+  assert.match((await app.message({ type: 'SAVE_ROUTING_RULE', pattern: 'github.com', spaceId: 'gone' })).error, /Space/);
+  assert.match((await app.message({ type: 'SAVE_ROUTING_RULE', pattern: 'nonsense', spaceId: 'work' })).error, /site/);
+  const removed = await app.message({ type: 'REMOVE_ROUTING_RULE', id: state.routingRules[0].id });
+  assert.equal(removed.state.routingRules.length, 0);
+});
+
+test('the command bar searches a site by shortcut and suggests it while typing', async () => {
+  const app = harness();
+  const { items } = await app.message({ type: 'SEARCH_OMNIBOX', query: 'yt lofi beats' });
+  assert.equal(items[0].title, 'Search YouTube for "lofi beats"');
+  assert.equal(items[0].url, 'https://www.youtube.com/results?search_query=lofi%20beats');
+  const hinted = await app.message({ type: 'SEARCH_OMNIBOX', query: 'wiki' });
+  assert.ok(hinted.items.some((item) => item.title === 'Search Wikipedia'));
+
+  assert.match((await app.message({ type: 'SAVE_SITE_SEARCH', name: 'Bad', shortcut: 'b', url: 'https://bad.test/' })).error, /%s/);
+  assert.match((await app.message({ type: 'SAVE_SITE_SEARCH', name: 'Dupe', shortcut: 'YT', url: 'https://d.test/?q=%s' })).error, /already used/);
+  await app.message({ type: 'SAVE_SITE_SEARCH', name: 'MDN', shortcut: 'mdn', url: 'https://developer.mozilla.org/search?q=%s' });
+  const custom = await app.message({ type: 'SEARCH_OMNIBOX', query: 'mdn flex gap' });
+  assert.equal(custom.items[0].url, 'https://developer.mozilla.org/search?q=flex%20gap');
+});
+
+test('a Boost is inserted as its site loads and swapped in open tabs when edited or removed', async () => {
+  const app = routingHarness(fixture(), [tab(1, 'https://news.example.com/'), tab(2, 'https://other.test/')]);
+  const saved = await app.message({ type: 'SAVE_BOOST', host: 'https://example.com/', css: 'body{color:red}' });
+  const boost = saved.state.boosts[0];
+  assert.equal(boost.host, 'example.com');
+  assert.deepEqual(app.css, ['+1:body{color:red}']);
+
+  await app.events.updated(9, { status: 'loading' }, { id: 9, url: 'https://example.com/page' });
+  await app.events.updated(9, { status: 'complete' }, { id: 9, url: 'https://example.com/page' });
+  await app.events.updated(8, { status: 'loading' }, { id: 8, url: 'https://other.test/' });
+  assert.deepEqual(app.css.slice(1), ['+9:body{color:red}']);
+
+  app.css.length = 0;
+  await app.message({ type: 'SAVE_BOOST', id: boost.id, host: 'example.com', css: 'body{color:blue}' });
+  assert.deepEqual(app.css, ['-1:body{color:red}', '+1:body{color:blue}']);
+
+  app.css.length = 0;
+  await app.message({ type: 'SAVE_BOOST', id: boost.id, host: 'example.com', css: 'body{color:blue}', enabled: false });
+  assert.deepEqual(app.css, ['-1:body{color:blue}']);
+  await app.events.updated(9, { status: 'loading' }, { id: 9, url: 'https://example.com/page' });
+  assert.deepEqual(app.css, ['-1:body{color:blue}']);
+
+  const removed = await app.message({ type: 'REMOVE_BOOST', id: boost.id });
+  assert.equal(removed.state.boosts.length, 0);
+});

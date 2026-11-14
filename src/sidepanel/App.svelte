@@ -4,6 +4,7 @@
   import { shouldPeek } from '../shared/interaction';
   import CommandPalette from '../shared/CommandPalette.svelte';
   import Icon from '../shared/Icon.svelte';
+  import SiteTools from './SiteTools.svelte';
   import { containFocus, isActivationKey } from '../shared/focus';
   import { findFolder, pinnedRows } from '../shared/pins';
   import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
@@ -90,6 +91,7 @@
   // Settings drawer
   let showSettings = $state(false);
   let showArchive = $state(false);
+  let showSiteTools = $state(false);
   let archiveQuery = $state('');
   let renamingItem = $state<string | null>(null);
   let renameValue = $state('');
@@ -185,6 +187,7 @@
         showTranslator = false;
         movingTabId = null;
         showArchive = false;
+        showSiteTools = false;
         renamingItem = null;
         showSplit = false;
       }
@@ -936,6 +939,10 @@
     </div>
   </footer>
 
+  {#if showSiteTools}
+    <SiteTools {arcState} activeUrl={activeTab?.url} {notify} onstate={(next) => arcState = next} onclose={() => showSiteTools = false} />
+  {/if}
+
   {#if showArchive}
     <div class="drawer-overlay" role="dialog" aria-modal="true" aria-label="Archived Tabs">
       <div class="drawer-card" use:containFocus>
@@ -1137,6 +1144,7 @@
             <option value="0">Never</option><option value="12">After 12 hours</option><option value="24">After 24 hours</option><option value="168">After 7 days</option><option value="720">After 30 days</option>
           </select>
         </div>
+        <button class="primary-btn" onclick={() => { showSettings = false; showSiteTools = true; }}>Routes, Site Search and Boosts</button>
         <button class="primary-btn" onclick={async () => { try { await requestArc({ type: 'RESET_SPACE' }); notify('Pinned tabs reset'); } catch { notify('Could not reset pinned tabs.'); } }}>Reset pinned tabs to saved URLs</button>
         <div class="shortcuts-summary">
           <div><span>Toggle Left Sidebar</span><kbd>Alt + S</kbd></div>
