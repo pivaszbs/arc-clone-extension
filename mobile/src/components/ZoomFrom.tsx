@@ -28,8 +28,13 @@ export function rectOf(target: unknown): Promise<Rect | null> {
 /** Lets the owner close the screen by shrinking it back into the card it came from. */
 export type ZoomHandle = { collapse(done: () => void): void };
 
-export function ZoomFrom({ origin, children, style, ref }: {
-  origin?: Rect | null; children: ReactNode; style?: StyleProp<ViewStyle>; ref?: Ref<ZoomHandle>;
+export function ZoomFrom({ origin, children, style, contentStyle, backdrop, ref }: {
+  origin?: Rect | null; children: ReactNode; style?: StyleProp<ViewStyle>;
+  /** Style of the growing card itself (give it the screen's background, so only the card is opaque). */
+  contentStyle?: StyleProp<ViewStyle>;
+  /** Colour the screen behind fades to while the card grows, like a modal; behind stays visible at first. */
+  backdrop?: string;
+  ref?: Ref<ZoomHandle>;
 }) {
   const frame = useRef<Measurable | null>(null);
   const [progress] = useState(() => new Animated.Value(0));
@@ -91,7 +96,8 @@ export function ZoomFrom({ origin, children, style, ref }: {
 
   return (
     <View ref={frame as never} onLayout={start} style={[styles.fill, style]} collapsable={false}>
-      <Animated.View style={[styles.frame, animated]}>
+      {backdrop ? <Animated.View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: backdrop, opacity: progress }]} /> : null}
+      <Animated.View style={[styles.frame, contentStyle, animated]}>
         {children}
       </Animated.View>
     </View>

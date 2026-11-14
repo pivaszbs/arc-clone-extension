@@ -530,7 +530,7 @@ function Study() {
   const closePlayer = () => { setEpisodeKey(null); setPlayerHidden(false); setPipActive(false); };
   const fullscreenPlayer = episode && !tvControlling && (
     <View style={fullscreen && mode === 'watch' ? StyleSheet.absoluteFill : styles.pipHost} pointerEvents={fullscreen && mode === 'watch' ? 'auto' : 'none'}>
-      <ZoomFrom ref={playerZoom} origin={playerOrigin} style={{ backgroundColor: '#000' }}>
+      <ZoomFrom ref={playerZoom} origin={playerOrigin} backdrop="#000" contentStyle={{ backgroundColor: '#000' }}>
       <Player
         episode={episode}
         neighbours={neighbours}
@@ -674,11 +674,6 @@ function Study() {
             {header}
             <DownloadView serverUrl={serverUrl} onMacProgress={() => { void loadRemote(); }} />
           </View>
-        ) : playing && !seriesScreen ? (
-          <View style={{ flex: 1, backgroundColor: '#000' }} />
-        ) : seriesScreen ? (
-          // Stays mounted under the player, so the player opens over it and closing finds it as it was.
-          <View style={{ flex: 1 }}>{header}<ZoomFrom ref={seriesZoom} origin={seriesOrigin}>{seriesScreen}</ZoomFrom></View>
         ) : library.length ? (
           <View style={{ flex: 1 }}>
             <SeriesGallery
@@ -702,7 +697,17 @@ function Study() {
                 }
               }}
             />
+            {seriesScreen && (
+              // The series opens over the gallery (kept underneath, scroll and all) out of its cover.
+              <View style={StyleSheet.absoluteFill}>
+                <ZoomFrom ref={seriesZoom} origin={seriesOrigin} backdrop={colors.background} contentStyle={{ backgroundColor: colors.background }}>
+                  {header}{seriesScreen}
+                </ZoomFrom>
+              </View>
+            )}
           </View>
+        ) : playing ? (
+          <View style={{ flex: 1, backgroundColor: '#000' }} />
         ) : (
           <View style={{ flex: 1 }}>{header}{empty}</View>
         )}
