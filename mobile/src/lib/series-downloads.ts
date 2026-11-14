@@ -177,7 +177,8 @@ export class SeriesDownloader {
                 const now = Date.now();
                 if (now - lastUpdate < 500) return;
                 lastUpdate = now;
-                this.set('downloading', { current: { series: job.series, name: job.name, bytes: bytesWritten, totalBytes } });
+                // Native progress can arrive as BigInt; the screen does ordinary arithmetic with it.
+                this.set('downloading', { current: { series: job.series, name: job.name, bytes: Number(bytesWritten), totalBytes: Number(totalBytes) } });
               },
             });
             let saved = await this.task.downloadAsync();
@@ -189,7 +190,7 @@ export class SeriesDownloader {
             this.task.release();
             this.task = null;
             if (!saved) throw new Error('The download stopped.');
-            if ((saved.size ?? 0) < MIN_VIDEO_BYTES) {
+            if (Number(saved.size ?? 0) < MIN_VIDEO_BYTES) {
               saved.delete();
               throw new Error('Anime365 sent a page instead of the video. Sign in to your account in the browser above.');
             }
