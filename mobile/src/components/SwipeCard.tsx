@@ -12,7 +12,8 @@ export type SwipeAction = { label: string; icon: SymbolViewProps['name']; color:
 
 type Props = {
   style?: StyleProp<ViewStyle>;
-  onPress: () => void;
+  /** Gets the pressed card, so a transition can start from it (see ZoomFrom.rectOf). */
+  onPress: (target: unknown) => void;
   accessibilityLabel?: string;
   /** Revealed by swiping right. */
   right?: SwipeAction;
@@ -113,7 +114,7 @@ export function SwipeCard({ style, onPress, accessibilityLabel, right, left, chi
             }}
             onPressIn={() => press(0.97)}
             onPressOut={() => press(1)}
-            onPress={onPress}
+            onPress={event => onPress(event.currentTarget)}
             pressRetentionOffset={12}
           >
             {children}

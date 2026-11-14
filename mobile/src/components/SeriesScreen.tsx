@@ -2,7 +2,7 @@ import { SymbolView } from 'expo-symbols';
 import { useEffect } from 'react';
 import { ActivityIndicator, Alert, FlatList, Image, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
-import Animated, { Easing, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
+import Animated, { Easing, useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
 import { scheduleOnRN } from 'react-native-worklets';
 
 import { episodeDownloads, useEpisodeDownloads } from '../lib/episode-downloads';
@@ -13,6 +13,7 @@ import type { Progress } from '../lib/storage';
 import { colors, radius, space } from '../theme';
 import { continueEpisode, seriesProgress } from './SeriesGallery';
 import { SwipeCard, swipeColors } from './SwipeCard';
+import { rectOf, type Rect } from './ZoomFrom';
 
 type Props = {
   series: Series;
@@ -21,7 +22,8 @@ type Props = {
   autoSkip: boolean;
   onAutoSkip: (value: boolean) => void;
   onBack: () => void;
-  onPlay: (episode: Episode) => void;
+  /** `from` is the tapped card or button, so the player can grow out of it. */
+  onPlay: (episode: Episode, from: Rect | null) => void;
   onToggleWatched: (episode: Episode) => void;
   /** True for series from the Mac: episodes can be downloaded to this device. */
   fromMac: boolean;
@@ -86,7 +88,6 @@ function DownloadIcon({ series, episode, fromMac }: { series: Series; episode: E
 export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, onBack, onPlay, onToggleWatched, fromMac, extra }: Props) {
   const { height } = useWindowDimensions();
   const downloads = useEpisodeDownloads();
-  const reduced = useReducedMotion();
   const next = continueEpisode(series, progress);
   const nextSaved = next ? progress[next.key] : undefined;
   const { watched } = seriesProgress(series, progress);
@@ -104,9 +105,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
   const cardWidth = (gridWidth - space.l * 2 - space.m * (columns - 1)) / columns;
   const coverWidth = twoPane ? Math.min(sideWidth - space.l * 2, Math.round(height * 0.38 * 0.75)) : width >= 700 ? 200 : 110;
 
-  // Enter: a short fade and rise (fade only with Reduce Motion).
-  const enter = useSharedValue(0);
-  useEffect(() => { enter.set(withTiming(1, { duration: 240, easing: EASE_OUT })); }, [enter, series.folder]);
+  // Entering is App's ZoomFrom (the screen grows out of the tapped cover).
   // Swipe in from the left edge to go back.
   const dragX = useSharedValue(0);
   const back = () => { haptics.tap(); onBack(); };
@@ -129,8 +128,8 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
     },
   });
   const screenStyle = useAnimatedStyle(() => ({
-    opacity: enter.get() * (1 - Math.min(0.4, dragX.get() / (width * 1.5))),
-    transform: [{ translateX: dragX.get() }, { translateY: reduced ? 0 : (1 - enter.get()) * 12 }],
+    opacity: 1 - Math.min(0.4, dragX.get() / (width * 1.5)),
+    transform: [{ translateX: dragX.get() }],
   }));
 
   const playLabel = nextSaved && !nextSaved.finished && nextSaved.position >= 1
@@ -166,7 +165,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
       {!!series.credit && <Text style={styles.credit} numberOfLines={1}>{series.credit}</Text>}
       <Text style={styles.count}>{series.episodes.length} episodes · {watched} watched</Text>
       {next && (
-        <Pressable onPress={() => { haptics.tap(); onPlay(next); }} style={({ pressed }) => [styles.play, twoPane && styles.playSide, pressed && styles.pressed]}>
+        <Pressable onPress={event => { haptics.tap(); void rectOf(event.currentTarget).then(from => onPlay(next, from)); }} style={({ pressed }) => [styles.play, twoPane && styles.playSide, pressed && styles.pressed]}>
           <SymbolView name="play.fill" size={16} tintColor={colors.background} />
           <Text style={styles.playText} numberOfLines={1}>{playLabel}</Text>
         </Pressable>
@@ -228,7 +227,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
           <SwipeCard
             style={{ width: cardWidth }}
             accessibilityLabel={`${item.label}, ${status}`}
-            onPress={() => { haptics.tap(); onPlay(item); }}
+            onPress={target => { haptics.tap(); void rectOf(target).then(from => onPlay(item, from)); }}
             right={{
               label: saved?.finished ? 'Unwatched' : 'Watched',
               icon: saved?.finished ? 'arrow.uturn.backward.circle' : 'checkmark.circle.fill',

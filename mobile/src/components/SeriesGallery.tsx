@@ -6,15 +6,17 @@ import { clock } from '../lib/format';
 import { haptics } from '../lib/haptics';
 import type { Episode, Series } from '../lib/library';
 import type { Progress } from '../lib/storage';
+import { rectOf, type Rect } from './ZoomFrom';
 import { colors, radius, space } from '../theme';
 
 type Props = {
   series: Series[];
   progress: Record<string, Progress>;
   width: number;
-  onOpen: (series: Series) => void;
+  /** `from` is where the tapped card is, so the next screen can grow out of it. */
+  onOpen: (series: Series, from: Rect | null) => void;
   /** One tap on the Continue card plays this episode straight away. */
-  onPlay: (series: Series, episode: Episode) => void;
+  onPlay: (series: Series, episode: Episode, from: Rect | null) => void;
   header?: React.ReactElement;
 };
 
@@ -54,7 +56,7 @@ function lastWatched(series: Series[], progress: Record<string, Progress>) {
 
 /** The big card at the top: the last series you watched, played with one tap. */
 function ContinueCard({ series, episode, progress, width, onPlay }: {
-  series: Series; episode: Episode; progress: Record<string, Progress>; width: number; onPlay: () => void;
+  series: Series; episode: Episode; progress: Record<string, Progress>; width: number; onPlay: (from: Rect | null) => void;
 }) {
   const saved = progress[episode.key];
   const resume = saved && !saved.finished && saved.position >= 1;
@@ -65,7 +67,7 @@ function ContinueCard({ series, episode, progress, width, onPlay }: {
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={`Continue ${series.title}, ${episode.label}`}
-      onPress={() => { haptics.tap(); onPlay(); }}
+      onPress={event => { haptics.tap(); void rectOf(event.currentTarget).then(onPlay); }}
       style={({ pressed }) => [styles.hero, pressed && styles.heroPressed]}
     >
       {series.poster ? <Image source={{ uri: series.poster }} style={StyleSheet.absoluteFill} blurRadius={40} resizeMode="cover" /> : null}
@@ -108,7 +110,7 @@ export function SeriesGallery({ series, progress, width, onOpen, onPlay, header 
       {header}
       {recent && (
         <View style={styles.heroWrap}>
-          <ContinueCard series={recent.series} episode={recent.episode} progress={progress} width={width - space.l * 2} onPlay={() => onPlay(recent.series, recent.episode)} />
+          <ContinueCard series={recent.series} episode={recent.episode} progress={progress} width={width - space.l * 2} onPlay={from => onPlay(recent.series, recent.episode, from)} />
           <Text style={styles.sectionTitle}>All series</Text>
         </View>
       )}
@@ -133,7 +135,7 @@ export function SeriesGallery({ series, progress, width, onOpen, onPlay, header 
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={item.title}
-            onPress={() => onOpen(item)}
+            onPress={event => { void rectOf(event.currentTarget).then(from => onOpen(item, from)); }}
             style={({ pressed }) => [styles.card, { width: (width - space.l * 2 - space.m * (columns - 1)) / columns }, pressed && styles.pressed]}
           >
             <Poster series={item} />

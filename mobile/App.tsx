@@ -10,6 +10,7 @@ import { PipelinesView, type ImportPipelineState, type LocalScanState } from './
 import { Player } from './src/components/Player';
 import { SeriesGallery } from './src/components/SeriesGallery';
 import { SeriesScreen } from './src/components/SeriesScreen';
+import { ZoomFrom, type Rect } from './src/components/ZoomFrom';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
 import { StatusDot, TabBar, type Tab } from './src/components/ui';
 import { installCrashLog } from './src/lib/crash-log';
@@ -320,6 +321,9 @@ function Study() {
   // Picture in Picture: leaving the player while PiP is on keeps it mounted (hidden) so the video
   // goes on in its floating window while you browse.
   const [pipActive, setPipActive] = useState(false);
+  // Where the tapped cover / card was, so the series screen and the player grow out of it.
+  const [seriesOrigin, setSeriesOrigin] = useState<Rect | null>(null);
+  const [playerOrigin, setPlayerOrigin] = useState<Rect | null>(null);
   const [playerHidden, setPlayerHidden] = useState(false);
   const fullscreen = !!episode && !tvControlling && !playerHidden;
   // By key: the playing episode may be the downloaded copy, a different object than the listed one.
@@ -382,7 +386,8 @@ function Study() {
     );
   };
 
-  const selectEpisode = (next: Episode) => {
+  const selectEpisode = (next: Episode, from: Rect | null = null) => {
+    setPlayerOrigin(from);
     haptics.select();
     if (tvControlling && series) {
       tvSyncRef.current?.sendTvControl({ action: 'playEpisode', seriesName: series.folder, episode: next.video });
@@ -523,6 +528,7 @@ function Study() {
   const closePlayer = () => { setEpisodeKey(null); setPlayerHidden(false); setPipActive(false); };
   const fullscreenPlayer = episode && !tvControlling && (
     <View style={fullscreen && mode === 'watch' ? StyleSheet.absoluteFill : styles.pipHost} pointerEvents={fullscreen && mode === 'watch' ? 'auto' : 'none'}>
+      <ZoomFrom origin={playerOrigin} style={{ backgroundColor: '#000' }}>
       <Player
         episode={episode}
         neighbours={neighbours}
@@ -549,6 +555,7 @@ function Study() {
         hasNext={!!series && index < series.episodes.length - 1}
         onProgress={handlePhoneProgress}
       />
+      </ZoomFrom>
     </View>
   );
 
@@ -661,7 +668,7 @@ function Study() {
         ) : playing ? (
           <View style={{ flex: 1, backgroundColor: '#000' }} />
         ) : seriesScreen ? (
-          <View style={{ flex: 1 }}>{header}{seriesScreen}</View>
+          <View style={{ flex: 1 }}>{header}<ZoomFrom origin={seriesOrigin}>{seriesScreen}</ZoomFrom></View>
         ) : library.length ? (
           <View style={{ flex: 1 }}>
             <SeriesGallery
@@ -669,8 +676,9 @@ function Study() {
               progress={allProgress()}
               width={width}
               header={header}
-              onOpen={item => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
-              onPlay={(item, next) => {
+              onOpen={(item, from) => { haptics.select(); setSeriesOrigin(from); setFolder(item.folder); setEpisodeKey(null); }}
+              onPlay={(item, next, from) => {
+                setPlayerOrigin(from);
                 // One tap from the Continue card: open the series and play, as on its screen.
                 setFolder(item.folder);
                 if (tvControlling) {
