@@ -2,10 +2,8 @@ import { useEventListener } from 'expo';
 import { SymbolView } from 'expo-symbols';
 import { isPictureInPictureSupported, useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
+import { ActivityIndicator, Animated as RNAnimated, Pressable, StyleSheet, Text, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
-import Animated, { Easing, interpolate, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
-import { scheduleOnRN } from 'react-native-worklets';
 import type { TimeRange } from 'react-native-anime-core';
 
 import { clock, cueAt } from '../lib/format';
@@ -24,7 +22,8 @@ type Props = {
   autoPlay?: boolean;
   autoSkip: boolean;
   subtitlesOn: boolean;
-  onToggleFullscreen: (value?: boolean) => void;
+  /** `swiped`: closed by the swipe down, which already animated the player away. */
+  onToggleFullscreen: (value?: boolean, swiped?: boolean) => void;
   onToggleSubtitles: () => void;
   onStep?: (direction: -1 | 1, autoplay: boolean) => void;
   hasPrevious: boolean;
@@ -92,6 +91,19 @@ export function Player(props: Props) {
     void player.replaceAsync({ uri: episode.videoUri, metadata: { title: episode.label } });
   }, [episode, player]);
 
+  // The latest props, for callbacks that must stay stable (see save below).
+  const propsRef = useRef(props);
+  useEffect(() => { propsRef.current = props; });
+
+  // Stable across renders: it used to depend on `props` (a new object every render), and the effect
+  // below saves whenever `save` changes, which told App about progress, which re-rendered the
+  // player with new props... thousands of renders a second, the whole app frozen.
+  // The ending's start, read inside save (a ref, so save stays stable).
+  const endingStart = useRef<number | undefined>(undefined);
+  useEffect(() => { endingStart.current = study.skips.ed?.start; }, [study.skips.ed?.start]);
+  // Once this episode counts as watched, a later save (closing, switching episodes) must not undo it.
+  const finishedKey = useRef<string | null>(null);
+
   const save = useCallback((finished = false) => {
     let position: number;
     let playerDuration: number;
@@ -101,10 +113,14 @@ export function Player(props: Props) {
     } catch { return; /* Already released (the episode was closed). */ }
     if (!ready || !Number.isFinite(position)) return;
     const total = playerDuration || duration;
-    saveProgress(episode.key, { position, duration: total, watchedAt: Date.now(), finished: finished || (total > 0 && position >= total - 5) });
+    // Watched once the ending has started (skipping or closing on it counts), or the last 5 s.
+    const reachedEnding = endingStart.current !== undefined && position >= endingStart.current - 1;
+    const done = finished || reachedEnding || (total > 0 && position >= total - 5) || finishedKey.current === episode.key;
+    if (done) finishedKey.current = episode.key;
+    saveProgress(episode.key, { position, duration: total, watchedAt: Date.now(), finished: done });
     lastSaved.current = Date.now();
-    props.onProgress?.();
-  }, [player, ready, duration, episode.key, props]);
+    propsRef.current.onProgress?.();
+  }, [player, ready, duration, episode.key]);
 
   useEffect(() => () => save(), [save]);
 
@@ -144,11 +160,14 @@ export function Player(props: Props) {
       if (playingRef.current || isPlaying(player)) setControls(false);
     }, HIDE_AFTER_MS);
   }, [player]);
-  const controlsOpacity = useSharedValue(1);
+  // Hidden controls leave the tree at once (Reanimated's opacity and exit animations left them on
+  // screen here); showing them fades in with React Native's own Animated on the native driver.
+  const [controlsFade] = useState(() => new RNAnimated.Value(1));
   useEffect(() => {
-    controlsOpacity.set(withTiming(controls ? 1 : 0, { duration: controls ? 150 : 250, easing: Easing.bezier(0.23, 1, 0.32, 1) }));
-  }, [controls, controlsOpacity]);
-  const controlsStyle = useAnimatedStyle(() => ({ opacity: controlsOpacity.get() }));
+    if (!controls) return;
+    controlsFade.setValue(0);
+    RNAnimated.timing(controlsFade, { toValue: 1, duration: 150, useNativeDriver: true }).start();
+  }, [controls, controlsFade]);
 
   // Timers must not outlive the player: reading a released player throws and closes the app.
   useEffect(() => () => {
@@ -179,12 +198,19 @@ export function Player(props: Props) {
   const seekBy = useCallback((seconds: number, side: 'left' | 'right') => {
     const total = safe(() => player.duration, 0) || duration;
     const at = safe(() => player.currentTime, 0);
-    if ((seconds < 0 && at <= 0.5) || (seconds > 0 && total && at >= total - 1)) haptics.edge();
-    else haptics.seek();
+    const atStart = seconds < 0 && at <= 0.5;
+    const atEnd = seconds > 0 && !!total && at >= total - 1;
+    if (atStart || atEnd) {
+      // Nothing left to skip: don't seek again (each seek to the end replays the end of the file).
+      haptics.edge();
+      if (atEnd && props.hasNext) props.onStep?.(1, true);
+      return;
+    }
+    haptics.seek();
     seekTo(at + seconds);
     setRipple(previous => ({ side, seconds: previous?.side === side ? previous.seconds + seconds : seconds }));
     poke();
-  }, [player, duration, seekTo, poke]);
+  }, [player, duration, seekTo, poke, props]);
 
   useEffect(() => {
     if (!ripple) return;
@@ -209,8 +235,9 @@ export function Player(props: Props) {
     tapTimer.current = setTimeout(() => {
       try {
         if (!started) { player.play(); haptics.tap(); return; }
-        if (!controls && player.playing) { poke(); return; }
-        togglePlay();
+        // A tap shows or hides the controls (play and pause are on the bar), like the TV and YouTube.
+        if (controls) { clearTimeout(hideTimer.current); setControls(false); }
+        else poke();
       } catch { /* The player was closed in the meantime. */ }
     }, DOUBLE_TAP_MS);
   }, [width, props, seekBy, togglePlay, started, controls, player, poke]);
@@ -267,48 +294,48 @@ export function Player(props: Props) {
 
   // Swipe down to leave fullscreen: the video follows the finger, shrinks and rounds its corners,
   // then either closes (far enough or flicked) or springs back.
-  const { height: screenHeight } = useWindowDimensions();
   const videoView = useRef<VideoView>(null);
   // Split View / Slide Over: a narrow window keeps only the essential controls.
   const narrow = width < 560;
-  const reduced = useReducedMotion();
-  const dragY = useSharedValue(0);
+  // React Native's own Animated (native driver) rather than Reanimated: with the player inside a
+  // Reanimated view, React's updates to the controls stopped reaching the screen.
+  const [dragY] = useState(() => new RNAnimated.Value(0));
   const dismiss = useCallback(() => {
     haptics.tap();
-    props.onToggleFullscreen(false);
-    // With PiP on, the player stays mounted (hidden); put it back in place for when it returns.
-    setTimeout(() => dragY.set(0), 300);
-  }, [props, dragY]);
+    // Not "swiped": App shrinks the player back into the card it came from, while the drag offset
+    // eases back to 0, so it flies from where the finger left it into the card.
+    props.onToggleFullscreen(false, false);
+  }, [props]);
   const swipeDown = usePanGesture({
     enabled: fullscreen,
+    runOnJS: true,
     activeOffsetY: 18,
     failOffsetX: [-24, 24],
     onUpdate: event => {
-      'worklet';
-      dragY.set(Math.max(0, event.translationY));
+      dragY.setValue(Math.max(0, event.translationY));
     },
     onDeactivate: event => {
-      'worklet';
       if (event.translationY > 140 || (event.velocityY > 900 && event.translationY > 40)) {
-        dragY.set(withTiming(screenHeight, { duration: 220, easing: Easing.bezier(0.23, 1, 0.32, 1) }));
-        scheduleOnRN(dismiss);
+        RNAnimated.timing(dragY, { toValue: 0, duration: 280, useNativeDriver: true }).start();
+        dismiss();
       } else {
-        dragY.set(withSpring(0, { duration: 400, dampingRatio: 0.8, velocity: event.velocityY }));
+        RNAnimated.spring(dragY, { toValue: 0, velocity: event.velocityY / 1000, bounciness: 4, useNativeDriver: true }).start();
       }
     },
   });
-  const dragStyle = useAnimatedStyle(() => {
-    const y = dragY.get();
-    return {
-      borderRadius: interpolate(y, [0, 200], [0, 24], 'clamp'),
-      opacity: reduced ? interpolate(y, [0, 300], [1, 0.4], 'clamp') : 1,
-      transform: reduced ? [] : [{ translateY: y }, { scale: interpolate(y, [0, 400], [1, 0.82], 'clamp') }],
-    };
-  });
+  const dragStyle = {
+    transform: [
+      { translateY: dragY },
+      { scale: dragY.interpolate({ inputRange: [0, 400], outputRange: [1, 0.82], extrapolate: 'clamp' }) },
+    ],
+  };
 
   return (
     <GestureDetector gesture={swipeDown}>
-    <Animated.View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline, dragStyle]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
+    <RNAnimated.View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline, dragStyle]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
+      {/* The video gets a wrapper of its own: with PiP the native view adds layers to its parent,
+          and the overlays below must not share that parent or removed ones stay on screen. */}
+      <View style={StyleSheet.absoluteFill} pointerEvents="none" collapsable={false}>
       <VideoView
         ref={videoView}
         player={player}
@@ -321,7 +348,8 @@ export function Player(props: Props) {
         onPictureInPictureStart={() => props.onPictureInPictureChange?.(true, true)}
         onPictureInPictureStop={() => props.onPictureInPictureChange?.(false, isPlaying(player))}
       />
-      <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to play or pause, double-tap a side to skip 10 seconds." />
+      </View>
+      <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to show or hide the controls, double-tap a side to skip 10 seconds." />
 
       {!ready && <ActivityIndicator style={styles.center} color={colors.text} size="large" />}
 
@@ -338,10 +366,37 @@ export function Player(props: Props) {
         </View>
       )}
 
+      {started && ready && controls && (
+        // Like the TV: a big round play/pause in the middle, skip buttons beside it. Fades with the bar.
+        <RNAnimated.View pointerEvents="box-none" style={[styles.centerControls, { opacity: controlsFade }]}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Back 10 seconds" onPress={() => seekBy(-SKIP_SECONDS, 'left')} hitSlop={12}>
+            {({ pressed }) => (
+              <Glass round={34} style={[styles.sideCircle, pressed && styles.circlePressed]}>
+                <SymbolView name="gobackward.10" size={28} tintColor={colors.text} />
+              </Glass>
+            )}
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel={playing ? 'Pause' : 'Play'} onPress={togglePlay} hitSlop={12}>
+            {({ pressed }) => (
+              <Glass round={48} style={[styles.bigPlay, !playing && styles.bigPlayOffset, pressed && styles.circlePressed]}>
+                <SymbolView name={playing ? 'pause.fill' : 'play.fill'} size={40} tintColor={colors.text} />
+              </Glass>
+            )}
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel="Forward 10 seconds" onPress={() => seekBy(SKIP_SECONDS, 'right')} hitSlop={12}>
+            {({ pressed }) => (
+              <Glass round={34} style={[styles.sideCircle, pressed && styles.circlePressed]}>
+                <SymbolView name="goforward.10" size={28} tintColor={colors.text} />
+              </Glass>
+            )}
+          </Pressable>
+        </RNAnimated.View>
+      )}
+
       {showBigPlay && (
         <Pressable accessibilityRole="button" accessibilityLabel="Play episode in fullscreen" onPress={playFullscreen} style={styles.center}>
           {({ pressed }) => (
-            <Glass round={48} style={[styles.bigPlay, pressed && { transform: [{ scale: 0.94 }] }]}>
+            <Glass round={48} style={[styles.bigPlay, styles.bigPlayOffset, pressed && styles.circlePressed]}>
               <SymbolView name="play.fill" size={38} tintColor={colors.text} />
             </Glass>
           )}
@@ -356,8 +411,8 @@ export function Player(props: Props) {
         ) : null}
       </View>
 
-      {started && (
-        <Animated.View pointerEvents={controls ? 'box-none' : 'none'} style={[styles.barArea, fullscreen && styles.barAreaFullscreen, controlsStyle]}>
+      {started && controls && (
+        <RNAnimated.View pointerEvents="box-none" style={[styles.barArea, fullscreen && styles.barAreaFullscreen, { opacity: controlsFade }]}>
           <Glass style={styles.bar}>
             <Scrubber time={time} total={total} skips={study.skips} onSeek={(t) => { seekTo(t); poke(); }} />
             <View style={styles.row}>
@@ -388,9 +443,9 @@ export function Player(props: Props) {
               />
             </View>
           </Glass>
-        </Animated.View>
+        </RNAnimated.View>
       )}
-    </Animated.View>
+    </RNAnimated.View>
     </GestureDetector>
   );
 }
@@ -435,7 +490,11 @@ const styles = StyleSheet.create({
   inline: { width: '100%', aspectRatio: 16 / 9, borderRadius: radius.medium },
   fullscreen: { flex: 1 },
   center: { position: 'absolute', alignSelf: 'center', top: '50%', marginTop: -48 },
-  bigPlay: { width: 96, height: 96, alignItems: 'center', justifyContent: 'center', paddingLeft: 6 },
+  bigPlay: { width: 96, height: 96, alignItems: 'center', justifyContent: 'center' },
+  bigPlayOffset: { paddingLeft: 6 },
+  centerControls: { position: 'absolute', left: 0, right: 0, top: '50%', marginTop: -48, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 44 },
+  sideCircle: { width: 68, height: 68, alignItems: 'center', justifyContent: 'center' },
+  circlePressed: { transform: [{ scale: 0.94 }] },
   ripple: { position: 'absolute', top: 0, bottom: 0, width: '34%', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', gap: 4 },
   rippleLeft: { left: 0, borderTopRightRadius: 400, borderBottomRightRadius: 400 },
   rippleRight: { right: 0, borderTopLeftRadius: 400, borderBottomLeftRadius: 400 },

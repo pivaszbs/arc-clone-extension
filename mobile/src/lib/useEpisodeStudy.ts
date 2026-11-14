@@ -32,7 +32,10 @@ export function useEpisodeStudy(episode: Episode | undefined, neighbours: Episod
       if (!cancelled) setLoaded({ key: episode.key, body, cues, japanese: animeCore.isJapanese(cues, false), references });
     })();
     return () => { cancelled = true; };
-  }, [episode, neighbours]);
+    // Only when the episode or its neighbours' subtitles really change: re-reading them and finding
+    // the opening/ending again is heavy, and new objects for the same episodes arrive on every refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [episode?.key, episode?.subtitleUri, neighbours.map(item => `${item.key}\n${item.subtitleUri ?? ''}`).join('\n')]);
 
   const ready = loaded && loaded.key === episode?.key ? loaded : null;
 

@@ -10,6 +10,7 @@ import { PipelinesView, type ImportPipelineState, type LocalScanState } from './
 import { Player } from './src/components/Player';
 import { SeriesGallery } from './src/components/SeriesGallery';
 import { SeriesScreen } from './src/components/SeriesScreen';
+import { ZoomFrom, type Rect, type ZoomHandle } from './src/components/ZoomFrom';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
 import { StatusDot, TabBar, type Tab } from './src/components/ui';
 import { installCrashLog } from './src/lib/crash-log';
@@ -51,6 +52,9 @@ export default function App() {
 function Study() {
   const { width } = useWindowDimensions();
   const insets = useSafeAreaInsets();
+  // The largest top inset seen: hiding the status bar for the video must not move the screen under it.
+  const [stableTop, setStableTop] = useState(insets.top);
+  if (insets.top > stableTop) setStableTop(insets.top);
   const initialServerUrl = normalizeTvServerUrl(savedSettings().tvServerUrl || DEFAULT_TV_SERVER_URL);
   const [mode, setModeState] = useState<AppMode>(() => {
     const saved = savedSettings().tab;
@@ -152,6 +156,8 @@ function Study() {
     }
   }, []);
 
+  const librarySignature = useRef('');
+  const remoteReloadTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const loadRemote = useCallback(async (targetUrl?: string) => {
     const url = normalizeTvServerUrl(targetUrl ?? serverUrlRef.current);
     setHttpStatus({ state: 'checking' });
@@ -163,7 +169,13 @@ function Study() {
       refreshProgress();
       if (remoteTvState) handleTvState(remoteTvState);
       if (sourceRef.current === 'server') {
-        setLibrary(remote);
+        // An unchanged catalog keeps the same objects, so nothing downstream (the playing episode's
+        // subtitle and opening/ending work) starts over.
+        const signature = JSON.stringify(remote);
+        if (signature !== librarySignature.current) {
+          librarySignature.current = signature;
+          setLibrary(remote);
+        }
       }
       setServerError(null);
       tvSyncRef.current?.log('Catalog', `Loaded ${remote.length} series (HTTP ${statusCode})`);
@@ -256,7 +268,9 @@ function Study() {
             }
           }
         } else if (sourceRef.current === 'server' && typeof msg.autoplay !== 'boolean') {
-          void loadRemote();
+          // Bursts of broadcasts (a worker publishing timings, another device syncing) reload once.
+          clearTimeout(remoteReloadTimer.current);
+          remoteReloadTimer.current = setTimeout(() => { void loadRemote(); }, 1500);
         }
       },
       setScanProgress,
@@ -310,12 +324,22 @@ function Study() {
   // Picture in Picture: leaving the player while PiP is on keeps it mounted (hidden) so the video
   // goes on in its floating window while you browse.
   const [pipActive, setPipActive] = useState(false);
+  // Where the tapped cover / card was, so the series screen and the player grow out of it.
+  const [seriesOrigin, setSeriesOrigin] = useState<Rect | null>(null);
+  const [playerOrigin, setPlayerOrigin] = useState<Rect | null>(null);
+  const playerZoom = useRef<ZoomHandle>(null);
+  const seriesZoom = useRef<ZoomHandle>(null);
   const [playerHidden, setPlayerHidden] = useState(false);
   const fullscreen = !!episode && !tvControlling && !playerHidden;
-  const index = series && episode ? series.episodes.indexOf(episode) : -1;
+  // By key: the playing episode may be the downloaded copy, a different object than the listed one.
+  const index = series && episode ? series.episodes.findIndex(item => item.key === episode.key) : -1;
+  // Keyed by which episodes they are, so a reloaded catalog doesn't redo the subtitle work.
+  const neighbourList = series && index >= 0 ? series.episodes.slice(Math.max(0, index - 2), index + 3) : [];
+  const neighbourIdentity = neighbourList.map(item => `${item.key}\n${item.subtitleUri ?? ''}`).join('\n');
   const neighbours = useMemo(
-    () => (series && index >= 0 ? series.episodes.slice(Math.max(0, index - 2), index + 3) : []),
-    [series, index],
+    () => neighbourList,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [neighbourIdentity],
   );
 
   // iPhones turn to landscape for fullscreen; iPads keep whatever the user holds.
@@ -367,7 +391,8 @@ function Study() {
     );
   };
 
-  const selectEpisode = (next: Episode) => {
+  const selectEpisode = (next: Episode, from: Rect | null = null) => {
+    setPlayerOrigin(from);
     haptics.select();
     if (tvControlling && series) {
       tvSyncRef.current?.sendTvControl({ action: 'playEpisode', seriesName: series.folder, episode: next.video });
@@ -508,6 +533,7 @@ function Study() {
   const closePlayer = () => { setEpisodeKey(null); setPlayerHidden(false); setPipActive(false); };
   const fullscreenPlayer = episode && !tvControlling && (
     <View style={fullscreen && mode === 'watch' ? StyleSheet.absoluteFill : styles.pipHost} pointerEvents={fullscreen && mode === 'watch' ? 'auto' : 'none'}>
+      <ZoomFrom ref={playerZoom} origin={playerOrigin} backdrop="#000" contentStyle={{ backgroundColor: '#000' }}>
       <Player
         episode={episode}
         neighbours={neighbours}
@@ -516,10 +542,12 @@ function Study() {
         autoSkip={settings.autoSkip}
         subtitlesOn={settings.subtitles}
         // The exit button goes back to the series; a double tap in the middle does nothing here.
-        onToggleFullscreen={value => {
+        onToggleFullscreen={(value, swiped) => {
           if (value !== false) return;
           if (pipActive) setPlayerHidden(true);
-          else closePlayer();
+          // The exit button shrinks the player back into its card; a swipe down already moved it away.
+          else if (swiped || !playerZoom.current) closePlayer();
+          else playerZoom.current.collapse(closePlayer);
         }}
         onPictureInPictureChange={(active, stillPlaying) => {
           setPipActive(active);
@@ -534,6 +562,7 @@ function Study() {
         hasNext={!!series && index < series.episodes.length - 1}
         onProgress={handlePhoneProgress}
       />
+      </ZoomFrom>
     </View>
   );
 
@@ -614,7 +643,12 @@ function Study() {
       width={width}
       autoSkip={settings.autoSkip}
       onAutoSkip={value => updateSettings({ autoSkip: value })}
-      onBack={() => { setFolder(null); setEpisodeKey(null); }}
+      onBack={swiped => {
+        const back = () => { setFolder(null); setEpisodeKey(null); };
+        // "All titles" shrinks the screen back into its cover; the edge swipe already slid it away.
+        if (swiped || !seriesZoom.current) back();
+        else seriesZoom.current.collapse(back);
+      }}
       onPlay={selectEpisode}
       onToggleWatched={ep => toggleEpisodeWatched(ep, series)}
       fromMac={source === 'server'}
@@ -632,7 +666,10 @@ function Study() {
   return (
     <View style={styles.root}>
       <StatusBar style="light" hidden={fullscreen} />
-      <SafeAreaView style={styles.root} edges={playing ? [] : ['top', 'left', 'right']}>
+      {/* Insets never change while playing (the player covers everything from outside), so nothing
+          under it shifts as it opens or closes. The top inset is held at its largest, so hiding the
+          status bar for the video doesn't move the screen either. */}
+      <SafeAreaView style={[styles.root, { paddingTop: stableTop }]} edges={['left', 'right']}>
         {mode === 'pipelines' ? (
           <View style={{ flex: 1 }}>
             {header}
@@ -643,10 +680,6 @@ function Study() {
             {header}
             <DownloadView serverUrl={serverUrl} onMacProgress={() => { void loadRemote(); }} />
           </View>
-        ) : playing ? (
-          <View style={{ flex: 1, backgroundColor: '#000' }} />
-        ) : seriesScreen ? (
-          <View style={{ flex: 1 }}>{header}{seriesScreen}</View>
         ) : library.length ? (
           <View style={{ flex: 1 }}>
             <SeriesGallery
@@ -654,16 +687,41 @@ function Study() {
               progress={allProgress()}
               width={width}
               header={header}
-              onOpen={item => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
+              onOpen={(item, from) => { haptics.select(); setSeriesOrigin(from); setFolder(item.folder); setEpisodeKey(null); }}
+              onPlay={(item, next, from) => {
+                setPlayerOrigin(from);
+                // One tap from the Continue card: open the series and play, as on its screen.
+                setFolder(item.folder);
+                if (tvControlling) {
+                  tvSyncRef.current?.sendTvControl({ action: 'playEpisode', seriesName: item.folder, episode: next.video });
+                  return;
+                }
+                setEpisodeKey(next.key);
+                setPlayerHidden(false);
+                if (source === 'server') {
+                  void tvSyncRef.current?.pushSync({ playingFolder: item.folder, playingEpisode: next.video });
+                }
+              }}
             />
+            {seriesScreen && (
+              // The series opens over the gallery (kept underneath, scroll and all) out of its cover.
+              <View style={StyleSheet.absoluteFill}>
+                <ZoomFrom ref={seriesZoom} origin={seriesOrigin} backdrop={colors.background} contentStyle={{ backgroundColor: colors.background }}>
+                  {header}{seriesScreen}
+                </ZoomFrom>
+              </View>
+            )}
           </View>
+        ) : playing ? (
+          <View style={{ flex: 1, backgroundColor: '#000' }} />
         ) : (
           <View style={{ flex: 1 }}>{header}{empty}</View>
         )}
-        {!playing && <TabBar tabs={tabs} current={mode} onChange={setMode} bottomInset={insets.bottom} />}
-        {/* Always the last child, so showing or hiding it never remounts the player (and its PiP window). */}
-        {fullscreenPlayer}
+        <TabBar tabs={tabs} current={mode} onChange={setMode} bottomInset={insets.bottom} />
       </SafeAreaView>
+      {/* Always the last child, over everything (outside the safe area), so showing or hiding it never
+          remounts the player (and its PiP window) or moves the screen under it. */}
+      {fullscreenPlayer}
     </View>
   );
 }

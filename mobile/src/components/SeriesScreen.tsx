@@ -1,9 +1,7 @@
 import { SymbolView } from 'expo-symbols';
-import { useEffect } from 'react';
-import { ActivityIndicator, Alert, FlatList, Image, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
+import { useState } from 'react';
+import { ActivityIndicator, Alert, Animated, FlatList, Image, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
-import Animated, { Easing, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
-import { scheduleOnRN } from 'react-native-worklets';
 
 import { episodeDownloads, useEpisodeDownloads } from '../lib/episode-downloads';
 import { clock } from '../lib/format';
@@ -11,8 +9,9 @@ import { haptics } from '../lib/haptics';
 import type { Episode, Series } from '../lib/library';
 import type { Progress } from '../lib/storage';
 import { colors, radius, space } from '../theme';
-import { seriesProgress } from './SeriesGallery';
+import { continueEpisode, seriesProgress } from './SeriesGallery';
 import { SwipeCard, swipeColors } from './SwipeCard';
+import { rectOf, type Rect } from './ZoomFrom';
 
 type Props = {
   series: Series;
@@ -20,8 +19,10 @@ type Props = {
   width: number;
   autoSkip: boolean;
   onAutoSkip: (value: boolean) => void;
-  onBack: () => void;
-  onPlay: (episode: Episode) => void;
+  /** `swiped`: the edge swipe already slid the screen away. */
+  onBack: (swiped?: boolean) => void;
+  /** `from` is the tapped card or button, so the player can grow out of it. */
+  onPlay: (episode: Episode, from: Rect | null) => void;
   onToggleWatched: (episode: Episode) => void;
   /** True for series from the Mac: episodes can be downloaded to this device. */
   fromMac: boolean;
@@ -30,15 +31,6 @@ type Props = {
 };
 
 const device = Platform.OS === 'ios' && Platform.isPad ? 'iPad' : 'iPhone';
-const EASE_OUT = Easing.bezier(0.23, 1, 0.32, 1);
-
-/** The episode to continue with: the one in progress, or the next after the last finished one. */
-export function continueEpisode(series: Series, progress: Record<string, Progress>) {
-  const { latest } = seriesProgress(series, progress);
-  if (latest < 0) return series.episodes[0];
-  const last = series.episodes[latest];
-  return progress[last.key]?.finished ? series.episodes[latest + 1] ?? last : last;
-}
 
 function confirmRemove(series: Series, episode: Episode, fromMac: boolean) {
   Alert.alert(`Remove ${episode.label} from this ${device}?`, fromMac ? 'You can download it again from the Mac.' : 'The file is deleted from this device.', [
@@ -47,12 +39,9 @@ function confirmRemove(series: Series, episode: Episode, fromMac: boolean) {
   ]);
 }
 
-/** A progress fill that glides to its new width instead of jumping (absolute and childless, so cheap). */
+/** A progress fill. */
 function Bar({ fraction }: { fraction: number }) {
-  const value = useSharedValue(fraction);
-  useEffect(() => { value.set(withTiming(fraction, { duration: 250, easing: Easing.linear })); }, [fraction, value]);
-  const fill = useAnimatedStyle(() => ({ width: `${Math.max(0, Math.min(1, value.get())) * 100}%` }));
-  return <View style={styles.bar}><Animated.View style={[styles.barFill, fill]} /></View>;
+  return <View style={styles.bar}><View style={[styles.barFill, { width: `${Math.max(0, Math.min(1, fraction)) * 100}%` }]} /></View>;
 }
 
 function DownloadIcon({ series, episode, fromMac }: { series: Series; episode: Episode; fromMac: boolean }) {
@@ -94,7 +83,6 @@ function DownloadIcon({ series, episode, fromMac }: { series: Series; episode: E
 export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, onBack, onPlay, onToggleWatched, fromMac, extra }: Props) {
   const { height } = useWindowDimensions();
   const downloads = useEpisodeDownloads();
-  const reduced = useReducedMotion();
   const next = continueEpisode(series, progress);
   const nextSaved = next ? progress[next.key] : undefined;
   const { watched } = seriesProgress(series, progress);
@@ -112,34 +100,31 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
   const cardWidth = (gridWidth - space.l * 2 - space.m * (columns - 1)) / columns;
   const coverWidth = twoPane ? Math.min(sideWidth - space.l * 2, Math.round(height * 0.38 * 0.75)) : width >= 700 ? 200 : 110;
 
-  // Enter: a short fade and rise (fade only with Reduce Motion).
-  const enter = useSharedValue(0);
-  useEffect(() => { enter.set(withTiming(1, { duration: 240, easing: EASE_OUT })); }, [enter, series.folder]);
-  // Swipe in from the left edge to go back.
-  const dragX = useSharedValue(0);
-  const back = () => { haptics.tap(); onBack(); };
+  // Entering is App's ZoomFrom (the screen grows out of the tapped cover).
+  // Swipe in from the left edge to go back. React Native's Animated on the native driver.
+  const [dragX] = useState(() => new Animated.Value(0));
   const edge = usePanGesture({
+    runOnJS: true,
     hitSlop: { left: 0, width: 28 },
     activeOffsetX: 12,
     failOffsetY: [-14, 14],
     onUpdate: event => {
-      'worklet';
-      dragX.set(Math.max(0, event.translationX));
+      dragX.setValue(Math.max(0, event.translationX));
     },
     onDeactivate: event => {
-      'worklet';
       if (event.translationX > 110 || (event.velocityX > 700 && event.translationX > 30)) {
-        dragX.set(withTiming(width, { duration: 220, easing: EASE_OUT }));
-        scheduleOnRN(back);
+        Animated.timing(dragX, { toValue: width, duration: 220, useNativeDriver: true }).start();
+        haptics.tap();
+        onBack(true);
       } else {
-        dragX.set(withSpring(0, { duration: 400, dampingRatio: 0.8, velocity: event.velocityX }));
+        Animated.spring(dragX, { toValue: 0, velocity: event.velocityX / 1000, bounciness: 4, useNativeDriver: true }).start();
       }
     },
   });
-  const screenStyle = useAnimatedStyle(() => ({
-    opacity: enter.get() * (1 - Math.min(0.4, dragX.get() / (width * 1.5))),
-    transform: [{ translateX: dragX.get() }, { translateY: reduced ? 0 : (1 - enter.get()) * 12 }],
-  }));
+  const screenStyle = {
+    opacity: dragX.interpolate({ inputRange: [0, width], outputRange: [1, 0.6], extrapolate: 'clamp' }),
+    transform: [{ translateX: dragX }],
+  };
 
   const playLabel = nextSaved && !nextSaved.finished && nextSaved.position >= 1
     ? `Continue ${next!.label} · ${clock(nextSaved.position)}`
@@ -174,7 +159,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
       {!!series.credit && <Text style={styles.credit} numberOfLines={1}>{series.credit}</Text>}
       <Text style={styles.count}>{series.episodes.length} episodes · {watched} watched</Text>
       {next && (
-        <Pressable onPress={() => { haptics.tap(); onPlay(next); }} style={({ pressed }) => [styles.play, twoPane && styles.playSide, pressed && styles.pressed]}>
+        <Pressable onPress={event => { haptics.tap(); void rectOf(event.currentTarget).then(from => onPlay(next, from)); }} style={({ pressed }) => [styles.play, twoPane && styles.playSide, pressed && styles.pressed]}>
           <SymbolView name="play.fill" size={16} tintColor={colors.background} />
           <Text style={styles.playText} numberOfLines={1}>{playLabel}</Text>
         </Pressable>
@@ -236,7 +221,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
           <SwipeCard
             style={{ width: cardWidth }}
             accessibilityLabel={`${item.label}, ${status}`}
-            onPress={() => { haptics.tap(); onPlay(item); }}
+            onPress={target => { haptics.tap(); void rectOf(target).then(from => onPlay(item, from)); }}
             right={{
               label: saved?.finished ? 'Unwatched' : 'Watched',
               icon: saved?.finished ? 'arrow.uturn.backward.circle' : 'checkmark.circle.fill',
