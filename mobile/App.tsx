@@ -52,6 +52,9 @@ export default function App() {
 function Study() {
   const { width } = useWindowDimensions();
   const insets = useSafeAreaInsets();
+  // The largest top inset seen: hiding the status bar for the video must not move the screen under it.
+  const [stableTop, setStableTop] = useState(insets.top);
+  if (insets.top > stableTop) setStableTop(insets.top);
   const initialServerUrl = normalizeTvServerUrl(savedSettings().tvServerUrl || DEFAULT_TV_SERVER_URL);
   const [mode, setModeState] = useState<AppMode>(() => {
     const saved = savedSettings().tab;
@@ -663,7 +666,10 @@ function Study() {
   return (
     <View style={styles.root}>
       <StatusBar style="light" hidden={fullscreen} />
-      <SafeAreaView style={styles.root} edges={playing ? [] : ['top', 'left', 'right']}>
+      {/* Insets never change while playing (the player covers everything from outside), so nothing
+          under it shifts as it opens or closes. The top inset is held at its largest, so hiding the
+          status bar for the video doesn't move the screen either. */}
+      <SafeAreaView style={[styles.root, { paddingTop: stableTop }]} edges={['left', 'right']}>
         {mode === 'pipelines' ? (
           <View style={{ flex: 1 }}>
             {header}
@@ -711,10 +717,11 @@ function Study() {
         ) : (
           <View style={{ flex: 1 }}>{header}{empty}</View>
         )}
-        {!playing && <TabBar tabs={tabs} current={mode} onChange={setMode} bottomInset={insets.bottom} />}
-        {/* Always the last child, so showing or hiding it never remounts the player (and its PiP window). */}
-        {fullscreenPlayer}
+        <TabBar tabs={tabs} current={mode} onChange={setMode} bottomInset={insets.bottom} />
       </SafeAreaView>
+      {/* Always the last child, over everything (outside the safe area), so showing or hiding it never
+          remounts the player (and its PiP window) or moves the screen under it. */}
+      {fullscreenPlayer}
     </View>
   );
 }
