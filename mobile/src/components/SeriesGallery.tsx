@@ -1,6 +1,6 @@
 import { SymbolView } from 'expo-symbols';
 import { useState } from 'react';
-import { FlatList, Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { FlatList, Image, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 
 import { clock } from '../lib/format';
 import { haptics } from '../lib/haptics';
@@ -18,6 +18,9 @@ type Props = {
   /** One tap on the Continue card plays this episode straight away. */
   onPlay: (series: Series, episode: Episode, from: Rect | null) => void;
   header?: React.ReactElement;
+  /** Pull down to reload the library. */
+  refreshing?: boolean;
+  onRefresh?: () => void;
 };
 
 /** Where you are in a series: the episode last watched, and how much of the series is finished. */
@@ -102,7 +105,7 @@ function Poster({ series }: { series: Series }) {
 }
 
 /** The library as a wall of covers, like the TV app. */
-export function SeriesGallery({ series, progress, width, onOpen, onPlay, header }: Props) {
+export function SeriesGallery({ series, progress, width, onOpen, onPlay, header, refreshing = false, onRefresh }: Props) {
   const columns = Math.max(2, Math.min(6, Math.floor(width / 190)));
   const recent = lastWatched(series, progress);
   const listHeader = (
@@ -127,6 +130,7 @@ export function SeriesGallery({ series, progress, width, onOpen, onPlay, header 
       ListHeaderComponentStyle={styles.header}
       contentContainerStyle={styles.content}
       columnWrapperStyle={styles.row}
+      refreshControl={onRefresh ? <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.textSecondary} /> : undefined}
       renderItem={({ item }) => {
         const { latest, watched } = seriesProgress(item, progress);
         const total = item.episodes.length;

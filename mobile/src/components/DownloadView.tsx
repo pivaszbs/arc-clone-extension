@@ -14,6 +14,7 @@ const WebView = WebViewClass as unknown as React.ComponentType<WebViewProps & Re
 
 const HOME = 'https://smotret-anime.com/';
 const POLL_MS = 5000;
+const NOT_ANSWERING = 'The Mac is not answering. Is npm run mac:up running?';
 
 type Props = {
   serverUrl: string;
@@ -51,11 +52,13 @@ export function DownloadView({ serverUrl, onMacProgress }: Props) {
         const next = await listMacDownloads(serverUrl);
         if (stopped) return;
         setRequests(next);
+        // The Mac is back: drop the warning.
+        setStatus(current => (current === NOT_ANSWERING ? '' : current));
         const done = next.reduce((sum, item) => sum + (item.done ?? 0) + (item.state === 'done' ? 1 : 0), 0);
         if (finished.current !== null && done > finished.current) onMacProgress();
         finished.current = done;
       } catch (error) {
-        if (!stopped) setStatus(error instanceof Error && /answered/.test(error.message) ? error.message : 'The Mac is not answering. Is npm run mac:up running?');
+        if (!stopped) setStatus(error instanceof Error && /answered/.test(error.message) ? error.message : NOT_ANSWERING);
       }
     };
     void poll();

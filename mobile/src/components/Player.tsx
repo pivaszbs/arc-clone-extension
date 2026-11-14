@@ -51,6 +51,8 @@ function safe<T>(action: () => T, fallback: T): T {
 }
 const SKIP_SECONDS = 10;
 const HIDE_AFTER_MS = 3000;
+const FADE_OUT_MS = 180;
+const SLOW_LOAD_MS = 4000;
 const skipOrder: SkipPart[] = ['recap', 'op', 'ed'];
 
 export function Player(props: Props) {
@@ -68,6 +70,11 @@ export function Player(props: Props) {
   const [ripple, setRipple] = useState<{ side: 'left' | 'right'; seconds: number } | null>(null);
   const [undo, setUndo] = useState<{ part: SkipPart; from: number } | null>(null);
   const [width, setWidth] = useState(1);
+  /** Why the episode couldn't be loaded (the Mac is off, the file is gone), instead of a spinner forever. */
+  const [failure, setFailure] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  /** Where the finger is on the scrubber, while it's held. */
+  const [scrub, setScrub] = useState<number | null>(null);
   const study = useEpisodeStudy(episode, props.neighbours, duration);
 
   const dismissed = useRef(new Set<SkipPart>());
@@ -76,6 +83,11 @@ export function Player(props: Props) {
   const tapTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const lastTap = useRef<{ at: number; side: 'left' | 'center' | 'right' } | null>(null);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // After a seek the player still reports a few old positions; ignore them so the thumb doesn't jump back.
+  const seekTarget = useRef<{ time: number; until: number } | null>(null);
+  const scrubbing = useRef(false);
+  // A player that failed reports position 0; saving that would lose the place.
+  const failed = useRef(false);
 
   // ----- Loading and progress -----
 
@@ -83,13 +95,21 @@ export function Player(props: Props) {
     const saved = progressFor(episode.key);
     resumeAt.current = saved && !saved.finished ? saved.position : 0;
     dismissed.current.clear();
+    seekTarget.current = null;
+    failed.current = false;
+    // The scrubber may have been under a finger when the episode changed.
+    scrubbing.current = false;
+    setScrub(null);
     setReady(false);
     setStarted(false);
+    setFailure(null);
     setTime(resumeAt.current);
     setDuration(saved?.duration ?? 0);
     setUndo(null);
-    void player.replaceAsync({ uri: episode.videoUri, metadata: { title: episode.label } });
-  }, [episode, player]);
+    player.replaceAsync({ uri: episode.videoUri, metadata: { title: episode.label } })
+      .catch(() => { /* Reported through statusChange, or the player is already released. */ });
+    // `attempt`: Try again loads the same episode once more.
+  }, [episode, player, attempt]);
 
   // The latest props, for callbacks that must stay stable (see save below).
   const propsRef = useRef(props);
@@ -111,7 +131,7 @@ export function Player(props: Props) {
       position = player.currentTime;
       playerDuration = player.duration;
     } catch { return; /* Already released (the episode was closed). */ }
-    if (!ready || !Number.isFinite(position)) return;
+    if (!ready || failed.current || !Number.isFinite(position)) return;
     const total = playerDuration || duration;
     // Watched once the ending has started (skipping or closing on it counts), or the last 5 s.
     const reachedEnding = endingStart.current !== undefined && position >= endingStart.current - 1;
@@ -124,8 +144,16 @@ export function Player(props: Props) {
 
   useEffect(() => () => save(), [save]);
 
-  useEventListener(player, 'statusChange', ({ status }) => {
+  useEventListener(player, 'statusChange', ({ status, error }) => {
+    if (status === 'error') {
+      // Try again resumes from the last saved position (at most 5 s back).
+      failed.current = true;
+      setReady(false);
+      setFailure(error?.message || 'The video could not be loaded.');
+      return;
+    }
     if (status !== 'readyToPlay' || ready) return;
+    setFailure(null);
     setReady(true);
     safe(() => {
       setDuration(player.duration);
@@ -143,9 +171,23 @@ export function Player(props: Props) {
     if (props.hasNext) props.onStep?.(1, true);
   });
   useEventListener(player, 'timeUpdate', ({ currentTime }) => {
+    const target = seekTarget.current;
+    if (target && Date.now() < target.until && Math.abs(currentTime - target.time) > 1.5) return;
+    seekTarget.current = null;
     setTime(currentTime);
     if (Date.now() - lastSaved.current > 5000 && isPlaying(player)) save();
   });
+
+  // A stream from a Mac that is asleep can sit on the spinner for a long time before it fails:
+  // after a few seconds offer a way out (before the first frame there are no controls yet).
+  const loadId = `${episode.key}#${attempt}`;
+  const [slowLoad, setSlowLoad] = useState<string | null>(null);
+  useEffect(() => {
+    if (ready || failure) return;
+    const timer = setTimeout(() => setSlowLoad(loadId), SLOW_LOAD_MS);
+    return () => clearTimeout(timer);
+  }, [ready, failure, loadId]);
+  const stuck = !ready && !failure && slowLoad === loadId;
 
   // ----- Controls visibility -----
 
@@ -157,16 +199,23 @@ export function Player(props: Props) {
     setControls(true);
     clearTimeout(hideTimer.current);
     hideTimer.current = setTimeout(() => {
+      // Not under a finger that is dragging the scrubber.
+      if (scrubbing.current) return;
       if (playingRef.current || isPlaying(player)) setControls(false);
     }, HIDE_AFTER_MS);
   }, [player]);
-  // Hidden controls leave the tree at once (Reanimated's opacity and exit animations left them on
-  // screen here); showing them fades in with React Native's own Animated on the native driver.
+  // Controls fade in and out with React Native's own Animated on the native driver (Reanimated's
+  // opacity and exit animations left them on screen here). `controlsMounted` trails `controls` by
+  // the fade-out; a plain timer takes them out of the tree, so they are gone even if the animation
+  // never reports back, and while fading out they take no touches.
   const [controlsFade] = useState(() => new RNAnimated.Value(1));
+  const [controlsMounted, setControlsMounted] = useState(true);
+  if (controls && !controlsMounted) setControlsMounted(true);
   useEffect(() => {
-    if (!controls) return;
-    controlsFade.setValue(0);
-    RNAnimated.timing(controlsFade, { toValue: 1, duration: 150, useNativeDriver: true }).start();
+    RNAnimated.timing(controlsFade, { toValue: controls ? 1 : 0, duration: controls ? 150 : FADE_OUT_MS, useNativeDriver: true }).start();
+    if (controls) return;
+    const timer = setTimeout(() => setControlsMounted(false), FADE_OUT_MS);
+    return () => clearTimeout(timer);
   }, [controls, controlsFade]);
 
   // Timers must not outlive the player: reading a released player throws and closes the app.
@@ -186,6 +235,7 @@ export function Player(props: Props) {
     const total = safe(() => player.duration, 0) || duration;
     const target = Math.max(0, total ? Math.min(total - 0.25, seconds) : seconds);
     safe(() => { player.currentTime = target; }, undefined);
+    seekTarget.current = { time: target, until: Date.now() + 1200 };
     setTime(target);
   }, [player, duration]);
 
@@ -222,6 +272,21 @@ export function Player(props: Props) {
   const onSurfacePress = useCallback((event: GestureResponderEvent) => {
     const x = event.nativeEvent.locationX;
     const side = x < width / 3 ? 'left' : x > (width * 2) / 3 ? 'right' : 'center';
+    const single = () => {
+      try {
+        if (!started) { player.play(); haptics.tap(); return; }
+        // A tap shows or hides the controls (play and pause are on the bar), like the TV and YouTube.
+        if (controls) { clearTimeout(hideTimer.current); setControls(false); }
+        else poke();
+      } catch { /* The player was closed in the meantime. */ }
+    };
+    // In fullscreen a double tap in the middle does nothing, so a tap there needn't wait for one.
+    if (side === 'center' && fullscreen) {
+      clearTimeout(tapTimer.current);
+      lastTap.current = null;
+      single();
+      return;
+    }
     const now = Date.now();
     const previous = lastTap.current;
     lastTap.current = { at: now, side };
@@ -232,15 +297,8 @@ export function Player(props: Props) {
       return;
     }
     clearTimeout(tapTimer.current);
-    tapTimer.current = setTimeout(() => {
-      try {
-        if (!started) { player.play(); haptics.tap(); return; }
-        // A tap shows or hides the controls (play and pause are on the bar), like the TV and YouTube.
-        if (controls) { clearTimeout(hideTimer.current); setControls(false); }
-        else poke();
-      } catch { /* The player was closed in the meantime. */ }
-    }, DOUBLE_TAP_MS);
-  }, [width, props, seekBy, togglePlay, started, controls, player, poke]);
+    tapTimer.current = setTimeout(single, DOUBLE_TAP_MS);
+  }, [width, props, seekBy, started, controls, player, poke, fullscreen]);
 
   const playFullscreen = useCallback(() => {
     haptics.tap();
@@ -351,7 +409,28 @@ export function Player(props: Props) {
       </View>
       <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to show or hide the controls, double-tap a side to skip 10 seconds." />
 
-      {!ready && <ActivityIndicator style={styles.center} color={colors.text} size="large" />}
+      {!ready && !failure && <ActivityIndicator style={styles.center} color={colors.text} size="large" />}
+
+      {stuck && (
+        <View style={styles.stuck} pointerEvents="box-none">
+          <Text style={styles.failureText}>Still loading…</Text>
+          <GlassPill label="Close" onPress={() => { haptics.select(); props.onToggleFullscreen(false); }} />
+        </View>
+      )}
+
+      {failure && (
+        <View style={styles.failure} pointerEvents="box-none">
+          <SymbolView name="exclamationmark.triangle" size={34} tintColor={colors.textSecondary} />
+          <Text style={styles.failureTitle}>{`Can't play ${episode.label}`}</Text>
+          <Text style={styles.failureText} numberOfLines={3}>
+            {/^https?:/i.test(episode.videoUri) ? 'It streams from the Mac, which is not answering. Download episodes to watch them away from it.' : failure}
+          </Text>
+          <View style={styles.failureActions}>
+            <GlassPill accent label="Try again" onPress={() => { haptics.select(); setAttempt(value => value + 1); }} />
+            <GlassPill label="Close" onPress={() => { haptics.select(); props.onToggleFullscreen(false); }} />
+          </View>
+        </View>
+      )}
 
       {ripple && (
         <View pointerEvents="none" style={[styles.ripple, ripple.side === 'left' ? styles.rippleLeft : styles.rippleRight]}>
@@ -366,9 +445,9 @@ export function Player(props: Props) {
         </View>
       )}
 
-      {started && ready && controls && (
+      {started && ready && controlsMounted && (
         // Like the TV: a big round play/pause in the middle, skip buttons beside it. Fades with the bar.
-        <RNAnimated.View pointerEvents="box-none" style={[styles.centerControls, { opacity: controlsFade }]}>
+        <RNAnimated.View pointerEvents={controls ? 'box-none' : 'none'} style={[styles.centerControls, { opacity: controlsFade }]}>
           <Pressable accessibilityRole="button" accessibilityLabel="Back 10 seconds" onPress={() => seekBy(-SKIP_SECONDS, 'left')} hitSlop={12}>
             {({ pressed }) => (
               <Glass round={34} style={[styles.sideCircle, pressed && styles.circlePressed]}>
@@ -411,17 +490,24 @@ export function Player(props: Props) {
         ) : null}
       </View>
 
-      {started && controls && (
-        <RNAnimated.View pointerEvents="box-none" style={[styles.barArea, fullscreen && styles.barAreaFullscreen, { opacity: controlsFade }]}>
+      {started && controlsMounted && (
+        <RNAnimated.View pointerEvents={controls ? 'box-none' : 'none'} style={[styles.barArea, fullscreen && styles.barAreaFullscreen, { opacity: controlsFade }]}>
           <Glass style={styles.bar}>
-            <Scrubber time={time} total={total} skips={study.skips} onSeek={(t) => { seekTo(t); poke(); }} />
+            <Scrubber
+              time={time}
+              total={total}
+              skips={study.skips}
+              // The controls stay while a finger holds the scrubber, and the clock follows it.
+              onScrub={(t) => { scrubbing.current = t !== null; setScrub(t); if (t === null) poke(); }}
+              onSeek={(t) => { seekTo(t); poke(); }}
+            />
             <View style={styles.row}>
               {!narrow && <IconButton name="backward.end.fill" label="Previous episode" size={18} disabled={!props.hasPrevious} onPress={() => { haptics.select(); props.onStep?.(-1, playing); }} />}
               <IconButton name="gobackward.10" label="Back 10 seconds" onPress={() => seekBy(-SKIP_SECONDS, 'left')} />
               <IconButton name={playing ? 'pause.fill' : 'play.fill'} label={playing ? 'Pause' : 'Play'} size={26} onPress={togglePlay} />
               <IconButton name="goforward.10" label="Forward 10 seconds" onPress={() => seekBy(SKIP_SECONDS, 'right')} />
               {!narrow && <IconButton name="forward.end.fill" label="Next episode" size={18} disabled={!props.hasNext} onPress={() => { haptics.select(); props.onStep?.(1, playing); }} />}
-              <Text style={styles.time} numberOfLines={1}>{narrow ? clock(time) : `${clock(time)} / ${clock(total)}`}</Text>
+              <Text style={[styles.time, scrub !== null && styles.timeScrubbing]} numberOfLines={1}>{narrow ? clock(scrub ?? time) : `${clock(scrub ?? time)} / ${clock(total)}`}</Text>
               {pipSupported && (
                 <IconButton
                   name="pip.enter"
@@ -450,11 +536,14 @@ export function Player(props: Props) {
   );
 }
 
-function Scrubber({ time, total, skips, onSeek }: {
+function Scrubber({ time, total, skips, onSeek, onScrub }: {
   time: number; total: number; skips: Partial<Record<SkipPart, TimeRange>>; onSeek: (time: number) => void;
+  /** The position under the finger while it drags; null when it lets go. */
+  onScrub: (time: number | null) => void;
 }) {
   const [width, setWidth] = useState(1);
-  const [drag, setDrag] = useState<number | null>(null);
+  const [drag, setDragState] = useState<number | null>(null);
+  const setDrag = (value: number | null) => { setDragState(value); onScrub(value); };
   const shown = drag ?? time;
   const fraction = total ? Math.min(1, Math.max(0, shown / total)) : 0;
   const at = (x: number) => (total ? Math.min(1, Math.max(0, x / width)) * total : 0);
@@ -512,6 +601,12 @@ const styles = StyleSheet.create({
   bar: { paddingHorizontal: space.s, paddingTop: space.s },
   row: { flexDirection: 'row', alignItems: 'center' },
   time: { flex: 1, color: colors.textSecondary, fontVariant: ['tabular-nums'], fontSize: 13, textAlign: 'right', marginRight: space.s },
+  timeScrubbing: { color: colors.accent },
+  failure: { ...StyleSheet.absoluteFill, alignItems: 'center', justifyContent: 'center', padding: space.xl, gap: space.s, backgroundColor: 'rgba(0,0,0,0.6)' },
+  stuck: { position: 'absolute', left: 0, right: 0, top: '50%', marginTop: 40, alignItems: 'center', gap: space.m },
+  failureTitle: { color: colors.text, fontSize: 20, fontWeight: '700', textAlign: 'center' },
+  failureText: { color: colors.textSecondary, fontSize: 15, lineHeight: 21, textAlign: 'center', maxWidth: 440 },
+  failureActions: { flexDirection: 'row', gap: space.m, marginTop: space.m },
   scrubber: { height: 24, justifyContent: 'center', marginHorizontal: space.s },
   track: { height: 4, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.22)', overflow: 'hidden' },
   fill: { position: 'absolute', left: 0, top: 0, bottom: 0, backgroundColor: colors.accent },
