@@ -5,12 +5,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActionSheetIOS, Alert, AppState, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
+import { DownloadView } from './src/components/DownloadView';
 import { EpisodeList } from './src/components/EpisodeList';
 import { PipelinesView, type ImportPipelineState, type LocalScanState } from './src/components/PipelinesView';
 import { Player } from './src/components/Player';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
 import { AutoSync, installCrashLog, type AutoSyncState } from './src/lib/auto-sync';
 import { haptics } from './src/lib/haptics';
+import { SeriesDownloader, type DownloadsState } from './src/lib/series-downloads';
 import { importFiles, importFolder, readLibrary, type Episode, type Series } from './src/lib/library';
 import { fetchRemoteCatalog } from './src/lib/server';
 import { findReachableAddress } from './src/lib/server-address';
@@ -33,7 +35,7 @@ import { colors, radius, space } from './src/theme';
 // Write the cause of any crash to Documents/.anime-study/auto-sync-errors.log.
 installCrashLog();
 
-type AppMode = 'watch' | 'pipelines';
+type AppMode = 'watch' | 'download' | 'pipelines';
 type LibrarySource = 'server' | 'local';
 
 function latestEpisode(series: Series) {
@@ -105,6 +107,8 @@ function Study() {
   const tvSyncRef = useRef<TvSyncClient | null>(null);
   const phoneWorkerRef = useRef<PhoneWorkerNode | null>(null);
   const autoSyncRef = useRef<AutoSync | null>(null);
+  const [downloader, setDownloader] = useState<SeriesDownloader | null>(null);
+  const [downloads, setDownloads] = useState<DownloadsState>({ status: 'idle', done: 0, total: 0, failed: 0, series: [] });
   const [autoSync, setAutoSync] = useState<AutoSyncState>({ status: 'idle', kept: 0, queued: 0 });
   const prevTvActiveRef = useRef(false);
   const lastPhoneSyncRef = useRef(0);
@@ -299,9 +303,18 @@ function Study() {
       (kind, detail) => client.log(kind, detail),
     );
     autoSyncRef.current = mirror;
+    const downloader = new SeriesDownloader(
+      setDownloads,
+      // Each finished episode shows up in Local Files right away.
+      () => scanLocal(sourceRef.current === 'local'),
+      (kind, detail) => client.log(kind, detail),
+    );
+    setDownloader(downloader);
+    setDownloads(downloader.current);
     client.connect();
     scanLocal(false);
     mirror.kick();
+    downloader.kick();
     return () => {
       mirror.stop();
       autoSyncRef.current = null;
@@ -473,7 +486,7 @@ function Study() {
           {!tvControlling && (
             <>
               <Text style={styles.title} numberOfLines={2}>
-                {mode === 'pipelines' ? 'Pipelines' : (series?.title ?? (source === 'server' ? 'Mac Server' : 'Offline Study'))}
+                {mode === 'pipelines' ? 'Pipelines' : mode === 'download' ? 'Download' : (series?.title ?? (source === 'server' ? 'Mac Server' : 'Offline Study'))}
               </Text>
               {mode === 'watch' && !!series?.credit && (
                 <View style={styles.credit}><Text style={styles.creditText} numberOfLines={1}>{series.credit}</Text></View>
@@ -483,7 +496,7 @@ function Study() {
         </View>
         <View style={styles.headerActions}>
           <View style={styles.modeSwitch}>
-            {(['watch', 'pipelines'] as const).map(item => {
+            {(['watch', 'download', 'pipelines'] as const).map(item => {
               const active = mode === item;
               return (
                 <Pressable
@@ -492,7 +505,7 @@ function Study() {
                   style={[styles.modePill, active && styles.modePillActive]}
                 >
                   <Text style={[styles.modePillText, active && styles.modePillTextActive]}>
-                    {item === 'watch' ? 'Watch' : 'Pipelines'}
+                    {item === 'watch' ? 'Watch' : item === 'download' ? 'Download' : 'Pipelines'}
                   </Text>
                 </Pressable>
               );
@@ -699,6 +712,11 @@ function Study() {
           <View style={{ flex: 1 }}>
             {header}
             {pipelinesScreen}
+          </View>
+        ) : mode === 'download' && downloader ? (
+          <View style={{ flex: 1 }}>
+            {header}
+            <DownloadView downloader={downloader} state={downloads} />
           </View>
         ) : !series ? (
           <View style={{ flex: 1 }}>{header}{empty}</View>

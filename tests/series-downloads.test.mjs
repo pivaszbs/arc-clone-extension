@@ -203,3 +203,28 @@ test('plans combined fallback dubbing when primary team is missing episodes', as
   assert.match(queue.files[0].filename, /Episode 001 - 3000\.mp4$/);
   assert.match(queue.files[1].filename, /Episode 002 - 4001\.mp4$/);
 });
+
+test('phone and Chrome name series files the same way', () => {
+  const world = { URL, console };
+  vm.runInNewContext(plannerCompiled.outputFiles[0].text, world);
+  const { seriesFiles } = world.planner;
+  const origin = 'https://smotret-anime.com';
+  const plan = {
+    series: `${origin}/catalog/kusuriya-39868`,
+    title: 'Kusuriya: no Hitorigoto!',
+    edition: 'Dream Cast',
+    episodes: [
+      { page: `${origin}/catalog/kusuriya-39868/1-seriya-1`, label: '1', video: { url: `${origin}/translations/mp4/6061916`, height: 1080 }, subtitle: `${origin}/translations/ass/6061916` },
+      { page: `${origin}/catalog/kusuriya-39868/2-seriya-2`, label: '2', video: { url: `${origin}/translations/mp4/6061922`, height: 1080 } },
+      { page: `${origin}/catalog/kusuriya-39868/3-seriya-3`, label: '3' }
+    ]
+  };
+  const { folder, files } = seriesFiles(plan, plan.episodes.map(episode => episode.page));
+  assert.equal(folder, 'Kusuriya no Hitorigoto - 39868 - Dream Cast');
+  assert.deepEqual(JSON.parse(JSON.stringify(files.map(file => [file.kind, file.name]))), [
+    ['subtitle', 'Episode 001 - 6061916.ass'],
+    ['video', 'Episode 001 - 6061916.mp4'],
+    ['video', 'Episode 002 - 6061922.mp4']
+  ]);
+  assert.throws(() => seriesFiles({ ...plan, episodes: [plan.episodes[2]] }, [plan.episodes[2].page]), /no downloadable episodes/);
+});
