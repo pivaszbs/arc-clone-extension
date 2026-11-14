@@ -179,12 +179,19 @@ export function Player(props: Props) {
   const seekBy = useCallback((seconds: number, side: 'left' | 'right') => {
     const total = safe(() => player.duration, 0) || duration;
     const at = safe(() => player.currentTime, 0);
-    if ((seconds < 0 && at <= 0.5) || (seconds > 0 && total && at >= total - 1)) haptics.edge();
-    else haptics.seek();
+    const atStart = seconds < 0 && at <= 0.5;
+    const atEnd = seconds > 0 && !!total && at >= total - 1;
+    if (atStart || atEnd) {
+      // Nothing left to skip: don't seek again (each seek to the end replays the end of the file).
+      haptics.edge();
+      if (atEnd && props.hasNext) props.onStep?.(1, true);
+      return;
+    }
+    haptics.seek();
     seekTo(at + seconds);
     setRipple(previous => ({ side, seconds: previous?.side === side ? previous.seconds + seconds : seconds }));
     poke();
-  }, [player, duration, seekTo, poke]);
+  }, [player, duration, seekTo, poke, props]);
 
   useEffect(() => {
     if (!ripple) return;

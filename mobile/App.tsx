@@ -312,7 +312,8 @@ function Study() {
   const [pipActive, setPipActive] = useState(false);
   const [playerHidden, setPlayerHidden] = useState(false);
   const fullscreen = !!episode && !tvControlling && !playerHidden;
-  const index = series && episode ? series.episodes.indexOf(episode) : -1;
+  // By key: the playing episode may be the downloaded copy, a different object than the listed one.
+  const index = series && episode ? series.episodes.findIndex(item => item.key === episode.key) : -1;
   const neighbours = useMemo(
     () => (series && index >= 0 ? series.episodes.slice(Math.max(0, index - 2), index + 3) : []),
     [series, index],
