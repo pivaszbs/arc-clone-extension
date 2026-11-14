@@ -98,6 +98,12 @@ export function Player(props: Props) {
   // Stable across renders: it used to depend on `props` (a new object every render), and the effect
   // below saves whenever `save` changes, which told App about progress, which re-rendered the
   // player with new props... thousands of renders a second, the whole app frozen.
+  // The ending's start, read inside save (a ref, so save stays stable).
+  const endingStart = useRef<number | undefined>(undefined);
+  useEffect(() => { endingStart.current = study.skips.ed?.start; }, [study.skips.ed?.start]);
+  // Once this episode counts as watched, a later save (closing, switching episodes) must not undo it.
+  const finishedKey = useRef<string | null>(null);
+
   const save = useCallback((finished = false) => {
     let position: number;
     let playerDuration: number;
@@ -107,7 +113,11 @@ export function Player(props: Props) {
     } catch { return; /* Already released (the episode was closed). */ }
     if (!ready || !Number.isFinite(position)) return;
     const total = playerDuration || duration;
-    saveProgress(episode.key, { position, duration: total, watchedAt: Date.now(), finished: finished || (total > 0 && position >= total - 5) });
+    // Watched once the ending has started (skipping or closing on it counts), or the last 5 s.
+    const reachedEnding = endingStart.current !== undefined && position >= endingStart.current - 1;
+    const done = finished || reachedEnding || (total > 0 && position >= total - 5) || finishedKey.current === episode.key;
+    if (done) finishedKey.current = episode.key;
+    saveProgress(episode.key, { position, duration: total, watchedAt: Date.now(), finished: done });
     lastSaved.current = Date.now();
     propsRef.current.onProgress?.();
   }, [player, ready, duration, episode.key]);
