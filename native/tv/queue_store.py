@@ -211,6 +211,15 @@ class QueueStore:
                 (key[0], key[1], json.dumps(data), time.time()),
             )
 
+    def sync_peers(self):
+        """Devices that have synced with this Mac: [(node id, last sync time)], newest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT node_id, MAX(ts) FROM events WHERE type='replica_sync' AND node_id IS NOT NULL"
+                " GROUP BY node_id ORDER BY MAX(ts) DESC LIMIT 20"
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     def log_event(self, type_, job_id=None, node_id=None, data=None):
         with self._lock:
             self._db.execute(

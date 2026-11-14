@@ -138,7 +138,7 @@ class TVHandler(BaseHTTPRequestHandler):
         resource = self.path[len(prefix):] if self.path.startswith(prefix) else None
         if resource in ASSETS:
             label = ASSETS[resource][0]
-        elif resource in ("library.json", "catalog.json", "sync", "worker/status", "worker/claim", "worker/progress", "worker/complete", "worker/retry", "replica/sync") or (resource and MEDIA_PATH.fullmatch(resource)):
+        elif resource in ("library.json", "catalog.json", "status.json", "sync", "worker/status", "worker/claim", "worker/progress", "worker/complete", "worker/retry", "replica/sync") or (resource and MEDIA_PATH.fullmatch(resource)):
             label = resource
         else:
             label = "unknown resource"
@@ -315,8 +315,9 @@ class TVHandler(BaseHTTPRequestHandler):
             return self.send_error(404)
         resource = path[len(prefix):]
         try:
-            if resource in ("library.json", "catalog.json"):
-                payload = self.server.library(0) if resource == "library.json" else self.server.catalog()
+            if resource in ("library.json", "catalog.json", "status.json"):
+                payload = (self.server.library(0) if resource == "library.json"
+                           else self.server.status() if resource == "status.json" else self.server.catalog())
                 data = json.dumps(payload).encode("utf-8")
                 self.respond("application/json; charset=utf-8", len(data))
                 if self.command == "GET":
@@ -829,6 +830,55 @@ class TVServer(ThreadingHTTPServer):
             return cached
         except (OSError, ValueError):
             return None
+
+    DEVICE_KINDS = {"ios": "iPhone", "chrome": "Chrome", "tv": "TV", "phone": "iPhone", "mac": "Mac"}
+
+    def status(self):
+        """Everything a dashboard needs in one request (phone "Server" screen, extension Pipelines)."""
+        workers = self.get_worker_status()
+        series = [self.library(index) for index in range(len(self.series))]
+        episodes = [ep for item in series for ep in item["episodes"]]
+        with_timings = sum(1 for ep in episodes
+                           if any(isinstance((ep["saved"].get("themes") or {}).get(part), dict) for part in ("op", "ed", "recap")))
+        name, ts_ip = tailscale_self()
+        with self.ws_lock:
+            live = len(self.ws_clients)
+        now = time.time()
+        devices = []
+        for node, last in self.store.sync_peers():
+            prefix = node.split("-", 1)[0]
+            devices.append({"node": node, "kind": self.DEVICE_KINDS.get(prefix, prefix or "Device"),
+                            "lastSync": last, "secondsAgo": max(0, int(now - last))})
+        return {
+            "version": 1,
+            "serverTime": now,
+            "detectorVersion": self.FINGERPRINT_DETECTOR_VERSION,
+            "addresses": self.addresses(),
+            "tailscale": {"running": bool(name or ts_ip), "name": name},
+            "library": {
+                "series": len(series),
+                "episodes": len(episodes),
+                "withTimings": with_timings,
+                "perSeries": [{
+                    "folder": item["folder"], "title": item["title"], "episodes": len(item["episodes"]),
+                    "withTimings": sum(1 for ep in item["episodes"]
+                                       if any(isinstance((ep["saved"].get("themes") or {}).get(part), dict) for part in ("op", "ed", "recap"))),
+                } for item in series],
+            },
+            "tv": self.get_tv_state(),
+            "liveConnections": live,
+            "devices": devices,
+            "workers": {
+                "nodes": workers.get("nodes", []),
+                "counts": workers.get("counts", {}),
+                "stages": workers.get("stages", {}),
+                "tvBusy": workers.get("tvBusy", False),
+                "jobs": workers.get("jobs", []),
+                "next": [{"seriesName": item.get("seriesName"), "episode": item.get("episode"), "kind": item.get("kind")}
+                         for item in (workers.get("pendingPreview") or [])[:5]],
+                "quarantinedEpisodes": workers.get("quarantinedEpisodes", []),
+            },
+        }
 
     def catalog(self):
         self.refresh_series()
