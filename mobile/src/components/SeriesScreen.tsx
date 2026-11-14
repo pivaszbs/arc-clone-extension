@@ -1,9 +1,7 @@
 import { SymbolView } from 'expo-symbols';
-import { useEffect } from 'react';
-import { ActivityIndicator, Alert, FlatList, Image, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
+import { useState } from 'react';
+import { ActivityIndicator, Alert, Animated, FlatList, Image, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
-import Animated, { Easing, useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
-import { scheduleOnRN } from 'react-native-worklets';
 
 import { episodeDownloads, useEpisodeDownloads } from '../lib/episode-downloads';
 import { clock } from '../lib/format';
@@ -32,7 +30,6 @@ type Props = {
 };
 
 const device = Platform.OS === 'ios' && Platform.isPad ? 'iPad' : 'iPhone';
-const EASE_OUT = Easing.bezier(0.23, 1, 0.32, 1);
 
 function confirmRemove(series: Series, episode: Episode, fromMac: boolean) {
   Alert.alert(`Remove ${episode.label} from this ${device}?`, fromMac ? 'You can download it again from the Mac.' : 'The file is deleted from this device.', [
@@ -41,12 +38,9 @@ function confirmRemove(series: Series, episode: Episode, fromMac: boolean) {
   ]);
 }
 
-/** A progress fill that glides to its new width instead of jumping (absolute and childless, so cheap). */
+/** A progress fill. */
 function Bar({ fraction }: { fraction: number }) {
-  const value = useSharedValue(fraction);
-  useEffect(() => { value.set(withTiming(fraction, { duration: 250, easing: Easing.linear })); }, [fraction, value]);
-  const fill = useAnimatedStyle(() => ({ width: `${Math.max(0, Math.min(1, value.get())) * 100}%` }));
-  return <View style={styles.bar}><Animated.View style={[styles.barFill, fill]} /></View>;
+  return <View style={styles.bar}><View style={[styles.barFill, { width: `${Math.max(0, Math.min(1, fraction)) * 100}%` }]} /></View>;
 }
 
 function DownloadIcon({ series, episode, fromMac }: { series: Series; episode: Episode; fromMac: boolean }) {
@@ -106,31 +100,30 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
   const coverWidth = twoPane ? Math.min(sideWidth - space.l * 2, Math.round(height * 0.38 * 0.75)) : width >= 700 ? 200 : 110;
 
   // Entering is App's ZoomFrom (the screen grows out of the tapped cover).
-  // Swipe in from the left edge to go back.
-  const dragX = useSharedValue(0);
-  const back = () => { haptics.tap(); onBack(); };
+  // Swipe in from the left edge to go back. React Native's Animated on the native driver.
+  const [dragX] = useState(() => new Animated.Value(0));
   const edge = usePanGesture({
+    runOnJS: true,
     hitSlop: { left: 0, width: 28 },
     activeOffsetX: 12,
     failOffsetY: [-14, 14],
     onUpdate: event => {
-      'worklet';
-      dragX.set(Math.max(0, event.translationX));
+      dragX.setValue(Math.max(0, event.translationX));
     },
     onDeactivate: event => {
-      'worklet';
       if (event.translationX > 110 || (event.velocityX > 700 && event.translationX > 30)) {
-        dragX.set(withTiming(width, { duration: 220, easing: EASE_OUT }));
-        scheduleOnRN(back);
+        Animated.timing(dragX, { toValue: width, duration: 220, useNativeDriver: true }).start();
+        haptics.tap();
+        onBack();
       } else {
-        dragX.set(withSpring(0, { duration: 400, dampingRatio: 0.8, velocity: event.velocityX }));
+        Animated.spring(dragX, { toValue: 0, velocity: event.velocityX / 1000, bounciness: 4, useNativeDriver: true }).start();
       }
     },
   });
-  const screenStyle = useAnimatedStyle(() => ({
-    opacity: 1 - Math.min(0.4, dragX.get() / (width * 1.5)),
-    transform: [{ translateX: dragX.get() }],
-  }));
+  const screenStyle = {
+    opacity: dragX.interpolate({ inputRange: [0, width], outputRange: [1, 0.6], extrapolate: 'clamp' }),
+    transform: [{ translateX: dragX }],
+  };
 
   const playLabel = nextSaved && !nextSaved.finished && nextSaved.position >= 1
     ? `Continue ${next!.label} · ${clock(nextSaved.position)}`

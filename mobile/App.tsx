@@ -665,9 +665,10 @@ function Study() {
             {header}
             <DownloadView serverUrl={serverUrl} onMacProgress={() => { void loadRemote(); }} />
           </View>
-        ) : playing ? (
+        ) : playing && !seriesScreen ? (
           <View style={{ flex: 1, backgroundColor: '#000' }} />
         ) : seriesScreen ? (
+          // Stays mounted under the player, so the player opens over it and closing finds it as it was.
           <View style={{ flex: 1 }}>{header}<ZoomFrom origin={seriesOrigin}>{seriesScreen}</ZoomFrom></View>
         ) : library.length ? (
           <View style={{ flex: 1 }}>

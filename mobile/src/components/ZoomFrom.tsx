@@ -1,69 +1,91 @@
-import { useRef, type ReactNode } from 'react';
-import { StyleSheet, type StyleProp, type ViewStyle } from 'react-native';
-import Animated, { interpolate, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Animated, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 
 /** Where on screen a transition starts: the card or button that was tapped. */
 export type Rect = { x: number; y: number; width: number; height: number };
 
+type Measurable = { measureInWindow?: (callback: (x: number, y: number, width: number, height: number) => void) => void };
+
 /** Measure the view an event came from, for ZoomFrom. Resolves null if it can't be measured. */
 export function rectOf(target: unknown): Promise<Rect | null> {
   return new Promise(resolve => {
-    const view = target as { measureInWindow?: (callback: (x: number, y: number, width: number, height: number) => void) => void } | null;
+    const view = target as Measurable | null;
     if (!view?.measureInWindow) return resolve(null);
-    view.measureInWindow((x, y, width, height) => resolve(width > 0 && height > 0 ? { x, y, width, height } : null));
+    const timer = setTimeout(() => resolve(null), 120);
+    view.measureInWindow((x, y, width, height) => {
+      clearTimeout(timer);
+      resolve(width > 0 && height > 0 ? { x, y, width, height } : null);
+    });
   });
 }
 
 /**
  * Grows its content out of `origin` (the tapped card) into its own frame, like iOS's zoom
- * transition: it starts at the card's size and place with rounded corners and springs open.
- * Without an origin it just fades in. Runs on the UI thread (Reanimated).
+ * transition: it starts at the card's size and place and springs open. Without an origin (or if
+ * measuring fails) it fades in. React Native's Animated on the native driver: Reanimated's
+ * animations didn't reach the screen in this app.
  */
 export function ZoomFrom({ origin, children, style }: { origin?: Rect | null; children: ReactNode; style?: StyleProp<ViewStyle> }) {
-  const view = useRef<{ measureInWindow(callback: (x: number, y: number, width: number, height: number) => void): void } | null>(null);
-  const reduced = useReducedMotion();
-  const progress = useSharedValue(0);
-  const from = useSharedValue({ dx: 0, dy: 0, scale: 1 });
+  const frame = useRef<Measurable | null>(null);
+  const [progress] = useState(() => new Animated.Value(0));
+  const [geometry, setGeometry] = useState({ dx: 0, dy: 0, scale: 1 });
   const started = useRef(false);
 
+  const open = (next?: { dx: number; dy: number; scale: number }) => {
+    if (next) {
+      setGeometry(next);
+      Animated.spring(progress, { toValue: 1, damping: 22, stiffness: 180, mass: 1, useNativeDriver: true }).start();
+    } else {
+      Animated.timing(progress, { toValue: 1, duration: 220, useNativeDriver: true }).start();
+    }
+  };
+
+  // Never leave the screen invisible: if measuring hasn't answered quickly, just fade in.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!started.current) { started.current = true; open(); }
+    }, 150);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const start = () => {
-    if (started.current) return;
-    started.current = true;
-    view.current?.measureInWindow((x, y, width, height) => {
-      if (origin && width > 0 && height > 0 && !reduced) {
-        from.set({
+    const node = frame.current;
+    if (started.current || !node?.measureInWindow) return;
+    node.measureInWindow((x, y, width, height) => {
+      if (started.current) return;
+      started.current = true;
+      if (origin && width > 0 && height > 0) {
+        open({
           dx: origin.x + origin.width / 2 - (x + width / 2),
           dy: origin.y + origin.height / 2 - (y + height / 2),
           scale: Math.max(0.05, Math.min(1, origin.width / width)),
         });
-        progress.set(withSpring(1, { duration: 450, dampingRatio: 0.86 }));
       } else {
-        progress.set(withTiming(1, { duration: 200 }));
+        open();
       }
     });
   };
 
-  const animated = useAnimatedStyle(() => {
-    const t = progress.get();
-    const { dx, dy, scale } = from.get();
-    return {
-      opacity: interpolate(t, [0, 0.2], [0, 1], 'clamp'),
-      borderRadius: interpolate(t, [0, 1], [18, 0], 'clamp'),
-      transform: [
-        { translateX: dx * (1 - t) },
-        { translateY: dy * (1 - t) },
-        { scale: scale + (1 - scale) * t },
-      ],
-    };
-  });
+  const animated = {
+    opacity: progress.interpolate({ inputRange: [0, 0.2, 1], outputRange: [0, 1, 1], extrapolate: 'clamp' as const }),
+    transform: [
+      { translateX: progress.interpolate({ inputRange: [0, 1], outputRange: [geometry.dx, 0] }) },
+      { translateY: progress.interpolate({ inputRange: [0, 1], outputRange: [geometry.dy, 0] }) },
+      { scale: progress.interpolate({ inputRange: [0, 1], outputRange: [geometry.scale, 1] }) },
+    ],
+  };
 
   return (
-    <Animated.View ref={view as never} onLayout={start} style={[styles.frame, style, animated]}>
-      {children}
-    </Animated.View>
+    <View ref={frame as never} onLayout={start} style={[styles.fill, style]} collapsable={false}>
+      <Animated.View style={[styles.frame, animated]}>
+        {children}
+      </Animated.View>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  fill: { flex: 1 },
   frame: { flex: 1, overflow: 'hidden' },
 });
