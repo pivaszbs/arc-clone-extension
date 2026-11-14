@@ -2,7 +2,7 @@
   "expo": {
     "name": "Anime Study",
     "slug": "anime-study",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",

@@ -2,7 +2,10 @@ import { useEventListener } from 'expo';
 import { SymbolView } from 'expo-symbols';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
+import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
+import Animated, { Easing, interpolate, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
+import { scheduleOnRN } from 'react-native-worklets';
 import type { TimeRange } from 'react-native-anime-core';
 
 import { clock, cueAt } from '../lib/format';
@@ -220,8 +223,45 @@ export function Player(props: Props) {
   const total = duration || player.duration || 0;
   const showBigPlay = !started && !fullscreen && ready;
 
+  // Swipe down to leave fullscreen: the video follows the finger, shrinks and rounds its corners,
+  // then either closes (far enough or flicked) or springs back.
+  const { height: screenHeight } = useWindowDimensions();
+  const reduced = useReducedMotion();
+  const dragY = useSharedValue(0);
+  const dismiss = useCallback(() => {
+    haptics.tap();
+    props.onToggleFullscreen(false);
+  }, [props]);
+  const swipeDown = usePanGesture({
+    enabled: fullscreen,
+    activeOffsetY: 18,
+    failOffsetX: [-24, 24],
+    onUpdate: event => {
+      'worklet';
+      dragY.set(Math.max(0, event.translationY));
+    },
+    onDeactivate: event => {
+      'worklet';
+      if (event.translationY > 140 || (event.velocityY > 900 && event.translationY > 40)) {
+        dragY.set(withTiming(screenHeight, { duration: 220, easing: Easing.bezier(0.23, 1, 0.32, 1) }));
+        scheduleOnRN(dismiss);
+      } else {
+        dragY.set(withSpring(0, { duration: 400, dampingRatio: 0.8, velocity: event.velocityY }));
+      }
+    },
+  });
+  const dragStyle = useAnimatedStyle(() => {
+    const y = dragY.get();
+    return {
+      borderRadius: interpolate(y, [0, 200], [0, 24], 'clamp'),
+      opacity: reduced ? interpolate(y, [0, 300], [1, 0.4], 'clamp') : 1,
+      transform: reduced ? [] : [{ translateY: y }, { scale: interpolate(y, [0, 400], [1, 0.82], 'clamp') }],
+    };
+  });
+
   return (
-    <View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
+    <GestureDetector gesture={swipeDown}>
+    <Animated.View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline, dragStyle]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
       <VideoView player={player} style={StyleSheet.absoluteFill} nativeControls={false} contentFit="contain" allowsPictureInPicture />
       <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to play or pause, double-tap a side to skip 10 seconds." />
 
@@ -285,7 +325,8 @@ export function Player(props: Props) {
           </Glass>
         </View>
       )}
-    </View>
+    </Animated.View>
+    </GestureDetector>
   );
 }
 

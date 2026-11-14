@@ -2,6 +2,7 @@ import { Directory, File, Paths } from 'expo-file-system';
 import { useEffect, useState } from 'react';
 
 import { logError } from './crash-log';
+import { haptics } from './haptics';
 import type { Episode, Series } from './library';
 
 /**
@@ -107,6 +108,7 @@ class EpisodeDownloads {
   private async run() {
     if (this.running) return;
     this.running = true;
+    let saved = 0;
     try {
       for (let job = this.queue.shift(); job; job = this.queue.shift()) {
         this.current = job;
@@ -142,6 +144,7 @@ class EpisodeDownloads {
             },
           });
           this.states.delete(key);
+          saved++;
           this.onLibraryChanged();
         } catch (error) {
           if (abort.signal.aborted) {
@@ -153,6 +156,8 @@ class EpisodeDownloads {
         }
         this.changed();
       }
+      // One haptic for the whole batch, when the last download lands.
+      if (saved) haptics.skipped();
     } finally {
       this.current = null;
       this.abort = null;
