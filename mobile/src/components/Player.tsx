@@ -33,6 +33,11 @@ type Props = {
 };
 
 const DOUBLE_TAP_MS = 280;
+
+/** False for a player that was already released (closing the episode), instead of throwing. */
+function isPlaying(player: { playing: boolean }) {
+  try { return player.playing; } catch { return false; }
+}
 const SKIP_SECONDS = 10;
 const HIDE_AFTER_MS = 3000;
 const skipOrder: SkipPart[] = ['recap', 'op', 'ed'];
@@ -76,9 +81,14 @@ export function Player(props: Props) {
   }, [episode, player]);
 
   const save = useCallback((finished = false) => {
-    const position = player.currentTime;
+    let position: number;
+    let playerDuration: number;
+    try {
+      position = player.currentTime;
+      playerDuration = player.duration;
+    } catch { return; /* Already released (the episode was closed). */ }
     if (!ready || !Number.isFinite(position)) return;
-    const total = player.duration || duration;
+    const total = playerDuration || duration;
     saveProgress(episode.key, { position, duration: total, watchedAt: Date.now(), finished: finished || (total > 0 && position >= total - 5) });
     lastSaved.current = Date.now();
     props.onProgress?.();
@@ -112,8 +122,14 @@ export function Player(props: Props) {
   const poke = useCallback(() => {
     setControls(true);
     clearTimeout(hideTimer.current);
-    hideTimer.current = setTimeout(() => { if (player.playing) setControls(false); }, HIDE_AFTER_MS);
+    hideTimer.current = setTimeout(() => { if (isPlaying(player)) setControls(false); }, HIDE_AFTER_MS);
   }, [player]);
+
+  // Timers must not outlive the player: reading a released player throws and closes the app.
+  useEffect(() => () => {
+    clearTimeout(hideTimer.current);
+    clearTimeout(tapTimer.current);
+  }, []);
 
   useEffect(() => {
     if (playing) poke();
@@ -167,9 +183,11 @@ export function Player(props: Props) {
     }
     clearTimeout(tapTimer.current);
     tapTimer.current = setTimeout(() => {
-      if (!started) { player.play(); haptics.tap(); return; }
-      if (!controls && player.playing) { poke(); return; }
-      togglePlay();
+      try {
+        if (!started) { player.play(); haptics.tap(); return; }
+        if (!controls && player.playing) { poke(); return; }
+        togglePlay();
+      } catch { /* The player was closed in the meantime. */ }
     }, DOUBLE_TAP_MS);
   }, [width, props, seekBy, togglePlay, started, controls, player, poke]);
 
