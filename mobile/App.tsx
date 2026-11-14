@@ -670,6 +670,19 @@ function Study() {
               width={width}
               header={header}
               onOpen={item => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
+              onPlay={(item, next) => {
+                // One tap from the Continue card: open the series and play, as on its screen.
+                setFolder(item.folder);
+                if (tvControlling) {
+                  tvSyncRef.current?.sendTvControl({ action: 'playEpisode', seriesName: item.folder, episode: next.video });
+                  return;
+                }
+                setEpisodeKey(next.key);
+                setPlayerHidden(false);
+                if (source === 'server') {
+                  void tvSyncRef.current?.pushSync({ playingFolder: item.folder, playingEpisode: next.video });
+                }
+              }}
             />
           </View>
         ) : (

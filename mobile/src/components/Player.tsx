@@ -346,10 +346,37 @@ export function Player(props: Props) {
         </View>
       )}
 
+      {started && ready && (
+        // Like the TV: a big round play/pause in the middle, skip buttons beside it. Fades with the bar.
+        <Animated.View pointerEvents={controls ? 'box-none' : 'none'} style={[styles.centerControls, controlsStyle]}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Back 10 seconds" onPress={() => seekBy(-SKIP_SECONDS, 'left')} hitSlop={12}>
+            {({ pressed }) => (
+              <Glass round={34} style={[styles.sideCircle, pressed && styles.circlePressed]}>
+                <SymbolView name="gobackward.10" size={28} tintColor={colors.text} />
+              </Glass>
+            )}
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel={playing ? 'Pause' : 'Play'} onPress={togglePlay} hitSlop={12}>
+            {({ pressed }) => (
+              <Glass round={48} style={[styles.bigPlay, !playing && styles.bigPlayOffset, pressed && styles.circlePressed]}>
+                <SymbolView name={playing ? 'pause.fill' : 'play.fill'} size={40} tintColor={colors.text} />
+              </Glass>
+            )}
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel="Forward 10 seconds" onPress={() => seekBy(SKIP_SECONDS, 'right')} hitSlop={12}>
+            {({ pressed }) => (
+              <Glass round={34} style={[styles.sideCircle, pressed && styles.circlePressed]}>
+                <SymbolView name="goforward.10" size={28} tintColor={colors.text} />
+              </Glass>
+            )}
+          </Pressable>
+        </Animated.View>
+      )}
+
       {showBigPlay && (
         <Pressable accessibilityRole="button" accessibilityLabel="Play episode in fullscreen" onPress={playFullscreen} style={styles.center}>
           {({ pressed }) => (
-            <Glass round={48} style={[styles.bigPlay, pressed && { transform: [{ scale: 0.94 }] }]}>
+            <Glass round={48} style={[styles.bigPlay, styles.bigPlayOffset, pressed && styles.circlePressed]}>
               <SymbolView name="play.fill" size={38} tintColor={colors.text} />
             </Glass>
           )}
@@ -443,7 +470,11 @@ const styles = StyleSheet.create({
   inline: { width: '100%', aspectRatio: 16 / 9, borderRadius: radius.medium },
   fullscreen: { flex: 1 },
   center: { position: 'absolute', alignSelf: 'center', top: '50%', marginTop: -48 },
-  bigPlay: { width: 96, height: 96, alignItems: 'center', justifyContent: 'center', paddingLeft: 6 },
+  bigPlay: { width: 96, height: 96, alignItems: 'center', justifyContent: 'center' },
+  bigPlayOffset: { paddingLeft: 6 },
+  centerControls: { position: 'absolute', left: 0, right: 0, top: '50%', marginTop: -48, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 44 },
+  sideCircle: { width: 68, height: 68, alignItems: 'center', justifyContent: 'center' },
+  circlePressed: { transform: [{ scale: 0.94 }] },
   ripple: { position: 'absolute', top: 0, bottom: 0, width: '34%', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', gap: 4 },
   rippleLeft: { left: 0, borderTopRightRadius: 400, borderBottomRightRadius: 400 },
   rippleRight: { right: 0, borderTopLeftRadius: 400, borderBottomLeftRadius: 400 },

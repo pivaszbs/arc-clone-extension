@@ -11,7 +11,7 @@ import { haptics } from '../lib/haptics';
 import type { Episode, Series } from '../lib/library';
 import type { Progress } from '../lib/storage';
 import { colors, radius, space } from '../theme';
-import { seriesProgress } from './SeriesGallery';
+import { continueEpisode, seriesProgress } from './SeriesGallery';
 import { SwipeCard, swipeColors } from './SwipeCard';
 
 type Props = {
@@ -31,14 +31,6 @@ type Props = {
 
 const device = Platform.OS === 'ios' && Platform.isPad ? 'iPad' : 'iPhone';
 const EASE_OUT = Easing.bezier(0.23, 1, 0.32, 1);
-
-/** The episode to continue with: the one in progress, or the next after the last finished one. */
-export function continueEpisode(series: Series, progress: Record<string, Progress>) {
-  const { latest } = seriesProgress(series, progress);
-  if (latest < 0) return series.episodes[0];
-  const last = series.episodes[latest];
-  return progress[last.key]?.finished ? series.episodes[latest + 1] ?? last : last;
-}
 
 function confirmRemove(series: Series, episode: Episode, fromMac: boolean) {
   Alert.alert(`Remove ${episode.label} from this ${device}?`, fromMac ? 'You can download it again from the Mac.' : 'The file is deleted from this device.', [
