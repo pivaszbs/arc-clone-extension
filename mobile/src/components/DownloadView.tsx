@@ -17,7 +17,7 @@ const POLL_MS = 5000;
 
 type Props = {
   serverUrl: string;
-  /** Called when the Mac finishes more episodes, so auto sync can copy them over. */
+  /** Called when the Mac finishes more episodes, so the library shows them. */
   onMacProgress: () => void;
 };
 
@@ -31,7 +31,7 @@ const stateLabel: Record<MacDownload['state'], string> = {
 
 /**
  * Browse Anime365 and send a series to the Mac. Chrome there downloads it into the library;
- * auto sync then copies the first episodes to this device.
+ * its episodes then appear under Mac Server, with Download buttons.
  */
 export function DownloadView({ serverUrl, onMacProgress }: Props) {
   const web = useRef<WebViewHandle>(null);
@@ -71,7 +71,7 @@ export function DownloadView({ serverUrl, onMacProgress }: Props) {
       const title = pageTitle.replace(/\s*[-—|]\s*Anime ?365.*$/i, '').trim();
       const request = await requestMacDownload(serverUrl, link, title);
       setRequests(prev => [...prev.filter(item => item.id !== request.id), request]);
-      setStatus('Sent to the Mac. Chrome there downloads it, then the first episodes come to this device.');
+      setStatus('Sent to the Mac. Chrome there downloads it; the episodes appear under Mac Server as they finish.');
       haptics.skipped();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Could not reach the Mac.');

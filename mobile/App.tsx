@@ -11,7 +11,8 @@ import { Player } from './src/components/Player';
 import { SeriesGallery } from './src/components/SeriesGallery';
 import { SeriesScreen } from './src/components/SeriesScreen';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
-import { AutoSync, installCrashLog, type AutoSyncState } from './src/lib/auto-sync';
+import { installCrashLog } from './src/lib/crash-log';
+import { episodeDownloads } from './src/lib/episode-downloads';
 import { haptics } from './src/lib/haptics';
 import { importFiles, importFolder, readLibrary, type Episode, type Series } from './src/lib/library';
 import { fetchRemoteCatalog } from './src/lib/server';
@@ -32,22 +33,11 @@ import {
 import { PhoneWorkerNode, type PhoneWorkerState } from './src/lib/worker-node';
 import { colors, radius, space } from './src/theme';
 
-// Write the cause of any crash to Documents/.anime-study/auto-sync-errors.log.
+// Write the cause of any crash to Documents/.anime-study/errors.log.
 installCrashLog();
 
 type AppMode = 'watch' | 'download' | 'pipelines';
 type LibrarySource = 'server' | 'local';
-
-function autoSyncLine(state: AutoSyncState) {
-  const kept = state.kept ? `${state.kept} episode${state.kept === 1 ? '' : 's'} kept from the Mac` : 'Keeps your next episodes from the Mac';
-  switch (state.status) {
-    case 'checking': return `Auto sync · checking the Mac…`;
-    case 'downloading': return `Auto sync · saving ${state.detail ?? ''}`;
-    case 'waiting': return `Auto sync paused · ${state.detail ?? ''} · ${kept}`;
-    case 'error': return `Auto sync · ${state.detail ?? 'error'}`;
-    default: return `Auto sync · ${state.detail ? `${state.detail} · ` : ''}${kept}`;
-  }
-}
 
 export default function App() {
   return (
@@ -90,9 +80,6 @@ function Study() {
   libraryRef.current = library;
   const tvSyncRef = useRef<TvSyncClient | null>(null);
   const phoneWorkerRef = useRef<PhoneWorkerNode | null>(null);
-  const autoSyncRef = useRef<AutoSync | null>(null);
-  const kickAutoSync = useCallback(() => autoSyncRef.current?.kick(), []);
-  const [autoSync, setAutoSync] = useState<AutoSyncState>({ status: 'idle', kept: 0, queued: 0 });
   const prevTvActiveRef = useRef(false);
   const lastPhoneSyncRef = useRef(0);
 
@@ -196,7 +183,6 @@ function Study() {
 
   const scan = useCallback(() => {
     scheduleSync(0);
-    autoSyncRef.current?.kick();
     if (sourceRef.current === 'server') {
       void loadRemote();
     } else {
@@ -278,20 +264,12 @@ function Study() {
       (kind, detail) => client.log(kind, detail),
     );
     phoneWorkerRef.current = worker;
-    const mirror = new AutoSync(
-      () => serverUrlRef.current,
-      setAutoSync,
-      // New copies show up in Local Files right away; the counts update either way.
-      () => scanLocal(sourceRef.current === 'local'),
-      (kind, detail) => client.log(kind, detail),
-    );
-    autoSyncRef.current = mirror;
+    // Downloaded episodes show up in Local Files right away.
+    episodeDownloads.onLibraryChanged = () => scanLocal(sourceRef.current === 'local');
     client.connect();
     scanLocal(false);
-    mirror.kick();
     return () => {
-      mirror.stop();
-      autoSyncRef.current = null;
+      episodeDownloads.onLibraryChanged = () => {};
       worker.stop();
       phoneWorkerRef.current = null;
       client.destroy();
@@ -516,9 +494,6 @@ function Study() {
               )}
             </View>
           )}
-          {!tvControlling && source === 'local' && (
-            <Text style={styles.autoSync} numberOfLines={2}>{autoSyncLine(autoSync)}</Text>
-          )}
         </>
       )}
     </View>
@@ -632,6 +607,7 @@ function Study() {
       onBack={() => { setFolder(null); setEpisodeKey(null); }}
       onPlay={selectEpisode}
       onToggleWatched={ep => toggleEpisodeWatched(ep, series)}
+      fromMac={source === 'server'}
       extra={player}
     />
   );
@@ -648,7 +624,7 @@ function Study() {
         ) : mode === 'download' ? (
           <View style={{ flex: 1 }}>
             {header}
-            <DownloadView serverUrl={serverUrl} onMacProgress={kickAutoSync} />
+            <DownloadView serverUrl={serverUrl} onMacProgress={() => { void loadRemote(); }} />
           </View>
         ) : fullscreenPlayer ? (
           fullscreenPlayer
@@ -715,7 +691,6 @@ const styles = StyleSheet.create({
   modePillText: { color: colors.textSecondary, fontSize: 12, fontWeight: '700' },
   modePillTextActive: { color: colors.background },
   sourceRow: { flexDirection: 'row', alignItems: 'center', gap: space.s },
-  autoSync: { color: colors.textSecondary, fontSize: 13 },
   sourceChip: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: radius.pill, backgroundColor: colors.surfaceRaised },
   sourceChipActive: { backgroundColor: colors.accentMuted },
   sourceChipText: { color: colors.textSecondary, fontSize: 13, fontWeight: '600' },

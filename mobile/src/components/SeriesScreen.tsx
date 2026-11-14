@@ -1,6 +1,7 @@
 import { SymbolView } from 'expo-symbols';
-import { FlatList, Image, Pressable, StyleSheet, Switch, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Image, Platform, Pressable, StyleSheet, Switch, Text, View } from 'react-native';
 
+import { useEpisodeDownloads } from '../lib/episode-downloads';
 import { clock } from '../lib/format';
 import { haptics } from '../lib/haptics';
 import type { Episode, Series } from '../lib/library';
@@ -17,6 +18,8 @@ type Props = {
   onBack: () => void;
   onPlay: (episode: Episode) => void;
   onToggleWatched: (episode: Episode) => void;
+  /** True for series from the Mac: episodes can be downloaded to this device. */
+  fromMac: boolean;
   /** Shown above the episodes, e.g. the TV remote while the TV plays this series. */
   extra?: React.ReactNode;
 };
@@ -30,7 +33,56 @@ export function continueEpisode(series: Series, progress: Record<string, Progres
 }
 
 /** One series: cover, a Continue button and the episodes as a grid, like the TV app. */
-export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, onBack, onPlay, onToggleWatched, extra }: Props) {
+const device = Platform.OS === 'ios' && Platform.isPad ? 'iPad' : 'iPhone';
+
+function DownloadButton({ series, episode, fromMac }: { series: Series; episode: Episode; fromMac: boolean }) {
+  const downloads = useEpisodeDownloads();
+  const state = downloads.state(series.folder, episode.video);
+  const here = downloads.isOnDevice(series.folder, episode.video);
+  if (here) {
+    return (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Remove ${episode.label} from this ${device}`}
+        hitSlop={10}
+        onPress={() => Alert.alert(`Remove ${episode.label} from this ${device}?`, fromMac ? 'You can download it again from the Mac.' : 'The file is deleted from this device.', [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Remove', style: 'destructive', onPress: () => downloads.remove(series.folder, episode.video) },
+        ])}
+      >
+        <SymbolView name={device === 'iPad' ? 'ipad' : 'iphone'} size={20} tintColor="#34d399" />
+      </Pressable>
+    );
+  }
+  if (!fromMac) return null;
+  if (state?.status === 'downloading') {
+    return (
+      <Pressable accessibilityRole="button" accessibilityLabel="Stop downloading" hitSlop={10} onPress={() => downloads.cancel(series.folder)} style={styles.percent}>
+        <Text style={styles.percentText}>{Math.round(state.fraction * 100)}%</Text>
+      </Pressable>
+    );
+  }
+  if (state?.status === 'queued') return <ActivityIndicator size="small" color={colors.textTertiary} />;
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Download ${episode.label} to this ${device}`}
+      hitSlop={10}
+      onPress={() => { haptics.select(); downloads.download(series, [episode]); }}
+    >
+      <SymbolView name={state?.status === 'failed' ? 'exclamationmark.arrow.circlepath' : 'arrow.down.circle'} size={22} tintColor={state?.status === 'failed' ? colors.accent : colors.textSecondary} />
+    </Pressable>
+  );
+}
+
+export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, onBack, onPlay, onToggleWatched, fromMac, extra }: Props) {
+  const downloads = useEpisodeDownloads();
+  const missing = series.episodes.filter(item => !downloads.isOnDevice(series.folder, item.video));
+  const active = series.episodes.filter(item => {
+    const state = downloads.state(series.folder, item.video);
+    return state && state.status !== 'failed';
+  });
+  const running = series.episodes.map(item => downloads.state(series.folder, item.video)).find(state => state?.status === 'downloading');
   const next = continueEpisode(series, progress);
   const nextSaved = next ? progress[next.key] : undefined;
   const { watched } = seriesProgress(series, progress);
@@ -60,6 +112,28 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
               </Text>
             </Pressable>
           )}
+          {fromMac && (active.length ? (
+            <View style={styles.downloadRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.downloadText}>
+                  Downloading to this {device} · {active.length} left{running?.status === 'downloading' ? ` · ${Math.round(running.fraction * 100)}%` : ''}
+                </Text>
+                <View style={styles.bar}><View style={[styles.barFill, { width: `${(running?.status === 'downloading' ? running.fraction : 0) * 100}%` }]} /></View>
+              </View>
+              <Pressable onPress={() => { haptics.select(); downloads.cancel(series.folder); }} style={styles.secondary}>
+                <Text style={styles.secondaryText}>Stop</Text>
+              </Pressable>
+            </View>
+          ) : missing.length ? (
+            <Pressable onPress={() => { haptics.select(); downloads.download(series, missing); }} style={({ pressed }) => [styles.secondary, styles.downloadAll, pressed && styles.pressed]}>
+              <SymbolView name="arrow.down.circle.fill" size={18} tintColor={colors.accent} />
+              <Text style={styles.secondaryText}>
+                {missing.length === series.episodes.length ? `Download all ${missing.length} episodes to this ${device}` : `Download the other ${missing.length} episodes to this ${device}`}
+              </Text>
+            </Pressable>
+          ) : (
+            <Text style={styles.downloadText}>All episodes are on this {device}</Text>
+          ))}
           <View style={styles.setting}>
             <Text style={styles.settingText}>Auto-skip opening, ending and recap</Text>
             <Switch value={autoSkip} onValueChange={value => { haptics.select(); onAutoSkip(value); }} trackColor={{ true: colors.accent }} />
@@ -96,6 +170,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
           >
             <View style={styles.cardTop}>
               <Text style={[styles.cardTitle, isNext && { color: colors.accent }]} numberOfLines={1}>{item.label}</Text>
+              <DownloadButton series={series} episode={item} fromMac={fromMac} />
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel={saved?.finished ? `Mark ${item.label} unwatched` : `Mark ${item.label} watched`}
@@ -140,7 +215,14 @@ const styles = StyleSheet.create({
   card: { backgroundColor: colors.surface, borderRadius: radius.medium, padding: space.l, gap: space.s },
   cardNext: { borderWidth: 1, borderColor: colors.accent },
   pressed: { opacity: 0.75 },
-  cardTop: { flexDirection: 'row', alignItems: 'center', gap: space.s },
+  cardTop: { flexDirection: 'row', alignItems: 'center', gap: space.m },
+  downloadRow: { flexDirection: 'row', alignItems: 'center', gap: space.m, maxWidth: 520 },
+  downloadText: { color: colors.textSecondary, fontSize: 14, marginBottom: space.xs },
+  downloadAll: { flexDirection: 'row', alignItems: 'center', gap: space.s, alignSelf: 'flex-start' },
+  secondary: { backgroundColor: colors.surfaceRaised, borderRadius: radius.pill, paddingHorizontal: space.l, paddingVertical: 10 },
+  secondaryText: { color: colors.text, fontSize: 15, fontWeight: '600' },
+  percent: { minWidth: 40, alignItems: 'center' },
+  percentText: { color: colors.accent, fontSize: 13, fontWeight: '700' },
   cardTitle: { flex: 1, color: colors.text, fontSize: 17, fontWeight: '700' },
   cardStatus: { color: colors.textSecondary, fontSize: 13 },
   bar: { height: 3, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.12)', overflow: 'hidden' },
