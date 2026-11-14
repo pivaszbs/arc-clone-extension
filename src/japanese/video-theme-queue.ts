@@ -1,12 +1,14 @@
-import { confirmLateOpening, fingerprintVideo, matchEarlySparseOpening, matchKnownOpening, matchLateOpening, matchRecap, matchVideoThemes, overlapsRecap, refineThemeEdges, type VideoThemes } from './video-themes';
+import { detectAnimeOpEdIntervals, parseCaptionResponse } from './captions';
+import { confirmLateOpening, fingerprintVideo, matchAudioEndings, matchEarlySparseOpening, matchKnownEnding, matchKnownOpening, matchLateOpening, matchRecap, matchVideoThemes, mergeEndings, overlapsRecap, refineThemeEdges, type VideoThemes } from './video-themes';
 
 type Fingerprint = Awaited<ReturnType<typeof fingerprintVideo>>;
 type Comparison = {
   recap?: VideoThemes['recap'];
   earlyOpeningsChecked?: boolean;
-  episodes: { themes: VideoThemes; lateOpening?: VideoThemes['op']; earlyOpening?: VideoThemes['op'] }[];
+  audioEndingsChecked?: boolean;
+  episodes: { themes: VideoThemes; lateOpening?: VideoThemes['op']; earlyOpening?: VideoThemes['op']; audioEnding?: VideoThemes['ed'] }[];
 };
-export type ScanFile = { id: string; file: File };
+export type ScanFile = { id: string; file: File; subtitle?: File };
 export type ScanStatus = { active: string; total: number; scanned: number; failed: number; restoring: boolean };
 
 function openScanCache(): Promise<IDBDatabase> {
@@ -68,6 +70,8 @@ export class VideoThemeQueue {
   private compared = new Map<string, Set<string>>();
   private sparseOpenings = new Map<string, NonNullable<VideoThemes['op']>[]>();
   private knownOpeningMatches = new Map<string, VideoThemes['op']>();
+  private knownEndingMatches = new Map<string, VideoThemes['ed']>();
+  private subtitleChecked = new Set<string>();
   private recaps = new Map<string, NonNullable<VideoThemes['recap']>>();
   private controller = new AbortController();
   private active = '';
@@ -149,12 +153,20 @@ export class VideoThemeQueue {
             }))
           };
         }
-        if (!comparison.earlyOpeningsChecked) {
-          for (const [side, [mine, theirs]] of directions.entries()) {
-            const result = comparison.episodes[side];
-            if (!result.themes.op && !result.lateOpening) result.earlyOpening = matchEarlySparseOpening(mine, theirs);
+        if (!comparison.earlyOpeningsChecked || !comparison.audioEndingsChecked) {
+          if (!comparison.earlyOpeningsChecked) {
+            for (const [side, [mine, theirs]] of directions.entries()) {
+              const result = comparison.episodes[side];
+              if (!result.themes.op && !result.lateOpening) result.earlyOpening = matchEarlySparseOpening(mine, theirs);
+            }
+            comparison.earlyOpeningsChecked = true;
           }
-          comparison.earlyOpeningsChecked = true;
+          if (!comparison.audioEndingsChecked) {
+            const [mine, theirs] = matchAudioEndings(frames, reference);
+            comparison.episodes[0].audioEnding = mine;
+            comparison.episodes[1].audioEnding = theirs;
+            comparison.audioEndingsChecked = true;
+          }
           await scanCache('comparisons', key, comparison).catch(() => {});
         }
         this.controller.signal.throwIfAborted();
@@ -164,10 +176,10 @@ export class VideoThemeQueue {
           this.recaps.set(other.id, this.savedThemes(other.id).recap ?? comparison.recap);
         }
         for (const [side, item] of [current, other].entries()) {
-          const { themes, lateOpening, earlyOpening } = comparison.episodes[side];
+          const { themes, lateOpening, earlyOpening, audioEnding } = comparison.episodes[side];
           const candidate = lateOpening ?? earlyOpening;
           const recap = this.recaps.get(item.id) ?? this.savedThemes(item.id).recap;
-          const matched = { ...themes };
+          const matched = { ...themes, ed: mergeEndings(themes.ed, audioEnding) };
           if (overlapsRecap(matched.op, recap)) matched.op = undefined;
           if (!matched.op && candidate && !overlapsRecap(candidate, recap)) {
             const previous = this.sparseOpenings.get(item.id) ?? [];
@@ -183,7 +195,7 @@ export class VideoThemeQueue {
   }
 
   private async checkKnownOpenings() {
-    for (const [index, item] of this.files.entries()) {
+    for (const item of this.files) {
       if (this.paused) return;
       this.controller.signal.throwIfAborted();
       const frames = this.frames.get(item.id);
@@ -191,7 +203,7 @@ export class VideoThemeQueue {
       const recap = this.recaps.get(item.id) ?? saved.recap;
       if (!frames?.op.length || (saved.op && !overlapsRecap(saved.op, recap))) continue;
       const candidates: NonNullable<VideoThemes['op']>[] = [];
-      for (const other of this.files.slice(Math.max(0, index - 2), index + 3)) {
+      for (const other of this.files) {
         if (other === item) continue;
         const reference = this.frames.get(other.id);
         const referenceThemes = this.savedThemes(other.id);
@@ -218,12 +230,74 @@ export class VideoThemeQueue {
     }
   }
 
+  private async checkKnownEndings() {
+    for (const item of this.files) {
+      if (this.paused) return;
+      this.controller.signal.throwIfAborted();
+      const frames = this.frames.get(item.id);
+      const saved = this.savedThemes(item.id);
+      if (!frames?.ed.length || saved.ed) continue;
+      const candidates: NonNullable<VideoThemes['ed']>[] = [];
+      for (const other of this.files) {
+        if (other === item) continue;
+        const reference = this.frames.get(other.id);
+        const ending = this.savedThemes(other.id).ed;
+        if (!reference?.ed.length || !ending) continue;
+        // Separate key from v3, whose cached misses were made without the soundtrack.
+        const key = JSON.stringify(['known-ending-audio', item.id, other.id, ending]);
+        if (!this.knownEndingMatches.has(key)) {
+          const cached = this.fresh ? undefined : await scanCache<{ ending?: VideoThemes['ed'] }>('comparisons', key).catch(() => undefined);
+          this.controller.signal.throwIfAborted();
+          if (this.paused) return;
+          const match = cached ? cached.ending : matchKnownEnding(frames, reference, ending);
+          this.knownEndingMatches.set(key, match);
+          if (!cached) await scanCache('comparisons', key, { ending: match }).catch(() => {});
+        }
+        const candidate = this.knownEndingMatches.get(key);
+        if (!candidate) continue;
+        const confirmed = confirmLateOpening(candidate, candidates);
+        if (confirmed) {
+          if (!this.paused) await this.refineNewThemes(item, { ed: confirmed });
+          break;
+        }
+        candidates.push(candidate);
+      }
+    }
+  }
+
+  private async checkSubtitleThemes() {
+    for (const item of this.files) {
+      if (this.paused) return;
+      this.controller.signal.throwIfAborted();
+      if (this.subtitleChecked.has(item.id)) continue;
+      this.subtitleChecked.add(item.id);
+      const saved = this.savedThemes(item.id);
+      if (saved.op && saved.ed) continue;
+      let body = '';
+      if (item.subtitle && item.subtitle.size <= 5_000_000) {
+        body = await item.subtitle.text().catch(() => '');
+      }
+      if (!body) {
+        try { body = localStorage.getItem(`${item.id}:subtitles`) || ''; } catch { /* ignore */ }
+      }
+      if (!body) continue;
+      const cues = parseCaptionResponse(body);
+      if (!cues.length) continue;
+      const duration = this.frames.get(item.id)?.ed.at(-1)?.time ?? Math.max(cues.at(-1)?.end ?? 0, 1400);
+      const detected = detectAnimeOpEdIntervals(body, cues, duration);
+      if (detected.op || detected.ed) {
+        await this.refineNewThemes(item, { op: detected.op ?? undefined, ed: detected.ed ?? undefined });
+      }
+    }
+  }
+
   private async restoreFingerprints() {
     const unchecked = this.files.filter(item => !this.cachedFrames.has(item.id));
     await Promise.all(unchecked.map(async item => {
       const cached = this.fresh ? undefined : await scanCache<Fingerprint>('frames', item.id).catch(() => undefined);
       this.cachedFrames.set(item.id, cached);
-      if (cached?.openingScanEnd !== undefined) this.frames.set(item.id, cached);
+      // Older fingerprints without a soundtrack go back through the scan, which only decodes the audio.
+      if (cached?.openingScanEnd !== undefined && cached.edAudio !== undefined) this.frames.set(item.id, cached);
     }));
     if (unchecked.length) this.report();
   }
@@ -236,8 +310,10 @@ export class VideoThemeQueue {
         await this.restoreFingerprints();
         if (this.controller.signal.aborted) break;
         if (!this.paused) {
+          await this.checkSubtitleThemes();
           await this.compareReadyFiles();
           await this.checkKnownOpenings();
+          await this.checkKnownEndings();
         }
         // A folder refresh can add files while cached results are loading.
         if (this.files.some(item => !this.cachedFrames.has(item.id))) continue;

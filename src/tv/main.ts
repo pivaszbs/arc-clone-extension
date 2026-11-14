@@ -3,12 +3,19 @@ import { hasJapanese, type Cue } from '../japanese/study';
 import { PhraseStops } from '../japanese/study-player';
 import type { VideoThemes } from '../japanese/video-themes';
 import { tvDiagnostics } from './diagnostics';
+import {
+  applyTvSyncEvent,
+  cleanTitle,
+  episodeTitle,
+  privateLibraryAddress,
+  type Part,
+  type Progress,
+  type TvEpisode as Episode,
+  type TvLibrary as Library,
+  type TvSyncMessage
+} from './library-client';
 
-type Part = keyof VideoThemes;
 type Range = NonNullable<VideoThemes[Part]>;
-type Progress = { position: number; watchedAt: number; finished: boolean };
-type Episode = { name: string; video: string; subtitles: string | null; saved?: { themes?: VideoThemes; progress?: Progress } };
-type Library = { id: string; title: string; autoSkip?: Partial<Record<Part, boolean>>; autoSkipDelay?: number; endingAction?: string; episodes: Episode[] };
 
 const element = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const libraryScreen = element('library');
@@ -76,8 +83,202 @@ let hideTimer: number | undefined;
 let osdTimer: number | undefined;
 let ws: WebSocket | null = null;
 let wsTimer: number | undefined;
+let scanWasActive = false;
+let serverAutoplay = true;
+let subtitlesEnabled = stored('tv-subtitles') !== 'off';
+let pendingAutoplay = true;
 let loadId = 0;
 let lastSave = 0;
+let lastTvStateSent = 0;
+
+function sendTvState(force = false) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const now = Date.now();
+  if (!force && now - lastTvStateSent < 2000) return;
+  lastTvStateSent = now;
+  const ep = !player.hidden && index >= 0 ? library?.episodes[index] : undefined;
+  const payload = ep && library
+    ? {
+        type: 'tv_state',
+        active: true,
+        series: seriesIndex,
+        seriesName: library.title,
+        seriesLabel: cleanTitle(library.title),
+        episode: ep.name,
+        episodeLabel: episodeTitle(ep.name),
+        paused: video.paused,
+        position: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+        duration: Number.isFinite(video.duration) ? video.duration : 0,
+        subtitles: subtitlesEnabled,
+        autoplay: serverAutoplay,
+        skipAvailable: Boolean(activeSkip),
+      }
+    : { type: 'tv_state', active: false };
+  try {
+    ws.send(JSON.stringify(payload));
+  } catch { /* ignore */ }
+}
+
+function handleDirectionKey(key: number) {
+  if (!player.hidden && controls.hidden) {
+    if (key === 37 || key === 39) {
+      const delta = key === 37 ? -15 : 15;
+      seek(video.currentTime + delta);
+      flashOsd(delta < 0 ? '−15s' : '+15s');
+    } else {
+      // Up or Down opens the Netflix/Crunchyroll-style player menu.
+      showControls();
+      play.focus();
+    }
+  } else {
+    if (!player.hidden) showControls();
+    moveFocus(key);
+  }
+}
+
+function handleBackAction(): boolean {
+  if (!player.hidden && skipMenuOpen) {
+    skipMenuOpen = false;
+    showControls();
+    skipMenuBtn.focus();
+    return true;
+  }
+  if (!player.hidden && !controls.hidden) {
+    hideControls();
+    return true;
+  }
+  if (!player.hidden) {
+    closeEpisode();
+    return true;
+  }
+  if (!showingTitles && catalog.length > 1 && connectForm.hidden) {
+    renderTitles();
+    return true;
+  }
+  if (!connectForm.hidden && library) {
+    connectForm.hidden = true;
+    change.focus();
+    return true;
+  }
+  return false;
+}
+
+function handleOkAction() {
+  if (!player.hidden && controls.hidden) {
+    togglePlayback();
+    sendTvState(true);
+  } else if (document.activeElement instanceof HTMLElement) {
+    document.activeElement.click();
+  } else {
+    const root = player.hidden ? libraryScreen : player;
+    root.querySelector<HTMLElement>('button:not([disabled])')?.focus();
+  }
+}
+
+function handleMenuAction() {
+  if (!player.hidden) {
+    if (controls.hidden) {
+      showControls();
+      play.focus();
+    } else {
+      hideControls();
+    }
+  } else if (catalog.length > 1 && !showingTitles) {
+    renderTitles();
+  } else {
+    renderLibrary();
+  }
+}
+
+function handleTvControl(msg: TvSyncMessage) {
+  const action = msg.action;
+  if (!action) return;
+  if (action === 'playEpisode') {
+    const targetSeries = typeof msg.series === 'number'
+      ? msg.series
+      : typeof msg.seriesName === 'string'
+        ? catalog.findIndex(s => s.title === msg.seriesName || s.id === msg.seriesName)
+        : seriesIndex;
+    if (targetSeries >= 0 && targetSeries < catalog.length && targetSeries !== seriesIndex) {
+      if (!player.hidden) saveProgress();
+      selectSeries(targetSeries);
+    }
+    const epIdx = typeof msg.episode === 'string' && library
+      ? library.episodes.findIndex(e => e.name === msg.episode)
+      : -1;
+    if (epIdx >= 0) {
+      void openEpisode(epIdx, false, true);
+    }
+    return;
+  }
+  if (action === 'up') { handleDirectionKey(38); return; }
+  if (action === 'down') { handleDirectionKey(40); return; }
+  if (action === 'left') { handleDirectionKey(37); return; }
+  if (action === 'right') { handleDirectionKey(39); return; }
+  if (action === 'ok') { handleOkAction(); return; }
+  if (action === 'back') { handleBackAction(); return; }
+  if (action === 'menu') { handleMenuAction(); return; }
+  if (action === 'autoplay') {
+    serverAutoplay = !serverAutoplay;
+    syncToServer({ autoplay: serverAutoplay });
+    flashOsd(serverAutoplay ? 'Autoplay on' : 'Autoplay stopped');
+    sendTvState(true);
+    return;
+  }
+  if (player.hidden) return;
+  if (action === 'play') {
+    void startPlayback();
+    if (!controls.hidden) flashOsd('▶ Play');
+    sendTvState(true);
+  } else if (action === 'pause') {
+    video.pause();
+    if (!controls.hidden) flashOsd('❚❚ Pause');
+    sendTvState(true);
+  } else if (action === 'toggle') {
+    togglePlayback();
+    sendTvState(true);
+  } else if (action === 'seekBy' && typeof msg.delta === 'number') {
+    seek(video.currentTime + msg.delta);
+    flashOsd(msg.delta < 0 ? `−${Math.abs(msg.delta)}s` : `+${msg.delta}s`);
+    sendTvState(true);
+  } else if (action === 'seek' && typeof msg.position === 'number') {
+    seek(msg.position);
+    sendTvState(true);
+  } else if (action === 'restart') {
+    seek(0);
+    void startPlayback();
+    flashOsd('↺ Restart');
+    sendTvState(true);
+  } else if (action === 'subtitles') {
+    subtitlesEnabled = !subtitlesEnabled;
+    save('tv-subtitles', subtitlesEnabled ? 'on' : 'off');
+    renderCaption();
+    flashOsd(subtitlesEnabled ? 'Subtitles on' : 'Subtitles off');
+    sendTvState(true);
+  } else if (action === 'markWatched') {
+    const ep = library?.episodes[index];
+    if (ep) {
+      const nextFinished = typeof msg.finished === 'boolean' ? msg.finished : !getProgress(ep)?.finished;
+      saveProgress(nextFinished);
+      flashOsd(nextFinished ? '✓ Marked watched' : 'Marked unwatched');
+      sendTvState(true);
+    }
+  } else if (action === 'next') {
+    if (library && index + 1 < library.episodes.length) void openEpisode(index + 1, false, true);
+  } else if (action === 'prev') {
+    if (library && index > 0) void openEpisode(index - 1, false, true);
+  } else if (action === 'skip') {
+    if (activeSkip) {
+      skipPart(false);
+      flashOsd('Skipped');
+    } else {
+      flashOsd('No intro/outro here');
+    }
+    sendTvState(true);
+  } else if (action === 'stop') {
+    closeEpisode();
+  }
+}
 const diagnostics = tvDiagnostics(video, () => [
   library ? `Library: connected · ${library.episodes.length} episodes` : 'Library: disconnected',
   player.hidden ? 'Player: closed' : `Japanese cues: ${cues.length} · Skip ranges: ${parts.filter(part => themes[part]).map(part => labels[part]).join(', ') || 'none'}`
@@ -91,32 +292,8 @@ function save(key: string, value: string) {
   try { localStorage.setItem(key, value); } catch { /* Playback can continue without storage. */ }
 }
 
-function privateLibraryAddress(input: string) {
-  const url = new URL(input.trim());
-  const octets = url.hostname.split('.').map(Number);
-  const local = octets.length === 4 && (octets[0] === 10 || octets[0] === 127 ||
-    octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31 || octets[0] === 192 && octets[1] === 168);
-  if (url.protocol !== 'http:' || !local || url.username || url.password || !/^\/[a-f0-9]{16}\/?$/.test(url.pathname)) {
-    throw new Error('Enter the full Anime Study address shown on your Mac.');
-  }
-  return `${url.origin}${url.pathname.replace(/\/$/, '')}/`;
-}
-
 function format(time: number) {
   return `${Math.floor(time / 60)}:${String(Math.floor(time % 60)).padStart(2, '0')}`;
-}
-
-function cleanTitle(raw: string) {
-  return raw
-    .replace(/^Смотреть аниме\s+/i, '')
-    .replace(/\s+онлайн(?=\s|$)/i, '')
-    .replace(/\s+-\s+\d+(?:\s+-\s+.*)?$/, '')
-    .trim() || raw;
-}
-
-function episodeTitle(name: string) {
-  const number = /^Episode\s+(\d+)\b/i.exec(name);
-  return number ? `Episode ${Number(number[1])}` : name.replace(/\.[^.]+$/, '');
 }
 
 function progressKey(episode: Episode, lib = library) {
@@ -124,9 +301,13 @@ function progressKey(episode: Episode, lib = library) {
 }
 
 function getProgress(episode: Episode, lib = library): Progress | undefined {
+  let local: Progress | null = null;
   try {
-    return JSON.parse(stored(progressKey(episode, lib)) || 'null') || episode.saved?.progress;
-  } catch { return episode.saved?.progress; }
+    local = JSON.parse(stored(progressKey(episode, lib)) || 'null') as Progress | null;
+  } catch { /* ignore */ }
+  const remote = episode.saved?.progress;
+  if (local && remote) return remote.watchedAt >= local.watchedAt ? remote : local;
+  return remote || local || undefined;
 }
 
 function syncToServer(payload: Record<string, unknown>) {
@@ -141,7 +322,8 @@ function syncToServer(payload: Record<string, unknown>) {
 function saveProgress(finished = false) {
   const episode = library?.episodes[index];
   if (!episode || !ready || !Number.isFinite(video.currentTime)) return;
-  const progress: Progress = { position: finished ? 0 : video.currentTime, watchedAt: Date.now(), finished };
+  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : undefined;
+  const progress: Progress = { position: finished ? 0 : video.currentTime, ...(duration ? { duration } : {}), watchedAt: Date.now(), finished };
   save(progressKey(episode), JSON.stringify(progress));
   episode.saved = { ...(episode.saved || {}), progress };
   syncToServer({ episode: episode.name, progress });
@@ -166,19 +348,34 @@ function selectSeries(i: number) {
 
 function renderTitles() {
   list.textContent = '';
+  list.classList.add('titles-grid');
   showingTitles = true;
   allTitlesBtn.hidden = true;
   element('title').textContent = 'Anime Study';
   catalog.forEach((entry, i) => {
     const row = document.createElement('li');
     const button = document.createElement('button');
-    button.textContent = cleanTitle(entry.title);
+    button.className = 'title-card';
+    if (entry.poster) {
+      const img = document.createElement('img');
+      img.className = 'title-poster';
+      img.src = base + entry.poster;
+      img.alt = '';
+      img.addEventListener('error', () => img.remove());
+      button.append(img);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'title-meta';
+    const name = document.createElement('span');
+    name.className = 'title-name';
+    name.textContent = cleanTitle(entry.title);
     const info = document.createElement('small');
     const latest = entry.episodes.reduce((best, ep, idx) =>
       (getProgress(ep, entry)?.watchedAt || 0) > (best < 0 ? 0 : getProgress(entry.episodes[best], entry)?.watchedAt || 0) ? idx : best, -1);
     const resumeText = latest >= 0 ? ` · ${episodeTitle(entry.episodes[latest].name)}` : '';
     info.textContent = `${entry.episodes.length} episodes${resumeText}`;
-    button.append(info);
+    meta.append(name, info);
+    button.append(meta);
     button.addEventListener('click', () => selectSeries(i));
     row.append(button);
     list.append(row);
@@ -192,6 +389,7 @@ function renderLibrary() {
     return;
   }
   list.textContent = '';
+  list.classList.remove('titles-grid');
   if (!library) return;
   allTitlesBtn.hidden = catalog.length <= 1;
   const episodes = library.episodes;
@@ -223,78 +421,59 @@ function openWebSocket(url: string) {
   }
   const socket = new WebSocket(url.replace(/^http/, 'ws') + 'ws');
   ws = socket;
-  socket.addEventListener('open', () => diagnostics.log('WebSocket connected'));
+  socket.addEventListener('open', () => {
+    diagnostics.log('WebSocket connected');
+    sendTvState(true);
+  });
   socket.addEventListener('message', event => {
     try {
-      const msg = JSON.parse(String(event.data)) as {
-        type?: string;
-        series?: number;
-        seriesName?: string;
-        episode?: string;
-        themes?: VideoThemes;
-        autoSkip?: Partial<Record<Part, boolean>>;
-        autoSkipDelay?: number;
-        progress?: Progress;
-        done?: number;
-        total?: number;
-      };
+      const msg = JSON.parse(String(event.data)) as TvSyncMessage;
+      if (msg.type === 'tv_control') {
+        handleTvControl(msg);
+        return;
+      }
       if (msg.type === 'scan_progress') {
         const matchesSeries = typeof msg.series === 'number'
           ? msg.series === seriesIndex
           : typeof msg.seriesName === 'string' && (msg.seriesName === library?.title || msg.seriesName === library?.id);
         if (matchesSeries && typeof msg.done === 'number' && typeof msg.total === 'number' && msg.total > 0) {
-          if (player.hidden) {
-            libraryStatus.textContent = msg.done < msg.total ? `Scanning intros on Mac: ${msg.done}/${msg.total}` : '';
-          } else if (msg.done === msg.total) {
-            flashOsd('Intro scan complete');
+          if (msg.done < msg.total) {
+            scanWasActive = true;
+            if (player.hidden) libraryStatus.textContent = `Scanning intros on Mac: ${msg.done}/${msg.total}`;
+          } else {
+            if (player.hidden) libraryStatus.textContent = '';
+            if (scanWasActive && !player.hidden) flashOsd('Intro scan complete');
+            scanWasActive = false;
           }
         }
         return;
       }
-      if (msg.type !== 'sync') return;
-      const targetIdx = typeof msg.series === 'number'
-        ? msg.series
-        : typeof msg.seriesName === 'string'
-          ? catalog.findIndex(s => s.title === msg.seriesName || s.id === msg.seriesName)
-          : -1;
-      const targetLib = targetIdx >= 0 ? catalog[targetIdx] : undefined;
-      if (!targetLib) return;
-      if (msg.autoSkip && typeof msg.autoSkip === 'object') {
-        targetLib.autoSkip = { ...(targetLib.autoSkip ?? {}), ...msg.autoSkip };
+      if (msg.type === 'sync' && typeof msg.autoplay === 'boolean') {
+        serverAutoplay = msg.autoplay;
+        if (!player.hidden) flashOsd(serverAutoplay ? 'Autoplay on' : 'Autoplay stopped');
       }
+      const applied = applyTvSyncEvent(catalog, msg);
+      if (!applied) return;
+      if (typeof msg.episode === 'string' && msg.progress) {
+        const syncedEp = applied.targetLib.episodes.find(e => e.name === msg.episode);
+        if (syncedEp) save(progressKey(syncedEp, applied.targetLib), JSON.stringify(msg.progress));
+      }
+      if (applied.targetIdx !== seriesIndex) return;
       if (typeof msg.autoSkipDelay === 'number') {
-        targetLib.autoSkipDelay = msg.autoSkipDelay;
+        const delayIdx = skipDelays.indexOf(msg.autoSkipDelay as (typeof skipDelays)[number]);
+        if (delayIdx >= 0) skipDelayIndex = delayIdx;
       }
-      if (typeof msg.episode === 'string') {
-        const ep = targetLib.episodes.find(e => e.name === msg.episode);
-        if (ep) {
-          if (msg.themes && typeof msg.themes === 'object') {
-            ep.themes = { ...(ep.themes ?? {}), ...msg.themes };
-          }
-          if (msg.progress && typeof msg.progress === 'object') {
-            ep.progress = { ...(ep.progress ?? {}), ...msg.progress };
-          }
+      if (!player.hidden && index >= 0) {
+        const currentEp = library?.episodes[index];
+        if (currentEp && msg.episode === currentEp.name && applied.themesUpdated && msg.themes) {
+          themes = { ...themes, ...msg.themes };
+          renderSegmentMarkers();
+          updateSkips(video.currentTime);
+          flashOsd('Skip timings updated');
         }
-      }
-      if (targetIdx === seriesIndex) {
-        if (typeof msg.autoSkipDelay === 'number') {
-          const delayIdx = skipDelays.indexOf(msg.autoSkipDelay);
-          if (delayIdx >= 0) skipDelayIndex = delayIdx;
-        }
-        if (!player.hidden && index >= 0) {
-          const currentEp = library?.episodes[index];
-          if (currentEp && msg.episode === currentEp.name && msg.themes && typeof msg.themes === 'object') {
-            themes = { ...themes, ...msg.themes };
-            renderSegmentMarkers();
-            updateSkips(video.currentTime);
-            flashOsd('Skip timings updated');
-          }
-          if (msg.autoSkip || typeof msg.autoSkipDelay === 'number') {
-            renderSkipSettings();
-          }
-        } else if (player.hidden && library && !allTitlesBtn.hidden) {
-          renderLibrary();
-        }
+        if (applied.skipUpdated) renderSkipSettings();
+      } else if (player.hidden && library && !showingTitles) {
+        renderLibrary();
       }
     } catch { /* Ignore malformed WebSocket frames. */ }
   });
@@ -318,7 +497,8 @@ async function connect(input: string) {
     diagnostics.log(`Catalog request: HTTP ${response.status}`);
     if (!response.ok) throw new Error();
     stage = 'reading the catalog response';
-    const payload = await response.json() as { series?: Library[] };
+    const payload = await response.json() as { autoplay?: boolean; series?: Library[] };
+    serverAutoplay = payload.autoplay !== false;
     const seriesList = Array.isArray(payload.series) ? payload.series.filter(item => Array.isArray(item.episodes) && item.episodes.length) : [];
     if (!seriesList.length) throw new Error();
     base = url;
@@ -328,7 +508,23 @@ async function connect(input: string) {
     connectForm.hidden = true;
     change.hidden = false;
     libraryStatus.textContent = '';
-    if (catalog.length > 1) {
+    let bestSeries = -1;
+    let bestEpisode = -1;
+    let bestWatchedAt = 0;
+    catalog.forEach((lib, sIdx) => {
+      lib.episodes.forEach((ep, eIdx) => {
+        const p = getProgress(ep, lib);
+        if (p && p.watchedAt > bestWatchedAt) {
+          bestWatchedAt = p.watchedAt;
+          bestSeries = sIdx;
+          bestEpisode = p.finished && eIdx + 1 < lib.episodes.length ? eIdx + 1 : eIdx;
+        }
+      });
+    });
+    if (bestSeries >= 0 && bestEpisode >= 0) {
+      selectSeries(bestSeries);
+      void openEpisode(bestEpisode, false, serverAutoplay);
+    } else if (catalog.length > 1) {
       seriesIndex = Math.min(seriesIndex, catalog.length - 1);
       renderTitles();
     } else {
@@ -346,8 +542,12 @@ async function connect(input: string) {
 function flashOsd(text: string) {
   osd.textContent = text;
   osd.hidden = false;
+  syncPauseCircle();
   window.clearTimeout(osdTimer);
-  osdTimer = window.setTimeout(() => { osd.hidden = true; }, 900);
+  osdTimer = window.setTimeout(() => {
+    osd.hidden = true;
+    syncPauseCircle();
+  }, 900);
 }
 
 function isAutoSkipEnabled(part: Part) {
@@ -462,7 +662,7 @@ function renderSkipSettings() {
 }
 
 function syncPauseCircle() {
-  pauseCircle.hidden = !video.paused || !controls.hidden || !!captured || player.hidden || !ready;
+  pauseCircle.hidden = !video.paused || !controls.hidden || !osd.hidden || !!captured || player.hidden || !ready;
 }
 
 function hideControls() {
@@ -484,9 +684,9 @@ function showControls() {
   player.classList.toggle('with-settings', skipMenuOpen);
   window.clearTimeout(hideTimer);
   hideTimer = window.setTimeout(() => {
-    if (video.paused || captured || replayUntil || skipMenuOpen || !playbackStatus.hidden) return;
+    if (captured || replayUntil || skipMenuOpen || !playbackStatus.hidden) return;
     hideControls();
-  }, 8000);
+  }, 4000);
 }
 
 function status(text: string) {
@@ -522,7 +722,7 @@ function syncLearning() {
 }
 
 function renderCaption() {
-  captionCue = captured || subtitleAt(video.currentTime);
+  captionCue = captured || (subtitlesEnabled ? subtitleAt(video.currentTime) : undefined);
   caption.hidden = !captionCue;
   caption.textContent = captionCue?.text || '';
 }
@@ -602,11 +802,13 @@ function updatePlayback() {
   if (!video.seeking) updateSkips(time);
   lastTime = time;
   if (!video.paused && Date.now() - lastSave > 5000) saveProgress();
+  sendTvState(false);
 }
 
-async function openEpisode(position: number, previousFinished = false) {
+async function openEpisode(position: number, previousFinished = false, autoplay = serverAutoplay) {
   const episode = library?.episodes[position];
   if (!episode) return;
+  pendingAutoplay = autoplay;
   if (!previousFinished && !player.hidden) saveProgress();
   const request = ++loadId;
   ready = false;
@@ -626,6 +828,8 @@ async function openEpisode(position: number, previousFinished = false) {
   skipElapsed = lastTime = 0;
   skipMenuOpen = false;
   skipSettings.hidden = true;
+  osd.hidden = true;
+  window.clearTimeout(osdTimer);
   caption.hidden = skipRow.hidden = true;
   progressBar.value = 0;
   element('clock').textContent = '';
@@ -640,6 +844,7 @@ async function openEpisode(position: number, previousFinished = false) {
   status('Loading episode…');
   syncLearning();
   play.focus();
+  sendTvState(true);
 
   if (episode.subtitles) {
     try {
@@ -672,6 +877,7 @@ function closeEpisode() {
   player.hidden = true;
   libraryScreen.hidden = false;
   renderLibrary();
+  sendTvState(true);
 }
 
 video.addEventListener('loadedmetadata', () => {
@@ -688,23 +894,31 @@ video.addEventListener('loadedmetadata', () => {
   status('');
   const position = getProgress(episode);
   if (position && !position.finished && position.position > 0 && position.position < video.duration - 1) seek(position.position);
-  void startPlayback();
+  if (pendingAutoplay) void startPlayback();
+  else syncPauseCircle();
+  sendTvState(true);
 });
 video.addEventListener('error', () => status('This file could not be played. Try an H.264/AAC MP4.'));
 video.addEventListener('timeupdate', updatePlayback);
 video.addEventListener('seeking', () => { stops.reset(); lastTime = video.currentTime; skipElapsed = 0; });
-video.addEventListener('seeked', updatePlayback);
-video.addEventListener('play', () => { play.textContent = 'Pause'; syncPauseCircle(); });
-video.addEventListener('pause', () => { play.textContent = 'Play'; if (ready && !video.ended) saveProgress(); syncPauseCircle(); });
+video.addEventListener('seeked', () => { updatePlayback(); sendTvState(true); });
+video.addEventListener('play', () => { play.textContent = 'Pause'; syncPauseCircle(); sendTvState(true); });
+video.addEventListener('pause', () => { play.textContent = 'Play'; if (ready && !video.ended) saveProgress(); syncPauseCircle(); sendTvState(true); });
 video.addEventListener('ended', () => {
   saveProgress(true);
-  if (library && index + 1 < library.episodes.length) void openEpisode(index + 1, true);
+  if (serverAutoplay && library && index + 1 < library.episodes.length) void openEpisode(index + 1, true, true);
+  else sendTvState(true);
 });
-window.addEventListener('pagehide', () => { if (!player.hidden && !video.ended) saveProgress(); });
+window.addEventListener('pagehide', () => {
+  if (!player.hidden && !video.ended) saveProgress();
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ type: 'tv_state', active: false })); } catch { /* ignore */ }
+  }
+});
 
 function togglePlayback() {
   if (video.paused) { void startPlayback(); if (!controls.hidden) flashOsd('▶ Play'); }
-  else { video.pause(); if (!controls.hidden) flashOsd('❚❚ Pause'); }
+  else { video.pause(); hideControls(); }
 }
 pauseCircle.addEventListener('click', togglePlayback);
 play.addEventListener('click', togglePlayback);
@@ -813,40 +1027,18 @@ document.addEventListener('keydown', event => {
     return;
   }
   if (key === 10009 || key === 27) {
-    if (!player.hidden && skipMenuOpen) {
-      skipMenuOpen = false;
-      showControls();
-      skipMenuBtn.focus();
-    } else if (!player.hidden && !controls.hidden) {
-      hideControls();
-    } else if (!player.hidden) closeEpisode();
-    else if (!showingTitles && catalog.length > 1 && connectForm.hidden) { renderTitles(); }
-    else if (!connectForm.hidden && library) { connectForm.hidden = true; change.focus(); }
-    else if (tizen) tizen.application?.getCurrentApplication().exit();
+    if (!handleBackAction() && tizen) tizen.application?.getCurrentApplication().exit();
     event.preventDefault();
   } else if (key >= 37 && key <= 40 && (!(event.target instanceof HTMLInputElement) || key === 38 || key === 40)) {
     event.preventDefault();
-    if (!player.hidden && controls.hidden) {
-      if (key === 37 || key === 39) {
-        const delta = key === 37 ? -15 : 15;
-        seek(video.currentTime + delta);
-        flashOsd(delta < 0 ? '−15s' : '+15s');
-      } else {
-        // Up or Down opens the Netflix/Crunchyroll-style player menu.
-        showControls();
-        play.focus();
-      }
-    } else {
-      if (!player.hidden) showControls();
-      moveFocus(key);
-    }
+    handleDirectionKey(key);
   } else if (!player.hidden && (key === 10252 || key === 32 || key === 13 && controls.hidden)) {
     event.preventDefault();
     togglePlayback();
   } else if (!player.hidden && [415, 19, 412, 417].includes(key)) {
     event.preventDefault();
-    if (key === 415) { void startPlayback(); flashOsd('▶ Play'); }
-    else if (key === 19) { video.pause(); flashOsd('❚❚ Pause'); }
+    if (key === 415) { void startPlayback(); if (!controls.hidden) flashOsd('▶ Play'); }
+    else if (key === 19) { video.pause(); if (!controls.hidden) flashOsd('❚❚ Pause'); }
     else {
       const delta = key === 412 ? -15 : 15;
       seek(video.currentTime + delta);

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
-        id="https://anime-study.local/samsung" version="0.1.4" viewmodes="fullscreen">
+        id="https://anime-study.local/samsung" version="0.1.10" viewmodes="fullscreen">
   <tizen:application id="AnimeStudy.AnimeStudy" package="AnimeStudy" required_version="6.0"/>
   <tizen:profile name="tv-samsung"/>
   <content src="index.html"/>

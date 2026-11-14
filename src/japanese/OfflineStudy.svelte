@@ -2,13 +2,17 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import JapaneseStudy from './JapaneseStudy.svelte';
   import SeriesDownloads from './SeriesDownloads.svelte';
-  import { parseCaptionResponse } from './captions';
+  import { detectAnimeOpEdIntervals, parseCaptionResponse } from './captions';
   import { castEpisode, findCastDevices, openSafariAirPlay, stopDirectCast, stopSafariAirPlay, updateSafariAirPlay, type CastDevice, type CastSession } from './direct-cast';
   import type { Cue } from './study';
   import { THEME_DETECTOR_VERSION, overlapsRecap, type VideoThemes } from './video-themes';
+  import { exportVideoThemes } from './theme-export';
+  import { parseEpisodeKey, recordChange, replica } from './replica';
   import { forgetFrameChecks, VideoThemeQueue, type ScanStatus } from './video-theme-queue';
   import { DesktopVideoStream } from '../video/desktop-stream';
   import { directoryPicker, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, type DownloadFolder, type EpisodeFolder } from './offline-library';
+  import { buildTvPlaybackData, TvSyncClient, writeTvPlaybackToFolder as persistTvPlayback, type EpisodeProgress as Progress, type PipelineEvent, type TvWsState } from './tv-sync';
+  import { extractEpisodeNumberFromName, extractSeriesIdFromName, parseSeriesArcMetadata, selectStoryCuesForExplainer, type ArcExplainerData } from './arc-explainer';
 
   const preferredParams = new URLSearchParams(location.search).get('series');
   const preferredSeriesId = preferredParams?.match(/\/catalog\/[^/]+-(\d+)(?:\/|[?#]|$)/)?.[1];
@@ -46,54 +50,74 @@
   let scanSeries: string | undefined;
   let scanPreferredId = '';
   let scanFileNames = new Map<string, string>();
-  const DEFAULT_TV_SERVER_URL = 'http://10.131.140.3:46158/cf7f1d1d391d8231/';
-  let tvWs: WebSocket | undefined;
-  let tvWsTimer: ReturnType<typeof setTimeout> | undefined;
-  let tvWsActive = true;
+  let scanFileSeries = new Map<string, string>();
+  type ParallelJob = {
+    key: string;
+    seriesName: string;
+    title: string;
+    queue: VideoThemeQueue;
+    status?: ScanStatus;
+    paused: boolean;
+  };
+  type SavedParallelJob = { key: string; seriesName: string; title: string; paused: boolean };
+  let parallelJobs = $state<ParallelJob[]>([]);
+  let pendingSavedJobs = $state<SavedParallelJob[]>([]);
+  let expandedCoverage = $state<Record<string, boolean>>({});
+  let arcExplainer = $state<ArcExplainerData | null>(null);
+  let arcExplainerLoading = $state(false);
+  let arcExplainerError = $state('');
+  let activeScreen = $state<'watch' | 'gallery' | 'pipelines'>('watch');
+  let tvWsState = $state<TvWsState>('disconnected');
+  let tvAutoplay = $state(true);
+  let pipelineEvents = $state<PipelineEvent[]>([]);
+  const tvSync = new TvSyncClient(
+    state => {
+      tvWsState = state;
+      if (state === 'connected') replica.scheduleSync(0);
+    },
+    events => { pipelineEvents = events; },
+    undefined,
+    msg => {
+      if (typeof msg.autoplay === 'boolean') tvAutoplay = msg.autoplay;
+    }
+  );
+  const toggleTvAutoplay = () => {
+    const next = !tvAutoplay;
+    tvAutoplay = next;
+    void tvSync.pushSync({ autoplay: next });
+  };
+  const sendTvSocket = (payload: Record<string, unknown>) => tvSync.sendSocket(payload);
+  // Changes go to the shared replica too, so they reach the Mac later if it's away right now.
+  const pushTvSync = (payload: Record<string, unknown>) => {
+    try { recordChange(payload); } catch { /* The live push below still runs. */ }
+    return tvSync.pushSync(payload);
+  };
 
-  function tvServerBaseUrl() {
-    try {
-      const custom = localStorage.getItem('arc-tv-server-url');
-      if (custom && /^https?:\/\//.test(custom)) return custom.endsWith('/') ? custom : `${custom}/`;
-    } catch { /* Fall back to the default Mac TV server URL. */ }
-    return DEFAULT_TV_SERVER_URL;
-  }
+  // Registered during setup: Svelte only accepts onDestroy while the component initialises.
+  onDestroy(replica.onRemoteChange((key, value) => applyRemoteChange(key, value)));
 
-  function sendTvSocket(payload: Record<string, unknown>) {
-    if (tvWs?.readyState === WebSocket.OPEN) {
-      try { tvWs.send(JSON.stringify(payload)); } catch { /* Ignore socket write errors. */ }
+  /** Write a change made on another device (phone, TV, Mac worker) into this page's own storage. */
+  function applyRemoteChange(key: string, value: unknown) {
+    const parsed = parseEpisodeKey(key);
+    if (!parsed || !value || typeof value !== 'object') return;
+    const file = episodeFolders.find(entry => entry.name === parsed.series)?.files.find(item => item.name === parsed.episode)
+      ?? (seriesFolderName === parsed.series ? episodes.find(item => item.video.name === parsed.episode)?.video : undefined);
+    if (!file) return;
+    const id = fileIdentity(file);
+    if (parsed.field === 'themes') {
+      const themes = value as VideoThemes;
+      try { localStorage.setItem(themeStorageKey(id), JSON.stringify(themes)); } catch { /* Storage full. */ }
+      if (id === localSource) videoThemes = themes;
+    } else if (parsed.field === 'progress') {
+      const incoming = value as Partial<Progress>;
+      if (typeof incoming.position !== 'number' || typeof incoming.watchedAt !== 'number') return;
+      const existing = episodeProgress(file);
+      if (existing && existing.watchedAt >= incoming.watchedAt) return;
+      writeEpisodeProgress(file, { position: incoming.position, watchedAt: incoming.watchedAt, finished: !!incoming.finished });
+      progressRevision++;
     }
   }
-
-  async function pushTvSync(payload: Record<string, unknown>) {
-    try {
-      await fetch(`${tvServerBaseUrl()}sync`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-    } catch { /* TV server may not be running locally. */ }
-  }
-
-  function connectTvSocket() {
-    clearTimeout(tvWsTimer);
-    if (tvWs) {
-      try { tvWs.close(); } catch { /* ignore */ }
-      tvWs = undefined;
-    }
-    if (!tvWsActive) return;
-    try {
-      const socket = new WebSocket(`${tvServerBaseUrl().replace(/^http/, 'ws')}ws`);
-      tvWs = socket;
-      socket.addEventListener('close', () => {
-        if (tvWs === socket) {
-          tvWs = undefined;
-          if (tvWsActive) tvWsTimer = setTimeout(connectTvSocket, 4000);
-        }
-      });
-      socket.addEventListener('error', () => { /* close fires next */ });
-    } catch { /* Ignore WebSocket initialization errors. */ }
-  }
+  const connectTvSocket = () => tvSync.connect();
   let localBody = $state('');
   let localSource = $state('');
   let currentVideoFile: File | undefined;
@@ -191,6 +215,73 @@
     return `arc-offline:${encodeURIComponent(file.name)}/${file.size}/${file.lastModified}`;
   }
 
+  let exportStatus = $state('');
+  type SkipPart = keyof VideoThemes;
+  type EndingAction = 'auto' | 'next' | 'skip';
+  const skipParts = ['recap', 'op', 'ed'] as const;
+  const autoSkipKey = 'arc-offline-auto-skip';
+  const endingActionKey = 'arc-offline-ending-action';
+  const subtitlesKey = 'arc-offline-subtitles';
+  let autoSkip = $state<Record<SkipPart, boolean>>((() => {
+    try {
+      const legacy = localStorage.getItem(autoSkipKey) !== 'off';
+      return {
+        recap: localStorage.getItem(`${autoSkipKey}-recap`) !== 'off',
+        op: (localStorage.getItem(`${autoSkipKey}-op`) ?? (legacy ? 'on' : 'off')) === 'on',
+        ed: (localStorage.getItem(`${autoSkipKey}-ed`) ?? (legacy ? 'on' : 'off')) === 'on'
+      };
+    } catch { return { recap: true, op: true, ed: true }; }
+  })());
+  let endingAction = $state<EndingAction>((() => {
+    try {
+      const saved = localStorage.getItem(endingActionKey);
+      return saved === 'auto' || saved === 'next' || saved === 'skip' ? saved : 'auto';
+    } catch { return 'auto'; }
+  })());
+  let showSubtitles = $state((() => {
+    try { return localStorage.getItem(subtitlesKey) !== 'off'; } catch { return true; }
+  })());
+
+  function updateAutoSkip(enabled: boolean) {
+    autoSkip = { recap: enabled, op: enabled, ed: enabled };
+    try {
+      localStorage.setItem(autoSkipKey, enabled ? 'on' : 'off');
+      for (const part of skipParts) localStorage.setItem(`${autoSkipKey}-${part}`, enabled ? 'on' : 'off');
+    } catch { /* Keep the current preference. */ }
+  }
+
+  function updateEndingAction(next: EndingAction) {
+    endingAction = next;
+    try { localStorage.setItem(endingActionKey, next); } catch { /* Keep the current preference. */ }
+  }
+
+  function updateShowSubtitles(enabled: boolean) {
+    showSubtitles = enabled;
+    try { localStorage.setItem(subtitlesKey, enabled ? 'on' : 'off'); } catch { /* Keep the current preference. */ }
+  }
+
+  function exportPredictions() {
+    try {
+      const files = episodes.length ? episodes.map(item => item.video) : currentVideoFile ? [currentVideoFile] : [];
+      const json = exportVideoThemes(files.map(file => ({ name: file.name, themes: storedThemes(fileIdentity(file)) })));
+      if (!json) {
+        exportStatus = 'No saved predictions for these episodes yet. Run frame checking first.';
+        return;
+      }
+      const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'video-themes.json';
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      exportStatus = 'Download requested. Put video-themes.json beside this series’ videos before importing into Anime Study.';
+    } catch {
+      exportStatus = 'Could not export predictions. Check that each video has a unique filename.';
+    }
+  }
+
   function progressKey(file: File) {
     return `arc-offline:${encodeURIComponent(file.name)}:progress`;
   }
@@ -226,19 +317,188 @@
     });
   });
 
+  // A detector update reuses the saved frame checks, so it can run without asking. It only decodes
+  // each episode's ending audio and recompares. Each series upgrades once per session, so stopping
+  // the queue sticks.
+  const autoUpgradedSeries = new Set<string>();
+  let autoUpgrading = $state(false);
+  $effect(() => {
+    if (!needsDetectorReprocess || scanQueue || rescanPreparing) return;
+    const series = selectedFolder ?? '';
+    if (autoUpgradedSeries.has(series) || parallelJobs.some(job => job.key === selectedFolder)) return;
+    autoUpgradedSeries.add(series);
+    autoUpgrading = true;
+    tvSync.log('Pipeline', `Updating skip timings to detector v${THEME_DETECTOR_VERSION}`);
+    startScanQueue();
+  });
+
+  async function translateToEnglish(text: string, sourceLang = 'auto'): Promise<string> {
+    const clean = text.trim();
+    if (!clean) return '';
+    try {
+      const response = await requestArc({ type: 'TRANSLATE_TEXT', text: clean, sourceLang, targetLang: 'en' });
+      return response.translatedText?.trim() || clean;
+    } catch {
+      return clean;
+    }
+  }
+
+  async function loadArcExplainer(force = false) {
+    if (arcExplainerLoading || !fileName) return;
+    const cacheKey = `arc-explainer:${localSource || fileName}`;
+    if (!force) {
+      try {
+        const cached = JSON.parse(localStorage.getItem(cacheKey) || 'null') as ArcExplainerData | null;
+        if (cached && cached.hasSubtitles === (localCues.length > 0)) {
+          arcExplainer = cached;
+          return;
+        }
+      } catch { /* ignore cache errors */ }
+    }
+    arcExplainerLoading = true;
+    arcExplainerError = '';
+    try {
+      const seriesId = extractSeriesIdFromName(seriesFolderName || animeName);
+      const episodeNumber = extractEpisodeNumberFromName(fileName);
+      let meta: ReturnType<typeof parseSeriesArcMetadata> = {
+        seriesTitle: animeName || seriesFolderName,
+        synopsis: '',
+        genres: [],
+      };
+      if (seriesId) {
+        try {
+          const metaCacheKey = `arc-series-meta:${seriesId}`;
+          let rawPayload: unknown = null;
+          if (!force) {
+            try { rawPayload = JSON.parse(localStorage.getItem(metaCacheKey) || 'null'); } catch { /* ignore */ }
+          }
+          if (!rawPayload) {
+            const res = await fetch(`https://smotret-anime.com/api/series/${seriesId}`);
+            if (res.ok) {
+              rawPayload = await res.json();
+              try { localStorage.setItem(metaCacheKey, JSON.stringify(rawPayload)); } catch { /* ignore */ }
+            }
+          }
+          if (rawPayload) meta = parseSeriesArcMetadata(rawPayload, episodeNumber);
+        } catch { /* Offline or series API unreachable. */ }
+      }
+
+      const [overview, episodeTitle] = await Promise.all([
+        meta.synopsis ? translateToEnglish(meta.synopsis) : Promise.resolve(''),
+        meta.episodeTitle ? translateToEnglish(meta.episodeTitle) : Promise.resolve(undefined),
+      ]);
+
+      const { recapLines, storyLines } = selectStoryCuesForExplainer(localCues, videoThemes);
+      const [recapSummary, storyBeats] = await Promise.all([
+        recapLines.length ? translateToEnglish(recapLines.join(' ')) : Promise.resolve(undefined),
+        storyLines.length
+          ? Promise.all(storyLines.map(line => translateToEnglish(line)))
+          : Promise.resolve([]),
+      ]);
+
+      const data: ArcExplainerData = {
+        seriesTitle: animeName || meta.seriesTitle || 'Current Series',
+        episodeTitle,
+        overview: overview || 'Load episode subtitles (.ass/.srt/.vtt) to generate an English story digest for this episode.',
+        recapSummary,
+        storyBeats,
+        genres: meta.genres,
+        hasSubtitles: localCues.length > 0,
+      };
+      arcExplainer = data;
+      try { localStorage.setItem(cacheKey, JSON.stringify(data)); } catch { /* ignore */ }
+    } catch (error) {
+      arcExplainerError = error instanceof Error ? error.message : 'Could not build arc explainer.';
+    } finally {
+      arcExplainerLoading = false;
+    }
+  }
+
+  async function loadSubtitleFile(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    try {
+      const body = await file.text();
+      localBody = body;
+      const key = localSource || fileName;
+      if (key) {
+        try { localStorage.setItem(`${key}:subtitles`, body); } catch { /* ignore */ }
+      }
+      arcExplainer = null;
+      await tick();
+      const cues = parseCaptionResponse(body);
+      if (cues.length && currentVideoFile) {
+        const subThemes = detectAnimeOpEdIntervals(body, cues, videoDuration || Math.max(cues.at(-1)?.end ?? 0, 1400));
+        if (subThemes.op || subThemes.ed) {
+          const merged = { ...videoThemes, op: videoThemes.op ?? subThemes.op, ed: videoThemes.ed ?? subThemes.ed };
+          videoThemes = merged;
+          try { localStorage.setItem(themeStorageKey(fileIdentity(currentVideoFile)), JSON.stringify(merged)); } catch { /* ignore */ }
+          void pushTvSync({ seriesName: seriesFolderName, episode: currentVideoFile.name, themes: merged });
+        }
+      }
+      void loadArcExplainer(true);
+    } catch {
+      arcExplainerError = 'Could not read that subtitle file.';
+    }
+  }
+
   function rememberScanQueue() {
     try {
       if (scanQueue && scanFolder) {
-        sessionStorage.setItem('arc-theme-queue', JSON.stringify({ folder: scanFolder.name, series: scanSeries, paused: scanPaused, preferredId: scanPreferredId }));
-      } else sessionStorage.removeItem('arc-theme-queue');
+        localStorage.setItem('arc-theme-queue', JSON.stringify({ folder: scanFolder.name, series: scanSeries, paused: scanPaused, preferredId: scanPreferredId }));
+      } else localStorage.removeItem('arc-theme-queue');
     } catch { /* The open tab can still run the queue. */ }
+  }
+
+  function rememberParallelJobs() {
+    try {
+      if (parallelJobs.length && folder) {
+        const jobs: SavedParallelJob[] = parallelJobs.map(j => ({
+          key: j.key,
+          seriesName: j.seriesName,
+          title: j.title,
+          paused: j.paused,
+        }));
+        localStorage.setItem('arc-parallel-jobs', JSON.stringify({ folder: folder.name, jobs }));
+        pendingSavedJobs = jobs;
+      } else {
+        localStorage.removeItem('arc-parallel-jobs');
+        pendingSavedJobs = [];
+      }
+    } catch { /* Storage may be unavailable. */ }
+  }
+
+  function readSavedParallelJobs(folderName?: string): SavedParallelJob[] {
+    try {
+      const saved = JSON.parse(localStorage.getItem('arc-parallel-jobs') || 'null') as { folder?: string; jobs?: SavedParallelJob[] } | null;
+      if (!saved || !Array.isArray(saved.jobs)) return [];
+      if (folderName && saved.folder !== folderName) return [];
+      return saved.jobs.filter(j => typeof j?.key === 'string' && typeof j?.seriesName === 'string');
+    } catch {
+      return [];
+    }
+  }
+
+  function findPairedSubtitle(videoFile: File, pool: File[]): File | undefined {
+    const stem = videoFile.name.replace(/\.[^.]+$/, '').toLowerCase();
+    return pool.find(f => /\.(ass|ssa|srt|vtt)$/i.test(f.name) && f.name.replace(/\.[^.]+$/, '').toLowerCase() === stem);
   }
 
   function queueFiles(files: File[]) {
     const ordered = files.filter(file => isEpisodeVideo(file.name))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
     scanFileNames = new Map(ordered.map(file => [fileIdentity(file), file.name]));
-    scanQueue?.update(ordered.map(file => ({ file, id: fileIdentity(file) })));
+    const folderLookup = new Map<File, string>();
+    for (const entry of episodeFolders) {
+      for (const f of entry.files) folderLookup.set(f, entry.name);
+    }
+    scanFileSeries = new Map(ordered.map(file => [
+      fileIdentity(file),
+      folderLookup.get(file) || file.webkitRelativePath.split('/').at(-2) || seriesFolderName
+    ]));
+    scanQueue?.update(ordered.map(file => ({ file, id: fileIdentity(file), subtitle: findPairedSubtitle(file, files) })));
   }
 
   function startScanQueue(series = selectedFolder, paused = false, fresh = false, preferredId = '') {
@@ -248,11 +508,16 @@
     scanPreferredId = preferredId;
     scanPaused = paused;
     const scanSeriesName = episodeFolders.find(entry => entry.key === scanSeries)?.name || seriesFolderName;
+    let lastProgressKey = '';
     const queue = new VideoThemeQueue(status => {
       if (scanQueue === queue) {
         scanStatus = status;
         if (scanSeriesName && status) {
-          sendTvSocket({ type: 'scan_progress', seriesName: scanSeriesName, done: status.scanned, total: status.total });
+          const progressKey = `${status.scanned}/${status.total}/${status.active || ''}`;
+          if (progressKey !== lastProgressKey) {
+            lastProgressKey = progressKey;
+            sendTvSocket({ type: 'scan_progress', seriesName: scanSeriesName, done: status.scanned, total: status.total });
+          }
         }
       }
     }, (id, match) => {
@@ -267,16 +532,70 @@
         recap
       };
       try { localStorage.setItem(themeStorageKey(id), JSON.stringify(found)); } catch { /* Playback still uses the current match. */ }
-      if (scanSeries === selectedFolder) void writeTvPlaybackToFolder(selectedFolder, buildTvPlaybackData());
+      if (scanSeries === selectedFolder) void writeTvPlaybackToFolder(selectedFolder, buildTvPlayback());
       const epName = scanFileNames.get(id) || (id === localSource ? currentVideoFile?.name : undefined);
-      if (epName && scanSeriesName) {
-        void pushTvSync({ seriesName: scanSeriesName, episode: epName, themes: found });
+      const targetSeries = scanFileSeries.get(id) || scanSeriesName;
+      if (epName && targetSeries) {
+        void pushTvSync({ seriesName: targetSeries, episode: epName, themes: found });
       }
     }, id => storedThemes(id, false), fresh, preferredId);
     scanQueue = queue;
     queue.setPaused(paused);
     queueFiles(scanFolder ? episodeFolders.find(entry => entry.key === scanSeries)?.files || [] : episodes.map(episode => episode.video));
     rememberScanQueue();
+  }
+
+  function stopParallelJobs() {
+    for (const job of parallelJobs) job.queue.stop();
+    parallelJobs = [];
+    rememberParallelJobs();
+  }
+
+  function launchSeriesJob(entry: EpisodeFolder, fresh: boolean, preferredId = '', paused = false) {
+    const ordered = entry.files.filter(file => isEpisodeVideo(file.name))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    if (!ordered.length) return;
+    const fileNames = new Map(ordered.map(file => [fileIdentity(file), file.name]));
+    const clean = folderTitle(entry.name).title || entry.name;
+    let lastKey = '';
+    const queue = new VideoThemeQueue(status => {
+      parallelJobs = parallelJobs.map(j => j.queue === queue ? { ...j, status } : j);
+      if (status) {
+        const progressKey = `${status.scanned}/${status.total}/${status.active || ''}`;
+        if (progressKey !== lastKey) {
+          lastKey = progressKey;
+          sendTvSocket({ type: 'scan_progress', seriesName: entry.name, done: status.scanned, total: status.total });
+        }
+      }
+    }, (id, match) => {
+      if (!match.op && !match.ed && !match.recap) return;
+      const previous = storedThemes(id, false);
+      const recap = match.recap ?? previous.recap;
+      const opening = overlapsRecap(previous.op, recap) ? match.op : previous.op ?? match.op;
+      const found = { op: opening, ed: previous.ed ?? match.ed, recap };
+      if (id === localSource) videoThemes = {
+        op: found.op ?? (overlapsRecap(videoThemes.op, recap) ? undefined : videoThemes.op),
+        ed: found.ed ?? videoThemes.ed,
+        recap
+      };
+      try { localStorage.setItem(themeStorageKey(id), JSON.stringify(found)); } catch { /* Playback still uses the current match. */ }
+      if (entry.key === selectedFolder) void writeTvPlaybackToFolder(selectedFolder, buildTvPlayback());
+      const epName = fileNames.get(id);
+      if (epName) void pushTvSync({ seriesName: entry.name, episode: epName, themes: found });
+    }, id => storedThemes(id, false), fresh, preferredId);
+    parallelJobs = [...parallelJobs.filter(j => j.key !== entry.key), { key: entry.key, seriesName: entry.name, title: clean, queue, paused }];
+    if (paused) queue.setPaused(true);
+    rememberParallelJobs();
+    queue.update(ordered.map(file => ({ file, id: fileIdentity(file), subtitle: findPairedSubtitle(file, entry.files) })));
+  }
+
+  function queueAllFolders() {
+    if (rescanPreparing || !episodeFolders.length) return;
+    stopScanQueue();
+    stopParallelJobs();
+    for (const entry of episodeFolders) launchSeriesJob(entry, false, localSource);
+    tvSync.log('Pipeline', `Started ${episodeFolders.length} parallel scan jobs`);
+    activeScreen = 'pipelines';
   }
 
   function toggleScanQueue() {
@@ -291,14 +610,31 @@
     scanQueue = undefined;
     scanFolder = undefined;
     scanStatus = undefined;
+    autoUpgrading = false;
     rememberScanQueue();
   }
 
-  async function rescanFiles(files: File[], series: string | undefined, preferredId: string) {
+  async function scanSingleEpisode(entry: EpisodeFolder, file: File) {
     if (rescanPreparing) return;
     rescanPreparing = true;
     stopScanQueue();
-    const sourceFolder = folder;
+    const id = fileIdentity(file);
+    const existingThemes = storedThemes(id, false);
+    if (existingThemes.op || existingThemes.ed || existingThemes.recap) {
+      await clearCachedThemes([file]);
+    }
+    const existingJob = parallelJobs.find(j => j.key === entry.key);
+    if (existingJob) {
+      existingJob.queue.stop();
+      parallelJobs = parallelJobs.filter(j => j.key !== entry.key);
+    }
+    launchSeriesJob(entry, false, id);
+    tvSync.log('Pipeline', `Scanning ${folderTitle(entry.name).title || entry.name} · ${episodeLabel(file.name)}`);
+    activeScreen = 'pipelines';
+    rescanPreparing = false;
+  }
+
+  async function clearCachedThemes(files: File[]) {
     const ids = new Set(files.filter(file => isEpisodeVideo(file.name)).map(fileIdentity));
     const cleared = await forgetFrameChecks(ids).then(() => true, () => false);
     for (const id of ids) {
@@ -307,6 +643,38 @@
       }
     }
     if (ids.has(localSource)) videoThemes = {};
+    return cleared;
+  }
+
+  function startSeriesJob(entry: EpisodeFolder) {
+    stopScanQueue();
+    launchSeriesJob(entry, false, localSource);
+    tvSync.log('Pipeline', `Started ${folderTitle(entry.name).title || entry.name}`);
+    activeScreen = 'pipelines';
+  }
+
+  async function rescanSeriesJob(entry: EpisodeFolder) {
+    if (rescanPreparing) return;
+    rescanPreparing = true;
+    stopScanQueue();
+    const existing = parallelJobs.find(j => j.key === entry.key);
+    if (existing) {
+      existing.queue.stop();
+      parallelJobs = parallelJobs.filter(j => j.key !== entry.key);
+    }
+    const cleared = await clearCachedThemes(entry.files);
+    launchSeriesJob(entry, !cleared, localSource);
+    tvSync.log('Pipeline', `Rescanning ${folderTitle(entry.name).title || entry.name}`);
+    activeScreen = 'pipelines';
+    rescanPreparing = false;
+  }
+
+  async function rescanFiles(files: File[], series: string | undefined, preferredId: string) {
+    if (rescanPreparing) return;
+    rescanPreparing = true;
+    stopScanQueue();
+    const sourceFolder = folder;
+    const cleared = await clearCachedThemes(files);
     if (sourceFolder === folder && (series === undefined || series === selectedFolder)) {
       startScanQueue(series, false, !cleared, preferredId);
       if (series === undefined) queueFiles(files);
@@ -319,20 +687,72 @@
     return rescanFiles(files, selectedFolder, localSource);
   }
 
-  function rescanAllFrames() {
-    const files = folderGranted ? episodeFolders.flatMap(entry => entry.files) : episodes.map(episode => episode.video);
-    return rescanFiles(files, undefined, localSource);
+  async function rescanAllFrames() {
+    if (rescanPreparing) return;
+    if (!folderGranted || !episodeFolders.length) {
+      return rescanFiles(episodes.map(episode => episode.video), undefined, localSource);
+    }
+    rescanPreparing = true;
+    stopScanQueue();
+    stopParallelJobs();
+    const cleared = await clearCachedThemes(episodeFolders.flatMap(entry => entry.files));
+    for (const entry of episodeFolders) launchSeriesJob(entry, !cleared, localSource);
+    tvSync.log('Pipeline', `Rescanning ${episodeFolders.length} series in parallel`);
+    activeScreen = 'pipelines';
+    rescanPreparing = false;
   }
 
   function restoreScanQueue(handle: DownloadFolder) {
-    if (scanQueue) return;
-    try {
-      const saved = JSON.parse(sessionStorage.getItem('arc-theme-queue') || 'null');
-      if (saved?.folder === handle.name) startScanQueue(saved.series, saved.paused === true, false, typeof saved.preferredId === 'string' ? saved.preferredId : '');
-    } catch { /* The queue can be started again from the library. */ }
+    if (!scanQueue) {
+      try {
+        const saved = JSON.parse(localStorage.getItem('arc-theme-queue') || 'null');
+        if (saved?.folder === handle.name) startScanQueue(saved.series, saved.paused === true, false, typeof saved.preferredId === 'string' ? saved.preferredId : '');
+      } catch { /* The queue can be started again from the library. */ }
+    }
+    restoreParallelJobs(handle);
   }
 
-  type Progress = { position: number; watchedAt: number; finished: boolean };
+  function restoreParallelJobs(handle: DownloadFolder, forceResume = false) {
+    if (parallelJobs.length) return;
+    const saved = readSavedParallelJobs(handle.name);
+    if (!saved.length) return;
+    let restored = 0;
+    for (const job of saved) {
+      const entry = episodeFolders.find(item => item.key === job.key || item.name === job.seriesName);
+      if (!entry) continue;
+      launchSeriesJob(entry, false, localSource, forceResume ? false : job.paused);
+      restored++;
+    }
+    if (restored) {
+      tvSync.log('Pipeline', `Continued ${restored} saved scan ${restored === 1 ? 'job' : 'jobs'}`);
+    }
+  }
+
+  async function continueSavedScan() {
+    if (!folderGranted) {
+      await openFolder(true);
+      if (folderGranted && folder) restoreParallelJobs(folder, true);
+      return;
+    }
+    if (folder && readSavedParallelJobs(folder.name).length) {
+      restoreParallelJobs(folder, true);
+      return;
+    }
+    // Fall back to continuing any unfinished series folders.
+    if (folderGranted && episodeFolders.length) {
+      let started = 0;
+      for (const entry of episodeFolders) {
+        if (parallelJobs.some(j => j.key === entry.key)) continue;
+        const videos = entry.files.filter(f => isEpisodeVideo(f.name));
+        const readyCount = videos.filter(f => { const t = storedThemes(fileIdentity(f), false); return !!(t.op || t.ed || t.recap); }).length;
+        if (readyCount < videos.length) {
+          launchSeriesJob(entry, false, localSource);
+          started++;
+        }
+      }
+      if (started) tvSync.log('Pipeline', `Continued ${started} unfinished scan ${started === 1 ? 'job' : 'jobs'}`);
+    }
+  }
 
   function episodeProgress(file: File): Progress | undefined {
     try {
@@ -341,45 +761,19 @@
     } catch { /* Playback can still work without storage. */ }
   }
 
-  function buildTvPlaybackData(targetEpisodes = episodes, title = animeName) {
-    const legacy = localStorage.getItem('arc-offline-auto-skip') !== 'off';
-    const autoSkip = Object.fromEntries((['recap', 'op', 'ed'] as const).map(part => {
-      const setting = localStorage.getItem(`arc-offline-auto-skip-${part}`);
-      return [part, setting === null ? part === 'recap' || legacy : setting === 'on'];
-    }));
-    return {
-      version: 1,
-      title,
-      endingAction: localStorage.getItem('arc-offline-ending-action') || 'auto',
-      autoSkip,
-      episodes: Object.fromEntries(targetEpisodes.map(({ video }) => [
-        video.name, { themes: storedThemes(fileIdentity(video)), progress: episodeProgress(video) }
-      ]))
-    };
+  function buildTvPlayback(targetEpisodes = episodes, title = animeName) {
+    return buildTvPlaybackData(targetEpisodes, title, video => storedThemes(fileIdentity(video)), episodeProgress);
   }
 
-  async function writeTvPlaybackToFolder(seriesKey: string | undefined, data: ReturnType<typeof buildTvPlaybackData>) {
-    if (!folderGranted || !folder || !seriesKey || seriesKey === '.') return false;
-    try {
-      const handle = folder as unknown as FileSystemDirectoryHandle & {
-        requestPermission?: (opts: { mode: 'read' | 'readwrite' }) => Promise<PermissionState>;
-      };
-      if (handle.requestPermission && (await handle.requestPermission({ mode: 'readwrite' })) !== 'granted') return false;
-      const dir = await handle.getDirectoryHandle(seriesKey);
-      const fileHandle = await dir.getFileHandle('anime-study-tv.json', { create: true });
-      const writable = await fileHandle.createWritable();
-      await writable.write(JSON.stringify(data, null, 2));
-      await writable.close();
-      void pushTvSync({ seriesName: seriesKey, autoSkip: data.autoSkip });
-      return true;
-    } catch {
-      return false;
-    }
+  async function writeTvPlaybackToFolder(seriesKey: string | undefined, data: ReturnType<typeof buildTvPlayback>) {
+    const ok = await persistTvPlayback(folder, folderGranted, seriesKey, data);
+    if (ok && seriesKey) void pushTvSync({ seriesName: seriesKey, autoSkip: data.autoSkip });
+    return ok;
   }
 
   async function exportTvPlaybackData() {
     saveProgress(true);
-    const data = buildTvPlaybackData();
+    const data = buildTvPlayback();
     if (await writeTvPlaybackToFolder(selectedFolder, data)) {
       folderStatus = 'Synced skip timings & progress to anime-study-tv.json in the series folder.';
       return;
@@ -551,10 +945,13 @@
 
   onMount(() => {
     let mounted = true;
+    pendingSavedJobs = readSavedParallelJobs();
     connectTvSocket();
+    replica.scheduleSync(0);
     if (directoryPicker) void rememberedFolder().then(async handle => {
       if (!mounted || folder || folderBusy || !handle) return;
       folder = handle;
+      pendingSavedJobs = readSavedParallelJobs(handle.name);
       const granted = await handle.queryPermission({ mode: 'read' }) === 'granted';
       if (!mounted || folder !== handle) return;
       folderGranted = granted;
@@ -579,8 +976,13 @@
 
   async function playFile(file: File, subtitle?: File, autoplay = false) {
     const request = ++opening;
-    const body = subtitle && subtitle.size <= 5000000 ? await subtitle.text().catch(() => '') : '';
+    let body = subtitle && subtitle.size <= 5000000 ? await subtitle.text().catch(() => '') : '';
+    if (!body) {
+      try { body = localStorage.getItem(`${fileIdentity(file)}:subtitles`) || ''; } catch { /* ignore */ }
+    }
     if (request !== opening) return;
+    arcExplainer = null;
+    arcExplainerError = '';
     if (desktopStream?.active) desktopStream.stop();
     videoReady = false;
     desktopPipError = '';
@@ -912,10 +1314,8 @@
   }
 
   onDestroy(() => {
-    tvWsActive = false;
-    clearTimeout(tvWsTimer);
-    try { tvWs?.close(); } catch { /* ignore */ }
-    tvWs = undefined;
+    tvSync.destroy();
+    for (const job of parallelJobs) job.queue.stop();
     scanQueue?.stop();
     if (desktopStream?.active) desktopStream.stop();
     desktopStream = undefined;
@@ -932,12 +1332,15 @@
     <h1 title={animeName || undefined}>{animeName || 'Offline Study'}</h1>
   </div>
   <nav aria-label="Offline Study">
-    <a href="#library">Library</a>
-    <a href="#downloads" onclick={() => { downloadsOpen = true; }}>Downloads</a>
+    <button type="button" class="nav-tab" aria-current={activeScreen === 'watch' ? 'page' : undefined} onclick={() => { activeScreen = 'watch'; }}>Watch</button>
+    <button type="button" class="nav-tab" aria-current={activeScreen === 'gallery' ? 'page' : undefined} onclick={() => { activeScreen = 'gallery'; }}>Gallery</button>
+    <button type="button" class="nav-tab" aria-current={activeScreen === 'pipelines' ? 'page' : undefined} onclick={() => { activeScreen = 'pipelines'; }}>Pipelines</button>
+    <a href="#settings" onclick={event => { event.preventDefault(); activeScreen = 'gallery'; void tick().then(() => document.getElementById('settings')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })); }}>Settings</a>
+    <a href="#downloads" onclick={event => { event.preventDefault(); activeScreen = 'gallery'; downloadsOpen = true; }}>Downloads</a>
   </nav>
 </header>
 
-<div class="watch-layout" class:with-episodes={episodes.length > 1}>
+<div class="watch-layout" class:with-episodes={episodes.length > 1} hidden={activeScreen !== 'watch'}>
   <div class="watch-main">
 {#if videoUrl}
   <div class="player" bind:this={player}>
@@ -969,7 +1372,7 @@
     {#if fullscreenError}<p role="alert">Fullscreen could not open.</p>{/if}
     {#key videoUrl}
       <div class="offline-controls">
-        <JapaneseStudy bind:this={studyPlayer} inline {overlayHidden} {localCues} {localBody} {localSource} {referenceCues} {videoThemes} title={fileName} bind:learning bind:studying onResumeAtEnd={() => stepEpisode(1, true)} onNextEpisode={episodeIndex >= 0 && episodeIndex < episodes.length - 1 ? () => stepEpisode(1, true) : undefined} onToggleFullscreen={() => toggleFullscreen(true)}>
+        <JapaneseStudy bind:this={studyPlayer} inline {overlayHidden} {localCues} {localBody} {localSource} {referenceCues} {videoThemes} title={fileName} bind:learning bind:studying bind:autoSkip bind:endingAction bind:showSubtitles onResumeAtEnd={() => stepEpisode(1, true)} onNextEpisode={episodeIndex >= 0 && episodeIndex < episodes.length - 1 ? () => stepEpisode(1, true) : undefined} onToggleFullscreen={() => toggleFullscreen(true)}>
           {#snippet playerOptions()}
             {#if desktopPipAvailable}
               <button class="theme-scan" disabled={desktopPipStarting || !videoReady} onclick={toggleDesktopPip}>
@@ -1029,6 +1432,51 @@
       <span class="no-predictions">No predictions for this episode</span>
     {/each}
   </section>
+  <details class="episode-bar arc-explainer" ontoggle={e => { if (e.currentTarget.open && !arcExplainer && !arcExplainerLoading) void loadArcExplainer(); }}>
+    <summary>
+      <strong>Arc explainer (English)</strong>
+      <span class="arc-explainer-meta">
+        {localCues.length ? `${localCues.length} subtitle lines` : 'No subtitles loaded'}
+      </span>
+    </summary>
+    <div class="arc-explainer-body">
+      <div class="arc-explainer-actions">
+        <button type="button" disabled={arcExplainerLoading} onclick={() => loadArcExplainer(true)}>
+          {arcExplainerLoading ? 'Generating…' : 'Refresh explainer'}
+        </button>
+        <label class="subtitle-upload">
+          Load subtitles (.ass/.srt/.vtt)
+          <input type="file" accept=".ass,.srt,.vtt,text/plain" onchange={loadSubtitleFile} hidden />
+        </label>
+      </div>
+      {#if arcExplainerError}
+        <p class="arc-error" role="alert">{arcExplainerError}</p>
+      {:else if arcExplainerLoading && !arcExplainer}
+        <p class="hint">Translating arc overview &amp; subtitle beats…</p>
+      {:else if arcExplainer}
+        {#if arcExplainer.episodeTitle}
+          <p class="arc-ep-title"><strong>Episode:</strong> {arcExplainer.episodeTitle}</p>
+        {/if}
+        <p class="arc-overview">{arcExplainer.overview}</p>
+        {#if arcExplainer.recapSummary}
+          <div class="arc-section">
+            <strong>Recap:</strong>
+            <p>{arcExplainer.recapSummary}</p>
+          </div>
+        {/if}
+        {#if arcExplainer.storyBeats.length}
+          <div class="arc-section">
+            <strong>Episode story beats (from subtitles):</strong>
+            <ul class="arc-beats">
+              {#each arcExplainer.storyBeats as beat}
+                <li>{beat}</li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+      {/if}
+    </div>
+  </details>
 {:else}
   <section class="empty-player">
     <h2>Watch from your library</h2>
@@ -1108,9 +1556,11 @@
   <form method="dialog"><button>Done</button></form>
 </dialog>
 
-<div class="watch-tools">
-  <section id="library" class="library-tools" aria-labelledby="library-title">
-    <h2 id="library-title">Library</h2>
+<div class="watch-tools" class:single-pane={activeScreen === 'pipelines'} hidden={activeScreen === 'watch'}>
+  <section id="library" class="library-tools" aria-labelledby="library-title" hidden={activeScreen !== 'gallery'}>
+    <div class="library-header">
+      <h2 id="library-title">Gallery</h2>
+    </div>
 {#if directoryPicker}
   <div class="episode-bar library">
     <button disabled={folderBusy} onclick={() => chooseFolder()}>{folder ? 'Change download folder' : 'Connect download folder'}</button>
@@ -1131,22 +1581,75 @@
       <button onclick={() => selectEpisode(true)}>{savedPosition ? 'Resume episode' : 'Play saved episode'}</button>
     {/if}
   </div>
+  {#if folderGranted && episodeFolders.length > 1}
+    <div class="folder-cards" role="list" aria-label="Series folders">
+      {#each episodeFolders as entry (entry.key)}
+        {@const name = folderTitle(entry.name)}
+        {@const videoCount = entry.files.filter(f => isEpisodeVideo(f.name)).length}
+        <button
+          type="button"
+          class="folder-card"
+          aria-current={entry.key === selectedFolder ? 'true' : undefined}
+          title={entry.name}
+          onclick={() => { selectedFolder = entry.key; switchEpisodeFolder(); activeScreen = 'watch'; }}
+        >
+          <strong>{name.title || entry.name}</strong>
+          <small>{videoCount} {videoCount === 1 ? 'episode' : 'episodes'}{name.credit ? ` · ${name.credit}` : ''}</small>
+        </button>
+      {/each}
+    </div>
+  {/if}
   {#if folderStatus}<p role="status">{folderStatus}</p>
   {:else if !folder}<p>Choose Arc Anime or a series folder inside it.</p>{/if}
 {/if}
   {#if episodes.length}
     <button class="export-tv" onclick={exportTvPlaybackData} title="Save the selected series’ skip predictions and watch progress for Anime Study TV">Export TV playback data</button>
   {/if}
-  {#if folderGranted || episodes.length || scanQueue}
+  <details class="local-files" open={!directoryPicker}>
+    <summary>Open files manually</summary>
+    <div class="files">
+      <div><label for="series-folder">Open a downloaded series folder</label><input id="series-folder" type="file" webkitdirectory onchange={openFolder} /></div>
+      <div><label for="episode">Episode video</label><input id="episode" type="file" accept="video/*,.mp4,.webm,.m4v" onchange={openVideo} /></div>
+    </div>
+  </details>
+  </section>
+  <section id="pipelines" class="library-tools" aria-labelledby="pipelines-title" hidden={activeScreen !== 'pipelines'}>
+    <div class="library-header">
+      <h2 id="pipelines-title">Pipelines</h2>
+      <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+        <button type="button" onclick={toggleTvAutoplay} aria-pressed={!tvAutoplay}>
+          {tvAutoplay ? 'Stop TV autoplay' : 'TV autoplay stopped (Enable)'}
+        </button>
+        <span class="ws-pill" data-state={tvWsState}>
+          <span class="ws-dot" aria-hidden="true"></span>
+          TV WebSocket: {tvWsState}
+        </span>
+      </div>
+    </div>
+  {#if folderGranted || episodes.length || scanQueue || pendingSavedJobs.length}
   <div class="episode-bar scan-queue" aria-label="Frame checking queue">
-    <button disabled={rescanPreparing} onclick={toggleScanQueue}>{scanQueue ? (scanPaused ? 'Resume frame checking' : 'Pause frame checking') : 'Queue frame checking'}</button>
+    {#if pendingSavedJobs.length && !parallelJobs.length}
+      <button type="button" onclick={continueSavedScan}>
+        Continue scan ({pendingSavedJobs.length} {pendingSavedJobs.length === 1 ? 'job' : 'jobs'})
+      </button>
+    {/if}
+    {#if folderGranted || episodes.length || scanQueue}
+      <button disabled={rescanPreparing} onclick={toggleScanQueue}>{scanQueue ? (scanPaused ? 'Resume frame checking' : 'Pause frame checking') : 'Queue frame checking'}</button>
+    {/if}
+    {#if episodeFolders.length > 1}
+      <button disabled={rescanPreparing} onclick={queueAllFolders}>Queue all folders</button>
+    {/if}
     {#if episodes.length}
       <button disabled={rescanPreparing || (!!scanStatus?.active && !scanPaused)} onclick={rescanFrames}>{rescanPreparing ? 'Preparing rescan…' : 'Rescan frames'}</button>
     {/if}
     {#if episodeFolders.length > 1}
       <button disabled={rescanPreparing || (!!scanStatus?.active && !scanPaused)} onclick={rescanAllFrames}>Rescan all</button>
     {/if}
-    {#if needsDetectorReprocess}
+    {#if autoUpgrading && scanQueue}
+      <p class="hint" role="status">
+        Skip detector updated (v{THEME_DETECTOR_VERSION}): matching ending songs and updating OP/ED timings automatically.
+      </p>
+    {:else if needsDetectorReprocess}
       <p class="hint" role="status">
         Skip detector updated (v{THEME_DETECTOR_VERSION}). Reprocess this series for updated OP/ED timings?
         <button onclick={rescanFrames}>Reprocess series</button>
@@ -1166,16 +1669,200 @@
       </span>
     {/if}
   </div>
-{/if}
-<details class="local-files" open={!directoryPicker}>
-    <summary>Open files manually</summary>
-    <div class="files">
-      <div><label for="series-folder">Open a downloaded series folder</label><input id="series-folder" type="file" webkitdirectory onchange={openFolder} /></div>
-      <div><label for="episode">Episode video</label><input id="episode" type="file" accept="video/*,.mp4,.webm,.m4v" onchange={openVideo} /></div>
+  <div class="pipelines-dashboard" aria-label="Realtime pipelines">
+    <div class="pipeline-card">
+      <div class="pipeline-head">
+        <strong>{parallelJobs.length ? `Parallel Scan Jobs (${parallelJobs.length})` : 'Frame Scan Pipeline'}</strong>
+        {#if parallelJobs.length}
+          <button type="button" onclick={stopParallelJobs}>Stop all</button>
+        {:else}
+          <span>{scanQueue && scanStatus ? `${scanStatus.scanned} / ${scanStatus.total}` : 'Idle'}</span>
+        {/if}
+      </div>
+      {#if parallelJobs.length}
+        <ul class="jobs-list">
+          {#each parallelJobs as job (job.key)}
+            {@const jobEntry = episodeFolders.find(entry => entry.key === job.key || entry.name === job.seriesName)}
+            {@const jobVideos = jobEntry ? jobEntry.files.filter(f => isEpisodeVideo(f.name)).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })) : []}
+            {@const jobExpanded = !!expandedCoverage[`job:${job.key}`]}
+            <li class="job-row">
+              <button
+                type="button"
+                class="job-head job-toggle"
+                aria-expanded={jobExpanded}
+                onclick={() => { expandedCoverage = { ...expandedCoverage, [`job:${job.key}`]: !jobExpanded }; }}
+              >
+                <span class="coverage-caret">{jobExpanded ? '▾' : '▸'}</span>
+                <strong class="coverage-title">{job.title}</strong>
+                <span>{job.status ? `${job.status.scanned} / ${job.status.total}` : 'Starting…'}</span>
+              </button>
+              {#if job.status && job.status.total > 0}
+                <progress max={job.status.total} value={job.status.scanned}></progress>
+              {/if}
+              <div class="job-foot">
+                <small>{job.paused ? 'Paused' : job.status?.active ? `Checking ${job.status.active}` : job.status && job.status.scanned + job.status.failed === job.status.total ? 'Done · watching folder' : 'Queued…'}</small>
+                <div class="job-actions">
+                  <button type="button" onclick={() => {
+                    const nextPaused = !job.paused;
+                    job.queue.setPaused(nextPaused);
+                    parallelJobs = parallelJobs.map(j => j.key === job.key ? { ...j, paused: nextPaused } : j);
+                    rememberParallelJobs();
+                  }}>{job.paused ? 'Resume' : 'Pause'}</button>
+                  <button type="button" onclick={() => {
+                    job.queue.stop();
+                    parallelJobs = parallelJobs.filter(j => j.key !== job.key);
+                    rememberParallelJobs();
+                  }}>Stop</button>
+                </div>
+              </div>
+              {#if jobExpanded && jobEntry && jobVideos.length}
+                <ul class="coverage-episodes">
+                  {#each jobVideos as file (fileIdentity(file))}
+                    {@const epThemes = storedThemes(fileIdentity(file), false)}
+                    {@const epParts = [epThemes.recap ? 'Recap' : '', epThemes.op ? 'OP' : '', epThemes.ed ? 'ED' : ''].filter(Boolean)}
+                    {@const isChecking = job.status?.active === file.name}
+                    <li>
+                      <button
+                        type="button"
+                        class="coverage-ep-btn"
+                        disabled={rescanPreparing}
+                        onclick={() => scanSingleEpisode(jobEntry, file)}
+                        title={epParts.length ? 'Click to rescan this episode' : 'Click to scan this episode'}
+                      >
+                        <span class="coverage-ep-name">{episodeLabel(file.name)}</span>
+                        <span class="coverage-ep-state" data-state={isChecking ? 'checking' : epParts.length ? 'done' : 'pending'}>
+                          {isChecking ? 'Checking…' : epParts.length ? epParts.join(' · ') : 'Scan'}
+                        </span>
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {:else if scanQueue && scanStatus && scanStatus.total > 0}
+        <progress max={scanStatus.total} value={scanStatus.scanned}></progress>
+        <small>{scanStatus.active ? `Checking ${scanStatus.active}` : scanPaused ? 'Paused' : 'Watching folder for new episodes'}</small>
+      {:else}
+        <small>Start "Queue frame checking" or "Rescan all" to scan OP/ED timings.</small>
+      {/if}
     </div>
-  </details>
+    {#if folderGranted && episodeFolders.length}
+      <div class="pipeline-card">
+        <div class="pipeline-head">
+          <strong>Series Coverage</strong>
+          <span>{episodeFolders.length} {episodeFolders.length === 1 ? 'folder' : 'folders'}</span>
+        </div>
+        <ul class="coverage-list">
+          {#each episodeFolders as entry (entry.key)}
+            {@const videos = entry.files.filter(f => isEpisodeVideo(f.name)).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))}
+            {@const readyCount = videos.filter(f => { const t = storedThemes(fileIdentity(f), false); return !!(t.op || t.ed || t.recap); }).length}
+            {@const activeJob = parallelJobs.find(j => j.key === entry.key)}
+            {@const isExpanded = !!expandedCoverage[entry.key]}
+            <li class="coverage-item">
+              <div class="coverage-row">
+                <button
+                  type="button"
+                  class="coverage-toggle"
+                  aria-expanded={isExpanded}
+                  onclick={() => { expandedCoverage = { ...expandedCoverage, [entry.key]: !isExpanded }; }}
+                >
+                  <span class="coverage-caret">{isExpanded ? '▾' : '▸'}</span>
+                  <span class="coverage-title">{folderTitle(entry.name).title || entry.name}</span>
+                  <span class="coverage-count">{readyCount} / {videos.length}</span>
+                </button>
+                <span class="coverage-right">
+                  {#if activeJob}
+                    <button type="button" onclick={() => {
+                      const nextPaused = !activeJob.paused;
+                      activeJob.queue.setPaused(nextPaused);
+                      parallelJobs = parallelJobs.map(j => j.key === activeJob.key ? { ...j, paused: nextPaused } : j);
+                      rememberParallelJobs();
+                    }}>{activeJob.paused ? 'Resume' : 'Pause'}</button>
+                    <button type="button" onclick={() => {
+                      activeJob.queue.stop();
+                      parallelJobs = parallelJobs.filter(j => j.key !== activeJob.key);
+                      rememberParallelJobs();
+                    }}>Stop</button>
+                  {:else}
+                    {#if readyCount < videos.length}
+                      <button type="button" disabled={rescanPreparing} onclick={() => startSeriesJob(entry)}>Scan</button>
+                    {/if}
+                    <button type="button" disabled={rescanPreparing} onclick={() => rescanSeriesJob(entry)}>Rescan</button>
+                  {/if}
+                </span>
+              </div>
+              {#if isExpanded}
+                <ul class="coverage-episodes">
+                  {#each videos as file (fileIdentity(file))}
+                    {@const epThemes = storedThemes(fileIdentity(file), false)}
+                    {@const epParts = [epThemes.recap ? 'Recap' : '', epThemes.op ? 'OP' : '', epThemes.ed ? 'ED' : ''].filter(Boolean)}
+                    {@const isChecking = activeJob?.status?.active === file.name}
+                    <li>
+                      <button
+                        type="button"
+                        class="coverage-ep-btn"
+                        disabled={rescanPreparing}
+                        onclick={() => scanSingleEpisode(entry, file)}
+                        title={epParts.length ? 'Click to rescan this episode' : 'Click to scan this episode'}
+                      >
+                        <span class="coverage-ep-name">{episodeLabel(file.name)}</span>
+                        <span class="coverage-ep-state" data-state={isChecking ? 'checking' : epParts.length ? 'done' : 'pending'}>
+                          {isChecking ? 'Checking…' : epParts.length ? epParts.join(' · ') : 'Scan'}
+                        </span>
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+    <div class="pipeline-card">
+      <div class="pipeline-head">
+        <strong>Live Event Feed</strong>
+        <span>{pipelineEvents.length} events</span>
+      </div>
+      {#if pipelineEvents.length}
+        <ul class="event-feed">
+          {#each pipelineEvents as item (item.id)}
+            <li><span class="event-time">{item.time}</span> <span class="event-kind">{item.kind}</span> {item.detail}</li>
+          {/each}
+        </ul>
+      {:else}
+        <small>Waiting for WebSocket or scan events…</small>
+      {/if}
+    </div>
+  </div>
+{/if}
   </section>
-  <section id="downloads" aria-label="Downloads">
+  <section id="settings" class="library-tools settings-tools" aria-labelledby="settings-title" hidden={activeScreen !== 'gallery'}>
+    <h2 id="settings-title">Settings</h2>
+    <label class="setting-check">
+      <input type="checkbox" checked={autoSkip.op && autoSkip.ed && autoSkip.recap} onchange={event => updateAutoSkip(event.currentTarget.checked)} />
+      <span>Auto-skip openings, endings and recaps</span>
+    </label>
+    <label class="setting-check">
+      <input type="checkbox" checked={showSubtitles} onchange={event => updateShowSubtitles(event.currentTarget.checked)} />
+      <span>Show subtitles</span>
+    </label>
+    <div class="episode-bar">
+      <label class="setting-select" for="offline-ending-action">Ending skip</label>
+      <select id="offline-ending-action" value={endingAction} onchange={event => updateEndingAction(event.currentTarget.value as EndingAction)}>
+        <option value="auto">Auto (next episode or post-credits)</option>
+        <option value="next">Next episode</option>
+        <option value="skip">Skip ending only</option>
+      </select>
+    </div>
+    <div class="episode-bar">
+      <button onclick={exportPredictions}>Export saved skip predictions</button>
+    </div>
+    {#if exportStatus}<p role="status">{exportStatus}</p>{/if}
+  </section>
+  <section id="downloads" aria-label="Downloads" hidden={activeScreen !== 'gallery'}>
     <SeriesDownloads bind:expanded={downloadsOpen} />
   </section>
 </div>
@@ -1487,6 +2174,8 @@
   .library-tools { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 15px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
   .library-tools p, .scan-queue span, .local-files { color: var(--muted); font-size: 13px; }
   .library-tools label { display: block; margin-bottom: 5px; }
+  .settings-tools .setting-check { display: flex; align-items: center; gap: 8px; margin-bottom: 0; font-size: 14px; cursor: pointer; }
+  .settings-tools .setting-select { margin-bottom: 0; font-size: 13px; color: var(--muted); }
   .export-tv {
     justify-self: start;
     font: inherit;
@@ -1539,4 +2228,184 @@
     .big-play { width: 64px; height: 64px; margin: -32px 0 0 -32px; font-size: 24px; }
     .episode-controls { margin-inline-start: 0; }
   }
+  .folder-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 8px;
+    margin: 10px 0 4px;
+  }
+  .folder-card {
+    text-align: left;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.04);
+    color: inherit;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .folder-card strong { font-size: 13px; line-height: 1.3; }
+  .folder-card small { font-size: 11.5px; opacity: 0.72; }
+  .folder-card[aria-current='true'] {
+    border-color: #ff6a2b;
+    background: rgba(255, 106, 43, 0.14);
+  }
+  .nav-tab {
+    background: transparent;
+    border: 1px solid transparent;
+    color: inherit;
+    padding: 5px 12px;
+    border-radius: 999px;
+    cursor: pointer;
+    font: inherit;
+    opacity: 0.78;
+  }
+  .nav-tab[aria-current='page'] {
+    opacity: 1;
+    border-color: #ff6a2b;
+    background: rgba(255, 106, 43, 0.16);
+  }
+  .library-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .ws-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .ws-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #888;
+  }
+  .ws-pill[data-state='connected'] .ws-dot { background: #34d399; }
+  .ws-pill[data-state='connecting'] .ws-dot { background: #fbbf24; }
+  .ws-pill[data-state='disconnected'] .ws-dot { background: #f87171; }
+  .pipelines-dashboard {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+  }
+  .pipeline-card {
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.03);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .pipeline-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+  }
+  .pipeline-card progress { width: 100%; height: 6px; accent-color: #ff6a2b; }
+  .pipeline-card small { font-size: 12px; opacity: 0.75; }
+  .coverage-list, .event-feed {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    font-size: 12px;
+  }
+  .coverage-item {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .coverage-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  .coverage-toggle, .job-toggle {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 0;
+    padding: 2px 0;
+    text-align: left;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+  .job-toggle { width: 100%; }
+  .coverage-caret { opacity: 0.65; font-size: 11px; flex-shrink: 0; }
+  .coverage-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .coverage-count { opacity: 0.75; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .coverage-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .coverage-right button { padding: 2px 8px; font-size: 11px; }
+  .coverage-episodes {
+    list-style: none;
+    margin: 0 0 4px 14px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .coverage-ep-btn {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    text-align: left;
+  }
+  .coverage-ep-btn:hover { background: rgba(255, 255, 255, 0.07); }
+  .coverage-ep-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .coverage-ep-state { opacity: 0.75; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  .coverage-ep-state[data-state='checking'] { color: #ff8a5b; opacity: 1; font-weight: 600; }
+  .coverage-ep-state[data-state='done'] { color: #34d399; opacity: 1; }
+  .event-feed { max-height: 150px; overflow-y: auto; }
+  .event-time { opacity: 0.55; font-variant-numeric: tabular-nums; }
+  .event-kind { color: #ff8a5b; font-weight: 600; }
+  .jobs-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  .job-row { padding: 8px 10px; border-radius: 8px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); display: flex; flex-direction: column; gap: 6px; }
+  .job-head, .job-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12px; }
+  .job-actions { display: flex; gap: 6px; }
+  .job-actions button { padding: 2px 8px; font-size: 11px; }
+  [hidden] { display: none !important; }
+  .watch-tools.single-pane { grid-template-columns: minmax(0, 1fr); }
+  .arc-explainer { display: block; }
+  .arc-explainer summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .arc-explainer-meta { font-size: 12px; opacity: 0.72; }
+  .arc-explainer-body { display: flex; flex-direction: column; gap: 10px; padding-top: 10px; font-size: 13px; line-height: 1.5; }
+  .arc-explainer-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .subtitle-upload {
+    display: inline-flex; align-items: center; padding: 6px 12px; border-radius: 9px;
+    background: var(--surface-raised, rgba(255,255,255,0.08)); border: 1px solid rgba(255,255,255,0.14);
+    cursor: pointer; font-size: 12px; font-weight: 600;
+  }
+  .arc-ep-title, .arc-overview, .arc-section p { margin: 0; }
+  .arc-overview { opacity: 0.92; }
+  .arc-beats { margin: 4px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; opacity: 0.9; }
+  .arc-error { color: #f87171; margin: 0; }
 </style>

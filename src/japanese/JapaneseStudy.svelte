@@ -8,7 +8,9 @@
   import { AutoSubtitles, type PageCaptions } from './auto-subtitles';
   import { PhraseStops, placeStudyVideo, readSkipChapters } from './study-player';
   import { overlapsRecap, type VideoThemes } from './video-themes';
-  let { loadEpisodeCaptions, inline = false, overlayHidden = false, localCues = [], localBody = '', localSource = '', referenceCues = [], videoThemes = {}, title = '', learning = $bindable(false), studying = $bindable(false), playerActions, playerOptions, onResumeAtEnd, onToggleFullscreen, onNextEpisode }: {
+  type SkipPart = keyof VideoThemes;
+  type EndingAction = 'auto' | 'next' | 'skip';
+  let { loadEpisodeCaptions, inline = false, overlayHidden = false, localCues = [], localBody = '', localSource = '', referenceCues = [], videoThemes = {}, title = '', learning = $bindable(false), studying = $bindable(false), autoSkip = $bindable<Record<SkipPart, boolean>>({ recap: true, op: true, ed: true }), endingAction = $bindable<EndingAction>('auto'), showSubtitles = $bindable(true), playerActions, playerOptions, onResumeAtEnd, onToggleFullscreen, onNextEpisode }: {
     loadEpisodeCaptions?: () => Promise<PageCaptions | null>;
     inline?: boolean;
     overlayHidden?: boolean;
@@ -20,6 +22,9 @@
     title?: string;
     learning?: boolean;
     studying?: boolean;
+    autoSkip?: Record<SkipPart, boolean>;
+    endingAction?: EndingAction;
+    showSubtitles?: boolean;
     playerActions?: Snippet;
     playerOptions?: Snippet;
     onResumeAtEnd?: () => void;
@@ -45,18 +50,16 @@
   let busy = $state(false);
   let status = $state('');
   let skipUndo = $state<{ time: number; expiresAt: number } | null>(null);
-  type SkipPart = keyof VideoThemes;
-  type EndingAction = 'auto' | 'next' | 'skip';
   const skipLabels = { recap: 'Skip recap', op: 'Skip opening', ed: 'Skip ending' };
   const skipParts = ['recap', 'op', 'ed'] as const;
   const skipSettings = { recap: 'Auto-skip recap', op: 'Auto-skip opening', ed: 'Auto-skip ending' };
   const autoSkipKey = 'arc-offline-auto-skip';
   const endingActionKey = 'arc-offline-ending-action';
+  const subtitlesKey = 'arc-offline-subtitles';
   const siteAutoSkipKey = 'animeAutoSkip';
   const siteEndingActionKey = 'animeEndingAction';
+  const siteSubtitlesKey = 'animeSubtitles';
   const replaceSitePlayerKey = 'animeReplaceSitePlayer';
-  let autoSkip = $state<Record<SkipPart, boolean>>({ recap: true, op: true, ed: true });
-  let endingAction = $state<EndingAction>('auto');
   // On the anime site, open the Arc player in place of the site's player unless the user turned it off.
   let replaceSitePlayer = $state(true);
   let sitePreferencesLoaded = false;
@@ -411,15 +414,17 @@
         }
         const savedAction = localStorage.getItem(endingActionKey);
         if (savedAction === 'auto' || savedAction === 'next' || savedAction === 'skip') endingAction = savedAction;
+        showSubtitles = localStorage.getItem(subtitlesKey) !== 'off';
       } catch { /* Use the default. */ }
     } else if (loadEpisodeCaptions) {
-      void siteStorage()?.get([siteAutoSkipKey, ...skipParts.map(part => `${siteAutoSkipKey}-${part}`), siteEndingActionKey, replaceSitePlayerKey]).then(saved => {
+      void siteStorage()?.get([siteAutoSkipKey, ...skipParts.map(part => `${siteAutoSkipKey}-${part}`), siteEndingActionKey, siteSubtitlesKey, replaceSitePlayerKey]).then(saved => {
         for (const part of skipParts) {
           const preference = saved[`${siteAutoSkipKey}-${part}`];
           autoSkip[part] = typeof preference === 'boolean' ? preference : (part === 'recap' || saved[siteAutoSkipKey] !== false);
         }
         const savedAction = saved[siteEndingActionKey];
         if (savedAction === 'auto' || savedAction === 'next' || savedAction === 'skip') endingAction = savedAction;
+        showSubtitles = saved[siteSubtitlesKey] !== false;
         replaceSitePlayer = saved[replaceSitePlayerKey] !== false;
       }).catch(() => {}).finally(() => { sitePreferencesLoaded = true; });
       if (!siteStorage()) sitePreferencesLoaded = true;
@@ -498,6 +503,15 @@
       return;
     }
     try { localStorage.setItem(`${autoSkipKey}-${part}`, enabled ? 'on' : 'off'); } catch { /* Keep the current preference. */ }
+  }
+
+  function setShowSubtitles(enabled: boolean) {
+    showSubtitles = enabled;
+    if (!inline) {
+      void siteStorage()?.set({ [siteSubtitlesKey]: enabled }).catch(() => {});
+      return;
+    }
+    try { localStorage.setItem(subtitlesKey, enabled ? 'on' : 'off'); } catch { /* Keep the current preference. */ }
   }
 
   function setReplaceSitePlayer(enabled: boolean) {
@@ -823,13 +837,13 @@
       </div>
     {/if}
     <section aria-label="Japanese learning" class="panel" hidden={overlayHidden || siteOverlayHidden}>
-      {#if !challenge && mode !== 'review' && !captured && ((studyPlayer && !combined) || detected || (mode === 'learn' && !sourceCues.length))}
+      {#if !challenge && mode !== 'review' && !captured && ((studyPlayer && !combined) || (showSubtitles && detected) || (mode === 'learn' && !sourceCues.length))}
         <div class="caption-row">
           {#if studyPlayer && !combined}
             <span class="notice">{playbackRequestedAt && now - playbackRequestedAt >= 5000
               ? 'The site hasn’t supplied video yet. Try its Play button.'
               : 'Start the video to switch to the Arc player.'}</span>
-          {:else if detected}
+          {:else if showSubtitles && detected}
             <button class="caption" lang="ja" title="Study this subtitle" onclick={() => detected && inspectPhrase(detected)}>{detected.text}</button>
           {:else if !sourceCues.length}
             <span class="notice">{video ? subtitleStatus : 'Start the video to connect'}</span>
@@ -882,6 +896,7 @@
               <option value="skip">Skip ending only</option>
             </select></label>
           {/if}
+          <label><input type="checkbox" checked={showSubtitles} onchange={event => setShowSubtitles(event.currentTarget.checked)} /> Show subtitles</label>
           {#if loadEpisodeCaptions}<label><input type="checkbox" checked={replaceSitePlayer} onchange={event => setReplaceSitePlayer(event.currentTarget.checked)} /> Always use the Arc player on this site</label>{/if}
           {#if video}<button onclick={() => { if (video) { video.muted = !video.muted; tick(); } }}>{playbackMuted ? 'Unmute' : 'Mute'}</button>{/if}
           {#if showPlayback && document.pictureInPictureEnabled}<button disabled={!playbackReady} onclick={pictureInPicture}>Picture in picture</button>{/if}

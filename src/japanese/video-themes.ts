@@ -1,8 +1,22 @@
-export const THEME_DETECTOR_VERSION = 3;
+import { audioPrintFromFile, matchAudioPrints, matchKnownAudio, type AudioPrint } from './audio-print';
+import { findAudioSwitch, parseMp4AudioTrack, readMp4AudioWindow } from './mp4-audio';
 
-export type VideoThemes = Partial<Record<'op' | 'ed' | 'recap', { start: number; end: number }>>;
+export const THEME_DETECTOR_VERSION = 4;
+
+export type VideoThemes = Partial<Record<'op' | 'ed' | 'recap', { start: number; end: number; source?: string }>>;
 type Sample = { time: number; pixels: Uint8ClampedArray };
-type Fingerprint = { op: Sample[]; ed: Sample[]; openingScanEnd?: number };
+// `edAudio` is null when the soundtrack could not be decoded, and missing in fingerprints saved before v4.
+type Fingerprint = { op: Sample[]; ed: Sample[]; openingScanEnd?: number; edAudio?: AudioPrint | null };
+
+async function endingAudio(file: File, ed: Sample[], signal: AbortSignal) {
+  if (!ed.length) return null;
+  try {
+    return await audioPrintFromFile(file, ed[0].time, ed.at(-1)!.time + 0.5, signal);
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return null;
+  }
+}
 
 const interval = 2;
 const earlyOpeningEnd = 360;
@@ -28,7 +42,11 @@ function waitForFrame(video: HTMLVideoElement, event: 'loadeddata' | 'seeked', s
 }
 
 export async function fingerprintVideo(file: File, signal: AbortSignal, previous?: Fingerprint): Promise<Fingerprint> {
-  if (previous?.openingScanEnd !== undefined) return previous;
+  if (previous?.openingScanEnd !== undefined) {
+    // Fingerprints saved before audio matching only need the soundtrack added.
+    if (previous.edAudio !== undefined) return previous;
+    return { ...previous, edAudio: await endingAudio(file, previous.ed, signal) };
+  }
   const video = document.createElement('video');
   video.preload = 'auto';
   video.muted = true;
@@ -54,15 +72,13 @@ export async function fingerprintVideo(file: File, signal: AbortSignal, previous
   try {
     await waitForFrame(video, 'loadeddata', signal, () => { video.src = url; });
     const duration = video.duration;
-    if (!Number.isFinite(duration) || duration < 180) return { op: [], ed: [], openingScanEnd: 0 };
+    if (!Number.isFinite(duration) || duration < 180) return { op: [], ed: [], openingScanEnd: 0, edAudio: null };
     const endingStart = Math.max(duration - 240, duration / 2);
     const openingScanEnd = Math.min(maximumOpeningEnd, endingStart);
     const firstNewSample = (previous?.op.at(-1)?.time ?? -0.5) + 1;
-    return {
-      op: [...(previous?.op ?? []), ...await sampleWindow(firstNewSample, openingScanEnd, context)],
-      ed: previous?.ed ?? await sampleWindow(endingStart, duration - 0.5, context),
-      openingScanEnd
-    };
+    const op = [...(previous?.op ?? []), ...await sampleWindow(firstNewSample, openingScanEnd, context)];
+    const ed = previous?.ed ?? await sampleWindow(endingStart, duration - 0.5, context);
+    return { op, ed, openingScanEnd, edAudio: await endingAudio(file, ed, signal) };
   } finally {
     video.removeAttribute('src');
     video.load();
@@ -189,27 +205,34 @@ export function matchEarlySparseOpening(current: Fingerprint, reference: Fingerp
   return best && best.start < earlyOpeningEnd ? refineWindow(early, reference.op, best) : undefined;
 }
 
-export function matchKnownOpening(current: Fingerprint, reference: Fingerprint, opening: NonNullable<VideoThemes['op']>, recap?: VideoThemes['recap']): VideoThemes['op'] {
-  const length = opening.end - opening.start;
-  if (length < 70 || length > 110) return undefined;
-  const first = reference.op.findIndex(sample => sample.time >= opening.start);
-  if (first < 0 || reference.op.at(-1)!.time < opening.end - 1) return undefined;
-  const samples = reference.op.slice(first).filter((sample, index) => sample.time < opening.end && index % interval === 0);
-  const phase = reference.op[first].time - opening.start;
+function matchKnownTheme(
+  currentSamples: Sample[],
+  referenceSamples: Sample[],
+  known: NonNullable<VideoThemes['op']>,
+  minLength: number,
+  maxLength: number,
+  recap?: VideoThemes['recap']
+): VideoThemes['op'] {
+  const length = known.end - known.start;
+  if (length < minLength || length > maxLength) return undefined;
+  const first = referenceSamples.findIndex(sample => sample.time >= known.start);
+  if (first < 0 || !referenceSamples.length || referenceSamples.at(-1)!.time < known.end - 1) return undefined;
+  const samples = referenceSamples.slice(first).filter((sample, index) => sample.time < known.end && index % interval === 0);
+  const phase = referenceSamples[first].time - known.start;
   let best: { range: NonNullable<VideoThemes['op']>; hits: number; mean: number } | undefined;
-  for (const [index, sample] of current.op.entries()) {
+  for (const [index, sample] of currentSamples.entries()) {
     const start = Math.max(0, sample.time - phase);
     const range = { start, end: start + length };
-    if (range.end > current.op.at(-1)!.time + 0.5) break;
+    if (range.end > currentSamples.at(-1)!.time + 0.5) break;
     if (overlapsRecap(range, recap)) continue;
     let hits = 0, total = 0, changes = 0, firstHit = Infinity, lastHit = -Infinity;
     for (const [offset, ref] of samples.entries()) {
-      const frame = current.op[index + offset * interval];
+      const frame = currentSamples[index + offset * interval];
       if (!frame) break;
-      const difference = alignedDistance(frame, reference.op, first + offset * interval);
+      const difference = alignedDistance(frame, referenceSamples, first + offset * interval);
       if (difference > 30) continue;
-      const time = ref.time - opening.start;
-      if (hits) changes += Number(distance(frame, current.op[index + lastHit * interval]) > 14);
+      const time = ref.time - known.start;
+      if (hits) changes += Number(distance(frame, currentSamples[index + lastHit * interval]) > 14);
       firstHit = Math.min(firstHit, time);
       lastHit = offset;
       hits++;
@@ -223,13 +246,81 @@ export function matchKnownOpening(current: Fingerprint, reference: Fingerprint, 
   return best?.range;
 }
 
+export function matchKnownOpening(current: Fingerprint, reference: Fingerprint, opening: NonNullable<VideoThemes['op']>, recap?: VideoThemes['recap']): VideoThemes['op'] {
+  return matchKnownTheme(current.op, reference.op, opening, 70, 110, recap);
+}
+
+export function matchKnownEnding(current: Fingerprint, reference: Fingerprint, ending: NonNullable<VideoThemes['ed']>): VideoThemes['ed'] {
+  return matchKnownTheme(current.ed, reference.ed, ending, 60, 110)
+    ?? (current.edAudio && reference.edAudio ? matchKnownAudio(current.edAudio, reference.edAudio, ending) : undefined);
+}
+
+/**
+ * Combine the picture and soundtrack matches for an ending. The song can start under the episode's
+ * last scene, where only the picture repeats, and credits can run over new footage, where only the
+ * song repeats, so overlapping matches are joined.
+ */
+export function mergeEndings(picture: VideoThemes['ed'], song: VideoThemes['ed']): VideoThemes['ed'] {
+  if (!picture || !song) return song ?? picture;
+  if (picture.start >= song.end || song.start >= picture.end) return song;
+  const joined = { start: Math.min(picture.start, song.start), end: Math.max(picture.end, song.end) };
+  return joined.end - joined.start <= 130 ? joined : picture;
+}
+
+/**
+ * Match the ending song between two episodes. This works when the credits run over episode-specific
+ * footage, where the picture comparison finds nothing. Returns the range in each episode.
+ */
+export function matchAudioEndings(current: Fingerprint, reference: Fingerprint): [VideoThemes['ed'], VideoThemes['ed']] {
+  const match = current.edAudio && reference.edAudio ? matchAudioPrints(current.edAudio, reference.edAudio) : undefined;
+  return [match?.current, match?.reference];
+}
+
 export function confirmLateOpening(candidate: NonNullable<VideoThemes['op']>, others: NonNullable<VideoThemes['op']>[]): VideoThemes['op'] {
-  const agreement = others.find(other => Math.abs(candidate.start - other.start) <= 4 && Math.abs(candidate.end - other.end) <= 4);
+  const agreement = others.find(other => {
+    const startClose = Math.abs(candidate.start - other.start) <= 4;
+    const endClose = Math.abs(candidate.end - other.end) <= 4;
+    if (startClose && endClose) return true;
+    const overlap = Math.min(candidate.end, other.end) - Math.max(candidate.start, other.start);
+    return overlap >= 60 && (startClose || endClose);
+  });
   if (!agreement) return undefined;
   return { start: Math.min(candidate.start, agreement.start), end: Math.max(candidate.end, agreement.end) };
 }
 
-/** Find the strongest picture cut near an estimated theme edge, so skips land on the exact frame. */
+export async function binarySearchFrameCut(
+  frameAt: (time: number) => Promise<Sample>,
+  low: number,
+  high: number
+): Promise<{ time: number; change: number }> {
+  let lo = Number(low.toFixed(2));
+  let hi = Number(high.toFixed(2));
+  if (hi - lo <= 0.08) {
+    const [a, b] = await Promise.all([frameAt(lo), frameAt(hi)]);
+    return { time: Number(((lo + hi) / 2).toFixed(2)), change: distance(a, b) };
+  }
+  let left = await frameAt(lo);
+  let right = await frameAt(hi);
+  let bestChange = distance(left, right);
+  while (hi - lo > 0.08) {
+    const midTime = Number(((lo + hi) / 2).toFixed(2));
+    if (midTime <= lo || midTime >= hi) break;
+    const mid = await frameAt(midTime);
+    const dLeft = distance(left, mid);
+    const dRight = distance(mid, right);
+    bestChange = Math.max(bestChange, dLeft, dRight);
+    if (dLeft >= dRight) {
+      hi = midTime;
+      right = mid;
+    } else {
+      lo = midTime;
+      left = mid;
+    }
+  }
+  return { time: Number(((lo + hi) / 2).toFixed(2)), change: Math.max(bestChange, distance(left, right)) };
+}
+
+/** Find the strongest picture cut or audio switch near an estimated theme edge using binary search. */
 export async function refineThemeEdges(file: File, themes: VideoThemes, signal: AbortSignal): Promise<VideoThemes> {
   const parts = (['op', 'ed', 'recap'] as const).filter(part => themes[part]);
   if (!parts.length) return themes;
@@ -242,6 +333,7 @@ export async function refineThemeEdges(file: File, themes: VideoThemes, signal: 
   const context = canvas.getContext('2d', { willReadFrequently: true });
   if (!context) return themes;
   const url = URL.createObjectURL(file);
+  const audioTrackPromise = parseMp4AudioTrack(file).catch(() => null);
 
   async function frameAt(time: number): Promise<Sample> {
     await waitForFrame(video, 'seeked', signal, () => { video.currentTime = time; });
@@ -251,18 +343,25 @@ export async function refineThemeEdges(file: File, themes: VideoThemes, signal: 
   }
 
   async function sharpen(estimate: number, radius: number) {
-    const step = 0.1;
-    const frames: Sample[] = [];
-    for (let time = Math.max(0.01, estimate - radius); time <= Math.min(video.duration - 0.05, estimate + radius) + 1e-6; time += step) {
-      frames.push(await frameAt(Number(time.toFixed(2))));
+    const lo = Math.max(0.01, estimate - radius);
+    const hi = Math.min(video.duration - 0.05, estimate + radius);
+    if (hi - lo <= 0.1) return estimate;
+    const audioTrack = await audioTrackPromise;
+    const [cut, audioSamples] = await Promise.all([
+      binarySearchFrameCut(frameAt, lo, hi),
+      audioTrack ? readMp4AudioWindow(file, lo, hi, signal, audioTrack).catch(() => null) : Promise.resolve(null),
+    ]);
+    const audioSwitch = audioSamples ? findAudioSwitch(audioSamples, estimate, radius) : null;
+    if (cut.change >= 12) {
+      if (audioSwitch && Math.abs(audioSwitch.time - cut.time) <= 0.25) {
+        return Number(((cut.time + audioSwitch.time) / 2).toFixed(2));
+      }
+      return cut.time;
     }
-    if (frames.length < 3) return estimate;
-    const changes = frames.slice(1).map((frame, index) => ({ time: frame.time, change: distance(frames[index], frame) }));
-    const sorted = changes.map(item => item.change).sort((a, b) => a - b);
-    const median = sorted[Math.floor(sorted.length / 2)];
-    const cut = changes.reduce((best, item) => item.change > best.change ? item : best);
-    // Fades have no single cut; keep the sampled estimate for them.
-    return cut.change >= 12 && cut.change >= median * 3 ? cut.time : estimate;
+    if (audioSwitch && audioSwitch.strength >= 0.45) {
+      return Number(audioSwitch.time.toFixed(2));
+    }
+    return estimate;
   }
 
   try {

@@ -40,6 +40,16 @@ export interface EpisodePair {
   label: string
 }
 
+export interface FrameWindow {
+  times: number[]
+  dataBase64: string
+}
+
+export interface VideoFingerprint {
+  op: FrameWindow
+  ed: FrameWindow
+}
+
 /** Shared Anime Study logic, implemented once in C++ for iOS and Android. */
 export interface AnimeCore extends HybridObject<{ ios: 'c++'; android: 'c++' }> {
   parseSubtitles(body: string): Cue[]
@@ -50,4 +60,5 @@ export interface AnimeCore extends HybridObject<{ ios: 'c++'; android: 'c++' }> 
   episodeLabel(fileName: string): string
   pairEpisodes(paths: string[]): EpisodePair[]
   cueIndexAt(cues: Cue[], time: number): number
+  matchVideoThemes(current: VideoFingerprint, reference: VideoFingerprint): SkipRanges
 }

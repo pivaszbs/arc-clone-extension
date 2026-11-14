@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { build } from 'esbuild';
 
 const compiled = await build({ entryPoints: ['src/background/series-downloads.ts'], bundle: true, write: false, format: 'iife', globalName: 'series' });
+const plannerCompiled = await build({ entryPoints: ['src/japanese/series.ts'], bundle: true, write: false, format: 'iife', globalName: 'planner' });
 
 test('downloads one file at a time and resumes without repeating completed files', async () => {
   const store = {};
@@ -98,4 +99,107 @@ test('downloads one file at a time and resumes without repeating completed files
   assert.equal(updated.files.length, 1);
   assert.match(downloads.at(-1).filename, /Episode 003 - 3002\.mp4$/);
   assert.equal(downloads[1].state, 'complete');
+});
+
+test('plans combined fallback dubbing when primary team is missing episodes', async () => {
+  const host = 'https://smotret-anime.com';
+  const seriesPath = '/catalog/fixture-1234';
+  const ep1 = `${seriesPath}/1-seriya-2000`;
+  const ep2 = `${seriesPath}/2-seriya-2001`;
+  const pages = new Map([
+    [`${host}${seriesPath}`, `
+      <h1>Fixture Anime</h1>
+      <a href="${ep1}">1 серия</a>
+      <a href="${ep2}">2 серия</a>
+    `],
+    [`${host}${ep1}/ozvuchka-3000`, `
+      <a class="truncate" href="${ep1}/ozvuchka-3000">StudioBand Amediateka</a>
+      <a href="${ep1}/ozvuchka-3001">AniLiberty</a>
+      <a href="/translations/mp4/3000?height=1080">1080p</a>
+    `],
+    [`${host}${ep2}/ozvuchka`, `
+      <a class="truncate" href="${ep2}/ozvuchka-4001">AniLiberty</a>
+      <a href="${ep2}/ozvuchka-4002">AniDUB</a>
+      <a href="/translations/mp4/4001?height=1080">1080p</a>
+    `],
+    [`${host}${ep2}/ozvuchka-4001`, `
+      <a class="truncate" href="${ep2}/ozvuchka-4001">AniLiberty</a>
+      <a href="${ep2}/ozvuchka-4002">AniDUB</a>
+      <a href="/translations/mp4/4001?height=1080">1080p</a>
+    `],
+    [`${host}${ep2}/ozvuchka-4002`, `
+      <a href="${ep2}/ozvuchka-4001">AniLiberty</a>
+      <a class="truncate" href="${ep2}/ozvuchka-4002">AniDUB</a>
+      <a href="/translations/mp4/4002?height=720">720p</a>
+    `]
+  ]);
+  const redirects = new Map([
+    [`${host}${ep2}/ozvuchka`, `${host}${ep2}/ozvuchka-4001`]
+  ]);
+  const world = {
+    URL,
+    AbortSignal,
+    fetch: async url => {
+      const href = String(url);
+      const finalUrl = redirects.get(href) || href;
+      const html = pages.get(href);
+      return {
+        ok: !!html,
+        url: finalUrl,
+        headers: { get: () => null },
+        text: async () => html || ''
+      };
+    }
+  };
+  vm.runInNewContext(plannerCompiled.outputFiles[0].text, world);
+  const { planSeries, resolveSeriesTeam, resolveEpisodeVariant, AUTO_FALLBACK } = world.planner;
+
+  const plan = await planSeries(`${host}${ep1}/ozvuchka-3000`, () => {});
+  assert.equal(plan.primaryTeam, 'StudioBand Amediateka');
+  assert.equal(plan.episodes[0].team, 'StudioBand Amediateka');
+  assert.equal(plan.episodes[0].video.url, `${host}/translations/mp4/3000?height=1080`);
+  assert.equal(plan.episodes[1].video, undefined);
+  assert.deepEqual(Array.from(plan.episodes[1].variants, v => v.team), ['AniLiberty', 'AniDUB']);
+
+  const combined = await resolveSeriesTeam(structuredClone(plan), 'AniLiberty');
+  assert.equal(combined.episodes[0].team, 'StudioBand Amediateka');
+  assert.equal(combined.episodes[1].team, 'AniLiberty');
+  assert.equal(combined.episodes[1].video.url, `${host}/translations/mp4/4001?height=1080`);
+
+  const autoFilled = await resolveSeriesTeam(structuredClone(plan), AUTO_FALLBACK);
+  assert.equal(autoFilled.episodes[1].team, 'AniLiberty');
+
+  const perEp = await resolveEpisodeVariant(structuredClone(combined), combined.episodes[1].page, 'AniDUB');
+  assert.equal(perEp.episodes[1].team, 'AniDUB');
+  assert.equal(perEp.episodes[1].video.url, `${host}/translations/mp4/4002?height=720`);
+
+  const cleared = await resolveSeriesTeam(structuredClone(combined), undefined);
+  assert.equal(cleared.episodes[0].team, 'StudioBand Amediateka');
+  assert.equal(cleared.episodes[1].video, undefined);
+
+  const store = {};
+  const downloads = [];
+  const runtime = { id: 'fixture', getURL: path => `chrome-extension://fixture/${path}`, onStartup: { addListener: () => {} } };
+  const bgWorld = {
+    URL,
+    chrome: {
+      runtime,
+      storage: { local: { get: async key => ({ [key]: structuredClone(store[key]) }), set: async values => Object.assign(store, structuredClone(values)) } },
+      alarms: { onAlarm: { addListener: () => {} }, create: async () => {}, clear: async () => {} },
+      downloads: {
+        onChanged: { addListener: () => {}, hasListener: () => true },
+        search: async () => [],
+        cancel: async () => {},
+        download: async options => { downloads.push(options); return downloads.length; }
+      }
+    }
+  };
+  vm.runInNewContext(compiled.outputFiles[0].text, bgWorld);
+  const { queue } = await bgWorld.series.seriesDownloadRequest(
+    { type: 'SERIES_DOWNLOAD_START', plan: combined, selectedPages: combined.episodes.map(e => e.page) },
+    { url: runtime.getURL('offline.html') }
+  );
+  assert.equal(queue.files.length, 2);
+  assert.match(queue.files[0].filename, /Episode 001 - 3000\.mp4$/);
+  assert.match(queue.files[1].filename, /Episode 002 - 4001\.mp4$/);
 });

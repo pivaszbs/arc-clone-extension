@@ -110,6 +110,55 @@ Dialogue: 0,0:22:46.00,0:23:30.00,Default,♬)";
     std::vector<Cue> cues = {{1, 3, "a"}, {5, 8, "b"}};
     CHECK(cueIndexAt(cues, 2) == 0 && cueIndexAt(cues, 4) == -1 && cueIndexAt(cues, 7.9) == 1);
   }
+  {
+    // Match repeated lyrics despite Cyrillic case and full-width ASCII differences.
+    std::vector<Cue> episode, reference;
+    for (int i = 0; i < 6; i++) {
+      episode.push_back({45.0 + i * 15, 49.0 + i * 15, "ПЕСНЯ ЁЖИКА ＡＢＣ " + std::to_string(i)});
+      reference.push_back({90.0 + i * 15, 94.0 + i * 15, "песня ёжика abc " + std::to_string(i)});
+    }
+    CHECK(segment(detectOpEd("", episode, 1440, {reference}).op, 45, 124, "repeated-subtitles"));
+    CHECK(parseSubtitles(R"({"events":[]})").empty());
+    CHECK(parseSubtitles("<text start=\"1\" dur=\"2\">日本語</text>").empty());
+  }
+  {
+    // Match 12x8 RGB24 frame sequences with an offset OP (90s) and ED (75s).
+    auto encodeB64 = [](const std::vector<uint8_t>& bytes) {
+      static const char kTab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      std::string out;
+      for (size_t i = 0; i < bytes.size(); i += 3) {
+        uint32_t b = static_cast<uint32_t>(bytes[i]) << 16;
+        if (i + 1 < bytes.size()) b |= static_cast<uint32_t>(bytes[i + 1]) << 8;
+        if (i + 2 < bytes.size()) b |= static_cast<uint32_t>(bytes[i + 2]);
+        out.push_back(kTab[(b >> 18) & 63]);
+        out.push_back(kTab[(b >> 12) & 63]);
+        out.push_back(i + 1 < bytes.size() ? kTab[(b >> 6) & 63] : '=');
+        out.push_back(i + 2 < bytes.size() ? kTab[b & 63] : '=');
+      }
+      return out;
+    };
+    auto makeFrames = [&](int totalSec, int themeStart, int themeLen, uint8_t bgSeed, uint8_t bgSlope, uint8_t bgPixSlope, uint8_t themeSeed) {
+      FrameWindow win;
+      std::vector<uint8_t> raw(static_cast<size_t>(totalSec) * 288, 0);
+      for (int t = 0; t < totalSec; t++) {
+        win.times.push_back(static_cast<double>(t));
+        bool inTheme = t >= themeStart && t < themeStart + themeLen;
+        int rel = t - themeStart;
+        for (size_t p = 0; p < 288; p++) {
+          raw[t * 288 + p] = inTheme
+                                 ? static_cast<uint8_t>((themeSeed + rel * 37 + p * 7) & 0xFF)
+                                 : static_cast<uint8_t>((bgSeed + t * bgSlope + p * bgPixSlope) & 0xFF);
+        }
+      }
+      win.dataBase64 = encodeB64(raw);
+      return win;
+    };
+    VideoFingerprint cur{makeFrames(200, 30, 90, 10, 53, 11, 100), makeFrames(150, 40, 75, 20, 53, 11, 150)};
+    VideoFingerprint ref{makeFrames(200, 60, 90, 200, 97, 17, 100), makeFrames(150, 20, 75, 220, 97, 17, 150)};
+    auto skips = matchVideoThemes(cur, ref);
+    CHECK(skips.op && near(skips.op->start, 29.5) && near(skips.op->end, 119.5));
+    CHECK(skips.ed && near(skips.ed->start, 39.5) && near(skips.ed->end, 114.5));
+  }
   if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
   std::printf("all core checks passed\n");
   return 0;

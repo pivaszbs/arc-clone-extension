@@ -114,3 +114,9 @@ Run `npm install` and `npm run build`, then open `chrome://extensions` and enabl
 3. Refresh open website tabs. The **Anime Study** toolbar button opens the offline library. The **Arc for Chrome** toolbar button opens its sidebar.
 
 Either extension can run independently. On macOS, run `npm run install:desktop-pip` to register both unpacked extensions with the desktop companion.
+
+## Anime Study across Mac, phone, Chrome and TV
+
+Run `npm run mac:up` on the Mac. It starts the library server and the OP/ED worker. The URL token comes from `ANIME_STUDY_TOKEN` or `~/Library/Application Support/AnimeStudy/token`, and it is never stored in the repo. The server answers on the home network and, when Tailscale is running, on the Mac's Tailscale name. Only this Mac, private networks and Tailscale devices (100.64.0.0/10) are accepted. `catalog.json` lists every address. The phone remembers them and switches automatically when one stops answering. The TV uses the home network address because Tizen cannot run Tailscale.
+
+Progress, skip timings and auto-skip choices sync master-master through `shared/sync/replica-core.ts`, mirroring `native/tv/replica.py`. The phone keeps that state in a file and Chrome keeps it in `localStorage`. Changes are saved locally first and sent when the Mac answers. The newest change wins. The phone also keeps the next episodes of series in progress through Local Files auto sync, so playback works without the Mac.

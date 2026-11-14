@@ -1,16 +1,40 @@
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { StatusBar } from 'expo-status-bar';
 import { SymbolView } from 'expo-symbols';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActionSheetIOS, Alert, AppState, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import { EpisodeList } from './src/components/EpisodeList';
+import { PipelinesView, type ImportPipelineState, type LocalScanState } from './src/components/PipelinesView';
 import { Player } from './src/components/Player';
+import { TvRemotePanel } from './src/components/TvRemotePanel';
+import { AutoSync, installCrashLog, type AutoSyncState } from './src/lib/auto-sync';
 import { haptics } from './src/lib/haptics';
 import { importFiles, importFolder, readLibrary, type Episode, type Series } from './src/lib/library';
-import { allProgress, saveSettings, settings as savedSettings } from './src/lib/storage';
+import { fetchRemoteCatalog } from './src/lib/server';
+import { findReachableAddress } from './src/lib/server-address';
+import { localEpisodeKeys, onRemoteChange, scheduleSync, setSyncer, syncWith } from './src/lib/replica';
+import { allProgress, applyReplicatedProgress, mergeProgress, progressFor, saveProgress, saveSettings, settings as savedSettings, type Progress } from './src/lib/storage';
+import {
+  DEFAULT_TV_SERVER_URL,
+  normalizeTvServerUrl,
+  TvSyncClient,
+  type PipelineEvent,
+  type ScanProgressInfo,
+  type TvHttpStatus,
+  type TvPlaybackState,
+  type TvWsState,
+  type WorkerStatusPayload,
+} from './src/lib/tv-sync';
+import { PhoneWorkerNode, type PhoneWorkerState } from './src/lib/worker-node';
 import { colors, radius, space } from './src/theme';
+
+// Write the cause of any crash to Documents/.anime-study/auto-sync-errors.log.
+installCrashLog();
+
+type AppMode = 'watch' | 'pipelines';
+type LibrarySource = 'server' | 'local';
 
 function latestEpisode(series: Series) {
   const progress = allProgress();
@@ -26,6 +50,17 @@ function latestEpisode(series: Series) {
   return progress[best.key]?.finished && series.episodes[index + 1] ? series.episodes[index + 1] : best;
 }
 
+function autoSyncLine(state: AutoSyncState) {
+  const kept = state.kept ? `${state.kept} episode${state.kept === 1 ? '' : 's'} kept from the Mac` : 'Keeps your next episodes from the Mac';
+  switch (state.status) {
+    case 'checking': return `Auto sync · checking the Mac…`;
+    case 'downloading': return `Auto sync · saving ${state.detail ?? ''}`;
+    case 'waiting': return `Auto sync paused · ${state.detail ?? ''} · ${kept}`;
+    case 'error': return `Auto sync · ${state.detail ?? 'error'}`;
+    default: return `Auto sync · ${state.detail ? `${state.detail} · ` : ''}${kept}`;
+  }
+}
+
 export default function App() {
   return (
     <SafeAreaProvider>
@@ -37,6 +72,23 @@ export default function App() {
 function Study() {
   const { width } = useWindowDimensions();
   const wide = width >= 700;
+  const initialServerUrl = normalizeTvServerUrl(savedSettings().tvServerUrl || DEFAULT_TV_SERVER_URL);
+  const [mode, setMode] = useState<AppMode>('watch');
+  const [source, setSource] = useState<LibrarySource>('server');
+  const [serverUrl, setServerUrl] = useState(initialServerUrl);
+  const [serverDraft, setServerDraft] = useState(initialServerUrl);
+  const [wsState, setWsState] = useState<TvWsState>('disconnected');
+  const [httpStatus, setHttpStatus] = useState<TvHttpStatus>({ state: 'idle' });
+  const [tvAutoplay, setTvAutoplay] = useState(true);
+  const [tvState, setTvState] = useState<TvPlaybackState | null>(null);
+  const [playOnPhoneOverride, setPlayOnPhoneOverride] = useState(false);
+  const [pipelineEvents, setPipelineEvents] = useState<PipelineEvent[]>([]);
+  const [scanProgress, setScanProgress] = useState<ScanProgressInfo>(null);
+  const [workerStatus, setWorkerStatus] = useState<WorkerStatusPayload | null>(null);
+  const [phoneWorker, setPhoneWorker] = useState<PhoneWorkerState>({ running: false, progress: 0 });
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [localScan, setLocalScan] = useState<LocalScanState>({ status: 'idle', seriesCount: 0, episodeCount: 0 });
+  const [importState, setImportState] = useState<ImportPipelineState>({ status: 'idle' });
   const [library, setLibrary] = useState<Series[]>([]);
   const [folder, setFolder] = useState<string | null>(null);
   const [episodeKey, setEpisodeKey] = useState<string | null>(null);
@@ -44,20 +96,240 @@ function Study() {
   const [settings, setSettings] = useState(savedSettings);
   const [, setRevision] = useState(0);
   const refreshProgress = useCallback(() => setRevision(value => value + 1), []);
+  const serverUrlRef = useRef(serverUrl);
+  serverUrlRef.current = serverUrl;
+  const sourceRef = useRef(source);
+  sourceRef.current = source;
+  const libraryRef = useRef<Series[]>([]);
+  libraryRef.current = library;
+  const tvSyncRef = useRef<TvSyncClient | null>(null);
+  const phoneWorkerRef = useRef<PhoneWorkerNode | null>(null);
+  const autoSyncRef = useRef<AutoSync | null>(null);
+  const [autoSync, setAutoSync] = useState<AutoSyncState>({ status: 'idle', kept: 0, queued: 0 });
+  const prevTvActiveRef = useRef(false);
+  const lastPhoneSyncRef = useRef(0);
+
+  const findLibraryEpisode = useCallback((seriesIdx: unknown, seriesName: unknown, episodeName: unknown) => {
+    if (typeof episodeName !== 'string') return null;
+    const list = libraryRef.current;
+    const targetSeries =
+      (typeof seriesIdx === 'number' ? list[seriesIdx] : undefined) ??
+      (typeof seriesName === 'string' ? list.find(s => s.folder === seriesName || s.title === seriesName) : undefined);
+    if (!targetSeries) return null;
+    const targetEp = targetSeries.episodes.find(e => e.video === episodeName);
+    if (!targetEp) return null;
+    return { targetSeries, targetSeriesIdx: list.indexOf(targetSeries), targetEp };
+  }, []);
+
+  const handleTvState = useCallback((next: TvPlaybackState) => {
+    setTvState(next);
+    if (typeof next.autoplay === 'boolean') setTvAutoplay(next.autoplay);
+    if (next.active !== prevTvActiveRef.current) {
+      prevTvActiveRef.current = next.active;
+      setPlayOnPhoneOverride(false);
+    }
+    if (next.active && next.episode && typeof next.position === 'number') {
+      const match = findLibraryEpisode(next.series, next.seriesName, next.episode);
+      if (match) {
+        const existing = progressFor(match.targetEp.key);
+        const dur = typeof next.duration === 'number' && next.duration > 0 ? next.duration : (existing?.duration ?? 0);
+        const finished = Boolean(existing?.finished) || (dur > 0 && next.position >= dur - 5);
+        if (!existing || Math.abs(existing.position - next.position) >= 1 || existing.duration !== dur || existing.finished !== finished) {
+          saveProgress(match.targetEp.key, {
+            position: finished ? 0 : next.position,
+            duration: dur,
+            watchedAt: Date.now(),
+            finished,
+          });
+          refreshProgress();
+        }
+      }
+    }
+  }, [findLibraryEpisode, refreshProgress]);
+
+  const scanLocal = useCallback((updateLibrary = true) => {
+    setLocalScan(prev => ({ ...prev, status: 'scanning', error: undefined }));
+    try {
+      const localSeries = readLibrary();
+      const episodeCount = localSeries.reduce((sum, s) => sum + s.episodes.length, 0);
+      const lastScannedAt = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setLocalScan({
+        status: 'ready',
+        seriesCount: localSeries.length,
+        episodeCount,
+        lastScannedAt,
+      });
+      if (updateLibrary) {
+        setLibrary(localSeries);
+        setServerError(null);
+      }
+      tvSyncRef.current?.log('Local Scan', `${localSeries.length} series, ${episodeCount} episodes`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setLocalScan(prev => ({ ...prev, status: 'error', error: msg }));
+      console.warn('Could not read the library', error);
+    }
+  }, []);
+
+  const loadRemote = useCallback(async (targetUrl?: string) => {
+    const url = normalizeTvServerUrl(targetUrl ?? serverUrlRef.current);
+    setHttpStatus({ state: 'checking' });
+    try {
+      const { series: remote, progress: remoteProgress, autoplay, tvState: remoteTvState, statusCode } = await fetchRemoteCatalog(url);
+      setHttpStatus({ state: 'ok', statusCode });
+      setTvAutoplay(autoplay);
+      mergeProgress(remoteProgress);
+      refreshProgress();
+      if (remoteTvState) handleTvState(remoteTvState);
+      if (sourceRef.current === 'server') {
+        setLibrary(remote);
+      }
+      setServerError(null);
+      tvSyncRef.current?.log('Catalog', `Loaded ${remote.length} series (HTTP ${statusCode})`);
+    } catch (error) {
+      // The Mac may just be on another address (Tailscale vs home network): switch if one answers.
+      const alternative = await findReachableAddress(url).catch(() => null);
+      if (alternative && alternative !== url) {
+        setServerDraft(alternative);
+        setServerUrl(alternative);
+        serverUrlRef.current = alternative;
+        saveSettings({ tvServerUrl: alternative });
+        tvSyncRef.current?.log('Server', `Switched to ${alternative}`);
+        tvSyncRef.current?.connect();
+        return;
+      }
+      const msg = error instanceof Error ? error.message : String(error);
+      setHttpStatus({ state: 'error', error: msg });
+      if (sourceRef.current === 'server') {
+        setServerError(msg);
+      }
+      tvSyncRef.current?.log('Error', `Catalog fetch failed: ${msg}`);
+    }
+  }, []);
 
   const scan = useCallback(() => {
-    try { setLibrary(readLibrary()); } catch (error) { console.warn('Could not read the library', error); }
-  }, []);
+    scheduleSync(0);
+    autoSyncRef.current?.kick();
+    if (sourceRef.current === 'server') {
+      void loadRemote();
+    } else {
+      scanLocal(true);
+    }
+  }, [loadRemote, scanLocal]);
+
+  // Master-master state with the Mac (src/lib/replica.ts): progress and OP/ED timings merge both ways.
+  useEffect(() => {
+    setSyncer(async () => {
+      const result = await syncWith(normalizeTvServerUrl(serverUrlRef.current));
+      if (result.sent || result.received) {
+        tvSyncRef.current?.log('Replica', `Synced with Mac · sent ${result.sent} · received ${result.received}`);
+      }
+    });
+    const unsubscribe = onRemoteChange((key, value) => {
+      const parts = key.split('/');
+      if (parts[0] !== 'ep' || parts.length < 4) return;
+      const field = parts[parts.length - 1];
+      const localKey = parts.slice(1, -1).join('/');
+      if (field === 'progress' && value && typeof value === 'object') {
+        let changed = false;
+        for (const key of localEpisodeKeys(localKey)) {
+          changed = applyReplicatedProgress(key, value as Partial<Progress>) || changed;
+        }
+        if (changed) refreshProgress();
+      } else if (field === 'themes' && sourceRef.current !== 'server') {
+        scanLocal(true);
+      }
+    });
+    scheduleSync(0);
+    return () => {
+      unsubscribe();
+      setSyncer(null);
+    };
+  }, [refreshProgress, scanLocal]);
+
+  useEffect(() => {
+    const client = new TvSyncClient(
+      state => {
+        setWsState(state);
+        if (state === 'connected') scheduleSync(0);
+      },
+      setPipelineEvents,
+      () => serverUrlRef.current,
+      msg => {
+        if (typeof msg.autoplay === 'boolean') {
+          setTvAutoplay(msg.autoplay);
+        }
+        if (typeof msg.episode === 'string' && msg.progress && typeof msg.progress === 'object') {
+          const p = msg.progress as Record<string, unknown>;
+          if (typeof p.position === 'number' && typeof p.watchedAt === 'number' && typeof p.finished === 'boolean') {
+            const match = findLibraryEpisode(msg.series, msg.seriesName, msg.episode);
+            if (match) {
+              const existing = progressFor(match.targetEp.key);
+              const dur = typeof p.duration === 'number' && p.duration > 0 ? p.duration : (existing?.duration ?? 0);
+              saveProgress(match.targetEp.key, {
+                position: p.position,
+                duration: dur,
+                watchedAt: p.watchedAt,
+                finished: p.finished,
+              });
+              refreshProgress();
+            }
+          }
+        } else if (sourceRef.current === 'server' && typeof msg.autoplay !== 'boolean') {
+          void loadRemote();
+        }
+      },
+      setScanProgress,
+      setHttpStatus,
+      handleTvState,
+      setWorkerStatus,
+    );
+    tvSyncRef.current = client;
+    const worker = new PhoneWorkerNode(
+      () => serverUrlRef.current,
+      setPhoneWorker,
+      (kind, detail) => client.log(kind, detail),
+    );
+    phoneWorkerRef.current = worker;
+    const mirror = new AutoSync(
+      () => serverUrlRef.current,
+      setAutoSync,
+      // New copies show up in Local Files right away; the counts update either way.
+      () => scanLocal(sourceRef.current === 'local'),
+      (kind, detail) => client.log(kind, detail),
+    );
+    autoSyncRef.current = mirror;
+    client.connect();
+    scanLocal(false);
+    mirror.kick();
+    return () => {
+      mirror.stop();
+      autoSyncRef.current = null;
+      worker.stop();
+      phoneWorkerRef.current = null;
+      client.destroy();
+      tvSyncRef.current = null;
+    };
+  }, [handleTvState, loadRemote, scanLocal]);
 
   useEffect(() => {
     scan();
     // Files dropped in through the Files app or Finder show up when the app comes back.
-    const subscription = AppState.addEventListener('change', state => { if (state === 'active') scan(); });
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active') scan();
+    });
     return () => subscription.remove();
-  }, [scan]);
+  }, [scan, source, serverUrl]);
+
+  const tvControlling = Boolean(tvState?.active) && source === 'server' && !playOnPhoneOverride;
 
   const series = library.find(item => item.folder === folder) ?? library[0];
   const episode = series?.episodes.find(item => item.key === episodeKey) ?? (series ? latestEpisode(series) : undefined);
+  const tvEpisodeKey = useMemo(() => {
+    if (!tvControlling || !series || !tvState?.episode) return undefined;
+    if (tvState.seriesName && series.folder !== tvState.seriesName) return undefined;
+    return series.episodes.find(item => item.video === tvState.episode)?.key;
+  }, [series, tvControlling, tvState?.episode, tvState?.seriesName]);
   const index = series && episode ? series.episodes.indexOf(episode) : -1;
   const neighbours = useMemo(
     () => (series && index >= 0 ? series.episodes.slice(Math.max(0, index - 2), index + 3) : []),
@@ -75,93 +347,289 @@ function Study() {
     setSettings(current => ({ ...current, ...next }));
   };
 
-  const pickSource = () => {
-    const run = async (task: () => Promise<string | null>) => {
-      try {
-        const name = await task();
-        scan();
-        if (name) { setFolder(name); setEpisodeKey(null); }
-      } catch (error) {
-        if (!/cancel/i.test(String(error))) Alert.alert('Could not import', String(error));
+  const runImport = useCallback(async (task: () => Promise<string | null>, kindLabel: string) => {
+    setImportState({ status: 'importing', detail: `Importing ${kindLabel}…` });
+    tvSyncRef.current?.log('Import', `Starting ${kindLabel} import`);
+    try {
+      const name = await task();
+      if (!name) {
+        setImportState({ status: 'idle' });
+        return;
       }
-    };
+      setImportState({ status: 'done', detail: `Imported ${name}` });
+      tvSyncRef.current?.log('Import', `Imported ${name}`);
+      scanLocal(sourceRef.current === 'local');
+      if (sourceRef.current === 'local') {
+        setFolder(name);
+        setEpisodeKey(null);
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (/cancel/i.test(msg)) {
+        setImportState({ status: 'idle' });
+        return;
+      }
+      setImportState({ status: 'error', detail: msg });
+      tvSyncRef.current?.log('Error', `Import failed: ${msg}`);
+      Alert.alert('Could not import', msg);
+    }
+  }, [scanLocal]);
+
+  const pickSource = () => {
     ActionSheetIOS.showActionSheetWithOptions(
       { options: ['Import downloads folder…', 'Import episode files…', 'Cancel'], cancelButtonIndex: 2, title: 'Add episodes' },
       choice => {
-        if (choice === 0) void run(importFolder);
-        if (choice === 1) void run(importFiles);
+        if (choice === 0) void runImport(importFolder, 'folder');
+        if (choice === 1) void runImport(importFiles, 'files');
       },
     );
   };
 
   const selectEpisode = (next: Episode) => {
     haptics.select();
+    if (tvControlling && series) {
+      tvSyncRef.current?.sendTvControl({ action: 'playEpisode', seriesName: series.folder, episode: next.video });
+      return;
+    }
     setEpisodeKey(next.key);
+    if (source === 'server' && series) {
+      void tvSyncRef.current?.pushSync({ playingFolder: series.folder, playingEpisode: next.video });
+    }
   };
 
   const step = (direction: -1 | 1) => {
     const next = series?.episodes[index + direction];
-    if (next) setEpisodeKey(next.key);
+    if (next) selectEpisode(next);
   };
 
+  const toggleEpisodeWatched = useCallback((targetEp: Episode, targetSeries?: Series) => {
+    haptics.select();
+    const existing = progressFor(targetEp.key);
+    const nextFinished = !existing?.finished;
+    const nextProgress: Progress = {
+      position: 0,
+      duration: existing?.duration ?? 0,
+      watchedAt: Date.now(),
+      finished: nextFinished,
+    };
+    saveProgress(targetEp.key, nextProgress);
+    refreshProgress();
+    if (sourceRef.current === 'server') {
+      const activeSeries = targetSeries ?? series;
+      const seriesIdx = activeSeries ? libraryRef.current.indexOf(activeSeries) : -1;
+      void tvSyncRef.current?.pushSync({
+        type: 'sync',
+        ...(seriesIdx >= 0 ? { series: seriesIdx } : {}),
+        ...(activeSeries ? { seriesName: activeSeries.folder } : {}),
+        episode: targetEp.video,
+        progress: nextProgress,
+      });
+    }
+  }, [refreshProgress, series]);
+
+  const handlePhoneProgress = useCallback(() => {
+    refreshProgress();
+    if (sourceRef.current !== 'server' || !series || !episode) return;
+    const saved = progressFor(episode.key);
+    if (!saved) return;
+    const now = Date.now();
+    if (!saved.finished && now - lastPhoneSyncRef.current < 5000) return;
+    lastPhoneSyncRef.current = now;
+    const seriesIdx = libraryRef.current.indexOf(series);
+    void tvSyncRef.current?.pushSync({
+      type: 'sync',
+      ...(seriesIdx >= 0 ? { series: seriesIdx } : {}),
+      seriesName: series.folder,
+      episode: episode.video,
+      progress: saved,
+    });
+  }, [episode, refreshProgress, series]);
+
+  const applyServerUrl = (nextRaw: string) => {
+    const normalized = normalizeTvServerUrl(nextRaw);
+    setServerDraft(normalized);
+    setServerUrl(normalized);
+    serverUrlRef.current = normalized;
+    saveSettings({ tvServerUrl: normalized });
+    tvSyncRef.current?.log('Server', `Switching to ${normalized}`);
+    tvSyncRef.current?.connect();
+    if (source === 'server') {
+      void loadRemote(normalized);
+    }
+  };
+
+  const wsBadgeColor =
+    wsState === 'connected' ? '#34d399' : wsState === 'connecting' ? colors.accent : '#f87171';
+
   const header = (
-    <View style={styles.header}>
+    <View style={[styles.header, tvControlling && styles.headerCompact]}>
       <View style={styles.titleRow}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.kicker}>Anime Study</Text>
-          <Text style={styles.title} numberOfLines={2}>{series?.title ?? 'Offline Study'}</Text>
-          {!!series?.credit && (
-            <View style={styles.credit}><Text style={styles.creditText} numberOfLines={1}>{series.credit}</Text></View>
+          <View style={styles.kickerRow}>
+            <Text style={styles.kicker}>Anime Study</Text>
+            <View style={[styles.wsDot, { backgroundColor: wsBadgeColor }]} />
+            <Text style={styles.wsText}>{wsState}</Text>
+          </View>
+          {!tvControlling && (
+            <>
+              <Text style={styles.title} numberOfLines={2}>
+                {mode === 'pipelines' ? 'Pipelines' : (series?.title ?? (source === 'server' ? 'Mac Server' : 'Offline Study'))}
+              </Text>
+              {mode === 'watch' && !!series?.credit && (
+                <View style={styles.credit}><Text style={styles.creditText} numberOfLines={1}>{series.credit}</Text></View>
+              )}
+            </>
           )}
         </View>
-        <Pressable accessibilityRole="button" accessibilityLabel="Add episodes" onPress={pickSource} hitSlop={10} style={styles.addButton}>
-          <SymbolView name="plus" size={20} tintColor={colors.accent} />
-        </Pressable>
+        <View style={styles.headerActions}>
+          <View style={styles.modeSwitch}>
+            {(['watch', 'pipelines'] as const).map(item => {
+              const active = mode === item;
+              return (
+                <Pressable
+                  key={item}
+                  onPress={() => { haptics.select(); setMode(item); }}
+                  style={[styles.modePill, active && styles.modePillActive]}
+                >
+                  <Text style={[styles.modePillText, active && styles.modePillTextActive]}>
+                    {item === 'watch' ? 'Watch' : 'Pipelines'}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          {mode === 'watch' && source === 'local' && (
+            <Pressable accessibilityRole="button" accessibilityLabel="Add episodes" onPress={pickSource} hitSlop={10} style={styles.addButton}>
+              <SymbolView name="plus" size={20} tintColor={colors.accent} />
+            </Pressable>
+          )}
+        </View>
       </View>
-      {library.length > 1 && (
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
-          {library.map(item => {
-            const active = item.folder === series?.folder;
-            return (
-              <Pressable
-                key={item.folder || '_root'}
-                onPress={() => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
-                style={[styles.chip, active && styles.chipActive]}
-              >
-                <Text style={[styles.chipText, active && { color: colors.background }]} numberOfLines={1}>{item.title}</Text>
-              </Pressable>
-            );
-          })}
-        </ScrollView>
+      {mode === 'watch' && (
+        <>
+          {!tvControlling && (
+            <View style={styles.sourceRow}>
+              {(['server', 'local'] as const).map(item => {
+                const active = source === item;
+                return (
+                  <Pressable
+                    key={item}
+                    onPress={() => {
+                      haptics.select();
+                      setSource(item);
+                      setFolder(null);
+                      setEpisodeKey(null);
+                    }}
+                    style={[styles.sourceChip, active && styles.sourceChipActive]}
+                  >
+                    <Text style={[styles.sourceChipText, active && styles.sourceChipTextActive]}>
+                      {item === 'server' ? 'Mac Server' : 'Local Files'}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+              {source === 'server' && (
+                <Pressable onPress={() => { haptics.select(); void loadRemote(); }} style={styles.refreshChip}>
+                  <Text style={styles.refreshChipText}>Refresh</Text>
+                </Pressable>
+              )}
+            </View>
+          )}
+          {!tvControlling && source === 'local' && (
+            <Text style={styles.autoSync} numberOfLines={2}>{autoSyncLine(autoSync)}</Text>
+          )}
+          {library.length > 1 && (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
+              {library.map(item => {
+                const active = item.folder === series?.folder;
+                return (
+                  <Pressable
+                    key={item.folder || '_root'}
+                    onPress={() => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
+                    style={[styles.chip, active && styles.chipActive]}
+                  >
+                    <Text style={[styles.chipText, active && { color: colors.background }]} numberOfLines={1}>{item.title}</Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          )}
+          {!tvControlling && (
+            <View style={styles.settingRow}>
+              <Text style={styles.settingText}>Auto-skip opening, ending and recap</Text>
+              <Switch
+                value={settings.autoSkip}
+                onValueChange={value => { haptics.select(); updateSettings({ autoSkip: value }); }}
+                trackColor={{ true: colors.accent }}
+              />
+            </View>
+          )}
+        </>
       )}
-      <View style={styles.settingRow}>
-        <Text style={styles.settingText}>Auto-skip opening, ending and recap</Text>
-        <Switch
-          value={settings.autoSkip}
-          onValueChange={value => { haptics.select(); updateSettings({ autoSkip: value }); }}
-          trackColor={{ true: colors.accent }}
-        />
-      </View>
     </View>
   );
 
-  const player = episode && (
-    <Player
-      episode={episode}
-      neighbours={neighbours}
-      fullscreen={fullscreen}
-      autoSkip={settings.autoSkip}
-      subtitlesOn={settings.subtitles}
-      onToggleFullscreen={value => setFullscreen(current => value ?? !current)}
-      onToggleSubtitles={() => updateSettings({ subtitles: !settings.subtitles })}
-      onStep={direction => step(direction)}
-      hasPrevious={index > 0}
-      hasNext={!!series && index < series.episodes.length - 1}
-      onProgress={refreshProgress}
+  const tvSwitchBanner = tvState?.active && source === 'server' && playOnPhoneOverride && !fullscreen ? (
+    <Pressable
+      accessibilityRole="button"
+      onPress={() => { haptics.select(); setPlayOnPhoneOverride(false); }}
+      style={styles.tvBanner}
+    >
+      <View style={styles.tvBannerDot} />
+      <Text style={styles.tvBannerText} numberOfLines={1}>
+        TV is playing {tvState.episodeLabel || tvState.episode || ''} · Tap for TV remote
+      </Text>
+    </Pressable>
+  ) : null;
+
+  const player = tvControlling && tvState ? (
+    <TvRemotePanel
+      tvState={tvState}
+      tvAutoplay={tvAutoplay}
+      onCommand={command => tvSyncRef.current?.sendTvControl(command)}
+      onPlayOnPhone={() => setPlayOnPhoneOverride(true)}
     />
+  ) : episode && (
+    <View style={fullscreen ? { flex: 1 } : { gap: space.s }}>
+      {tvSwitchBanner}
+      <Player
+        episode={episode}
+        neighbours={neighbours}
+        fullscreen={fullscreen}
+        autoSkip={settings.autoSkip}
+        subtitlesOn={settings.subtitles}
+        onToggleFullscreen={value => setFullscreen(current => value ?? !current)}
+        onToggleSubtitles={() => updateSettings({ subtitles: !settings.subtitles })}
+        onStep={direction => step(direction)}
+        hasPrevious={index > 0}
+        hasNext={!!series && index < series.episodes.length - 1}
+        onProgress={handlePhoneProgress}
+      />
+    </View>
   );
 
-  const empty = (
+  const empty = source === 'server' ? (
+    <View style={styles.empty}>
+      <SymbolView name="wifi.slash" size={48} tintColor={colors.textTertiary} />
+      <Text style={styles.emptyTitle}>No Mac server catalog</Text>
+      <Text style={styles.emptyText}>
+        {serverError
+          ? `Could not reach ${serverUrl}\n(${serverError})`
+          : `Waiting for catalog from ${serverUrl}.`}
+      </Text>
+      <View style={styles.emptyActions}>
+        <Pressable onPress={() => { haptics.select(); void loadRemote(); }} style={styles.emptyButton}>
+          <Text style={styles.emptyButtonText}>Retry</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => { haptics.select(); setSource('local'); }}
+          style={[styles.emptyButton, styles.emptySecondaryButton]}
+        >
+          <Text style={styles.emptySecondaryButtonText}>Use Local Files</Text>
+        </Pressable>
+      </View>
+    </View>
+  ) : (
     <View style={styles.empty}>
       <SymbolView name="film.stack" size={48} tintColor={colors.textTertiary} />
       <Text style={styles.emptyTitle}>No episodes yet</Text>
@@ -173,8 +641,51 @@ function Study() {
     </View>
   );
 
+  const pipelinesScreen = (
+    <PipelinesView
+      serverDraft={serverDraft}
+      onChangeServerDraft={setServerDraft}
+      onApplyServerUrl={applyServerUrl}
+      onFetchCatalog={() => { void loadRemote(); }}
+      wsState={wsState}
+      httpStatus={httpStatus}
+      serverError={serverError}
+      tvAutoplay={tvAutoplay}
+      onToggleTvAutoplay={nextAutoplay => {
+        setTvAutoplay(nextAutoplay);
+        void tvSyncRef.current?.pushSync({ autoplay: nextAutoplay });
+      }}
+      scanProgress={scanProgress}
+      localScan={localScan}
+      onRescanLocal={() => scanLocal(source === 'local')}
+      importState={importState}
+      onImportFolder={() => { void runImport(importFolder, 'folder'); }}
+      onImportFiles={() => { void runImport(importFiles, 'files'); }}
+      coverageSeries={library}
+      pipelineEvents={pipelineEvents}
+      onClearEvents={() => tvSyncRef.current?.clearEvents()}
+      workerStatus={workerStatus}
+      phoneWorker={phoneWorker}
+      onTogglePhoneWorker={() => {
+        const worker = phoneWorkerRef.current;
+        if (!worker) return;
+        if (worker.isRunning()) worker.stop();
+        else worker.start();
+      }}
+      onRefreshWorkerStatus={() => { void tvSyncRef.current?.fetchWorkerStatus(); }}
+      onRetryQuarantined={target => { void tvSyncRef.current?.retryWorkerEpisodes(target); }}
+    />
+  );
+
   const list = series && (
-    <EpisodeList episodes={series.episodes} current={episode?.key} progress={allProgress()} onSelect={selectEpisode} header={wide ? header : undefined} />
+    <EpisodeList
+      episodes={series.episodes}
+      current={tvControlling ? tvEpisodeKey : episode?.key}
+      progress={allProgress()}
+      onSelect={selectEpisode}
+      onToggleWatched={ep => toggleEpisodeWatched(ep, series)}
+      header={wide ? header : undefined}
+    />
   );
 
   // Hidden sections keep their place in the tree so the video player is never remounted.
@@ -184,17 +695,24 @@ function Study() {
     <View style={styles.root}>
       <StatusBar style="light" hidden={fullscreen} />
       <SafeAreaView style={styles.root} edges={fullscreen ? [] : ['top', 'left', 'right']}>
-        {!series ? (
+        {mode === 'pipelines' ? (
+          <View style={{ flex: 1 }}>
+            {header}
+            {pipelinesScreen}
+          </View>
+        ) : !series ? (
           <View style={{ flex: 1 }}>{header}{empty}</View>
         ) : wide ? (
           <View style={styles.split}>
             <View style={[styles.sidebar, { width: Math.min(380, width * 0.36) }, hide]}>{list}</View>
             <View style={[styles.main, fullscreen && styles.mainFullscreen]}>
               {player}
-              <View style={hide}>
-                <Text style={styles.nowPlaying} numberOfLines={1}>{episode?.label}</Text>
-                <Text style={styles.fileName} numberOfLines={1}>{episode?.video}</Text>
-              </View>
+              {!tvControlling && (
+                <View style={hide}>
+                  <Text style={styles.nowPlaying} numberOfLines={1}>{episode?.label}</Text>
+                  <Text style={styles.fileName} numberOfLines={1}>{episode?.video}</Text>
+                </View>
+              )}
             </View>
           </View>
         ) : (
@@ -219,6 +737,7 @@ const styles = StyleSheet.create({
   phonePlayer: { paddingHorizontal: space.m, paddingBottom: space.m },
   phoneFullscreen: { flex: 1 },
   header: { paddingHorizontal: space.l, paddingTop: space.s, paddingBottom: space.m, gap: space.m },
+  headerCompact: { paddingBottom: space.s, gap: space.s },
   titleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: space.m },
   kicker: { color: colors.accent, fontSize: 13, fontWeight: '700', letterSpacing: 0.6, textTransform: 'uppercase' },
   title: { color: colors.text, fontSize: 28, fontWeight: '800', marginTop: 2 },
@@ -238,4 +757,27 @@ const styles = StyleSheet.create({
   emptyText: { color: colors.textSecondary, fontSize: 15, textAlign: 'center', lineHeight: 21, maxWidth: 420 },
   emptyButton: { backgroundColor: colors.accent, borderRadius: radius.pill, paddingHorizontal: 22, paddingVertical: 12, marginTop: space.s },
   emptyButtonText: { color: colors.background, fontSize: 16, fontWeight: '700' },
+  emptyActions: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: space.s, marginTop: space.s },
+  emptySecondaryButton: { backgroundColor: colors.surfaceRaised },
+  emptySecondaryButtonText: { color: colors.text, fontSize: 16, fontWeight: '700' },
+  kickerRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  wsDot: { width: 8, height: 8, borderRadius: 4 },
+  wsText: { color: colors.textSecondary, fontSize: 12, fontWeight: '600', textTransform: 'capitalize' },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: space.s },
+  modeSwitch: { flexDirection: 'row', backgroundColor: colors.surfaceRaised, borderRadius: radius.pill, padding: 3 },
+  modePill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: radius.pill },
+  modePillActive: { backgroundColor: colors.accent },
+  modePillText: { color: colors.textSecondary, fontSize: 12, fontWeight: '700' },
+  modePillTextActive: { color: colors.background },
+  sourceRow: { flexDirection: 'row', alignItems: 'center', gap: space.s },
+  autoSync: { color: colors.textSecondary, fontSize: 13 },
+  sourceChip: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: radius.pill, backgroundColor: colors.surfaceRaised },
+  sourceChipActive: { backgroundColor: colors.accentMuted },
+  sourceChipText: { color: colors.textSecondary, fontSize: 13, fontWeight: '600' },
+  sourceChipTextActive: { color: colors.accent },
+  refreshChip: { marginLeft: 'auto', paddingHorizontal: 12, paddingVertical: 6, borderRadius: radius.pill, backgroundColor: colors.surface },
+  refreshChipText: { color: colors.text, fontSize: 13, fontWeight: '600' },
+  tvBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.accentMuted, borderRadius: radius.medium, paddingHorizontal: space.m, paddingVertical: space.s },
+  tvBannerDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#34d399' },
+  tvBannerText: { color: colors.accent, fontSize: 13, fontWeight: '600', flex: 1 },
 });

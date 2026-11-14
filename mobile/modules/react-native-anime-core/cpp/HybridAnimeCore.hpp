@@ -18,6 +18,7 @@ class HybridAnimeCore : public HybridAnimeCoreSpec {
   std::string episodeLabel(const std::string& fileName) override;
   std::vector<EpisodePair> pairEpisodes(const std::vector<std::string>& paths) override;
   double cueIndexAt(const std::vector<Cue>& cues, double time) override;
+  SkipRanges matchVideoThemes(const VideoFingerprint& current, const VideoFingerprint& reference) override;
 };
 
 }  // namespace margelo::nitro::animecore
