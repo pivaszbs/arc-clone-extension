@@ -152,6 +152,8 @@ function Study() {
     }
   }, []);
 
+  const librarySignature = useRef('');
+  const remoteReloadTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const loadRemote = useCallback(async (targetUrl?: string) => {
     const url = normalizeTvServerUrl(targetUrl ?? serverUrlRef.current);
     setHttpStatus({ state: 'checking' });
@@ -163,7 +165,13 @@ function Study() {
       refreshProgress();
       if (remoteTvState) handleTvState(remoteTvState);
       if (sourceRef.current === 'server') {
-        setLibrary(remote);
+        // An unchanged catalog keeps the same objects, so nothing downstream (the playing episode's
+        // subtitle and opening/ending work) starts over.
+        const signature = JSON.stringify(remote);
+        if (signature !== librarySignature.current) {
+          librarySignature.current = signature;
+          setLibrary(remote);
+        }
       }
       setServerError(null);
       tvSyncRef.current?.log('Catalog', `Loaded ${remote.length} series (HTTP ${statusCode})`);
@@ -256,7 +264,9 @@ function Study() {
             }
           }
         } else if (sourceRef.current === 'server' && typeof msg.autoplay !== 'boolean') {
-          void loadRemote();
+          // Bursts of broadcasts (a worker publishing timings, another device syncing) reload once.
+          clearTimeout(remoteReloadTimer.current);
+          remoteReloadTimer.current = setTimeout(() => { void loadRemote(); }, 1500);
         }
       },
       setScanProgress,
@@ -314,9 +324,13 @@ function Study() {
   const fullscreen = !!episode && !tvControlling && !playerHidden;
   // By key: the playing episode may be the downloaded copy, a different object than the listed one.
   const index = series && episode ? series.episodes.findIndex(item => item.key === episode.key) : -1;
+  // Keyed by which episodes they are, so a reloaded catalog doesn't redo the subtitle work.
+  const neighbourList = series && index >= 0 ? series.episodes.slice(Math.max(0, index - 2), index + 3) : [];
+  const neighbourIdentity = neighbourList.map(item => `${item.key}\n${item.subtitleUri ?? ''}`).join('\n');
   const neighbours = useMemo(
-    () => (series && index >= 0 ? series.episodes.slice(Math.max(0, index - 2), index + 3) : []),
-    [series, index],
+    () => neighbourList,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [neighbourIdentity],
   );
 
   // iPhones turn to landscape for fullscreen; iPads keep whatever the user holds.
