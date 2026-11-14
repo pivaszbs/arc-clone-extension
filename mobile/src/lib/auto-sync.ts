@@ -2,6 +2,7 @@ import { Directory, File, Paths } from 'expo-file-system';
 
 import { getDeviceHealth } from '../../modules/device-health/src';
 import type { Series } from './library';
+import { requestedFolders } from './mac-downloads';
 import { fetchRemoteCatalog } from './server';
 import { allProgress, type Progress } from './storage';
 
@@ -72,8 +73,8 @@ function progressOf(progress: Record<string, Progress>, series: Series, video: s
 
 type Wanted = { series: Series; episodeIndex: number };
 
-/** The next unfinished episodes of every series you've started. */
-export function pickEpisodes(remote: Series[], progress: Record<string, Progress>, keepAhead = KEEP_AHEAD): Wanted[] {
+/** The next unfinished episodes of every series you've started, or asked the Mac to download from here. */
+export function pickEpisodes(remote: Series[], progress: Record<string, Progress>, keepAhead = KEEP_AHEAD, requested = new Set<string>()): Wanted[] {
   const wanted: Wanted[] = [];
   for (const series of remote) {
     let latest = -1;
@@ -82,6 +83,7 @@ export function pickEpisodes(remote: Series[], progress: Record<string, Progress
       const saved = progressOf(progress, series, episode.video);
       if (saved && saved.watchedAt > latestAt) { latestAt = saved.watchedAt; latest = index; }
     });
+    if (latest < 0 && requested.has(series.folder)) latest = 0;
     if (latest < 0) continue;
     let added = 0;
     for (let index = latest; index < series.episodes.length && added < keepAhead; index++) {
@@ -152,7 +154,7 @@ export class AutoSync {
       this.set({ status: 'checking', detail: undefined });
       const { series: remote } = await fetchRemoteCatalog(this.serverUrl());
       const progress = allProgress();
-      const wanted = pickEpisodes(remote, progress);
+      const wanted = pickEpisodes(remote, progress, KEEP_AHEAD, await requestedFolders(this.serverUrl()));
       const manifest = readManifest();
 
       // Remove copies auto sync made once they're watched and no longer wanted.

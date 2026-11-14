@@ -12,7 +12,6 @@ import { Player } from './src/components/Player';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
 import { AutoSync, installCrashLog, type AutoSyncState } from './src/lib/auto-sync';
 import { haptics } from './src/lib/haptics';
-import { SeriesDownloader, type DownloadsState } from './src/lib/series-downloads';
 import { importFiles, importFolder, readLibrary, type Episode, type Series } from './src/lib/library';
 import { fetchRemoteCatalog } from './src/lib/server';
 import { findReachableAddress } from './src/lib/server-address';
@@ -107,8 +106,7 @@ function Study() {
   const tvSyncRef = useRef<TvSyncClient | null>(null);
   const phoneWorkerRef = useRef<PhoneWorkerNode | null>(null);
   const autoSyncRef = useRef<AutoSync | null>(null);
-  const [downloader, setDownloader] = useState<SeriesDownloader | null>(null);
-  const [downloads, setDownloads] = useState<DownloadsState>({ status: 'idle', done: 0, total: 0, failed: 0, series: [] });
+  const kickAutoSync = useCallback(() => autoSyncRef.current?.kick(), []);
   const [autoSync, setAutoSync] = useState<AutoSyncState>({ status: 'idle', kept: 0, queued: 0 });
   const prevTvActiveRef = useRef(false);
   const lastPhoneSyncRef = useRef(0);
@@ -303,18 +301,9 @@ function Study() {
       (kind, detail) => client.log(kind, detail),
     );
     autoSyncRef.current = mirror;
-    const downloader = new SeriesDownloader(
-      setDownloads,
-      // Each finished episode shows up in Local Files right away.
-      () => scanLocal(sourceRef.current === 'local'),
-      (kind, detail) => client.log(kind, detail),
-    );
-    setDownloader(downloader);
-    setDownloads(downloader.current);
     client.connect();
     scanLocal(false);
     mirror.kick();
-    downloader.kick();
     return () => {
       mirror.stop();
       autoSyncRef.current = null;
@@ -713,10 +702,10 @@ function Study() {
             {header}
             {pipelinesScreen}
           </View>
-        ) : mode === 'download' && downloader ? (
+        ) : mode === 'download' ? (
           <View style={{ flex: 1 }}>
             {header}
-            <DownloadView downloader={downloader} state={downloads} />
+            <DownloadView serverUrl={serverUrl} onMacProgress={kickAutoSync} />
           </View>
         ) : !series ? (
           <View style={{ flex: 1 }}>{header}{empty}</View>

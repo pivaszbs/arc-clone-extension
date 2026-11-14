@@ -170,6 +170,8 @@ class TVHandler(BaseHTTPRequestHandler):
         if path == f"/{self.server.token}/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
             self.handle_websocket()
             return
+        if path == f"/{self.server.token}/downloads":
+            return self._send_json({"requests": self.server.download_requests()})
         if path == f"/{self.server.token}/worker/status":
             data = json.dumps(self.server.get_worker_status()).encode("utf-8")
             self.respond("application/json; charset=utf-8", len(data))
@@ -282,6 +284,17 @@ class TVHandler(BaseHTTPRequestHandler):
                 if body is None:
                     return self.send_error(400)
                 self._send_json(self.server.replica_sync(body))
+            elif resource == "downloads/request":
+                body = self._read_json_body(16_384)
+                if body is None:
+                    return self.send_error(400)
+                request = self.server.request_download(body)
+                self._send_json({"request": request} if request else {"error": "Open an Anime365 series first."}, code=200 if request else 400)
+            elif resource == "downloads/update":
+                body = self._read_json_body(262_144)
+                if body is None:
+                    return self.send_error(400)
+                self._send_json(self.server.update_download(body))
             elif resource == "worker/retry":
                 body = self._read_json_body(65_536)
                 if body is None:
@@ -400,6 +413,7 @@ class TVServer(ThreadingHTTPServer):
         self.meta_lock = threading.Lock()
         self.ws_lock = threading.Lock()
         self.worker_lock = threading.Lock()
+        self.downloads_lock = threading.Lock()
         self.ws_clients = set()
         self.tv_state = {"type": "tv_state", "active": False}
         self.tv_state_conn = None
@@ -465,6 +479,83 @@ class TVServer(ThreadingHTTPServer):
     def remove_ws(self, conn):
         with self.ws_lock:
             self.ws_clients.discard(conn)
+
+    # Series download requests: a phone or iPad asks for a series, and Chrome on this Mac (signed in to
+    # Anime365) claims the request, downloads it into this library and reports progress back here.
+    DOWNLOAD_STATES = ("pending", "planning", "downloading", "done", "failed")
+
+    def _downloads_path(self):
+        return self.folder / ".anime-study-download-requests.json"
+
+    def _read_downloads(self):
+        try:
+            saved = json.loads(self._downloads_path().read_text(encoding="utf-8"))
+            return [item for item in saved.get("requests", []) if isinstance(item, dict)]
+        except (OSError, ValueError, AttributeError):
+            return []
+
+    def _write_downloads(self, requests):
+        path = self._downloads_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"requests": requests[-50:]}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+        self.broadcast({"type": "downloads", "requests": requests[-50:]})
+
+    def download_requests(self):
+        with self.downloads_lock:
+            return self._read_downloads()
+
+    def request_download(self, body):
+        url = body.get("url")
+        if not isinstance(url, str) or len(url) > 2_000:
+            return None
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        anime365 = any(host == domain or host.endswith("." + domain) for domain in ("smotret-anime.com", "smotret-anime.net"))
+        if parts.scheme != "https" or not anime365 or parts.username or parts.password or parts.port or not parts.path.startswith("/catalog/"):
+            return None
+        title = body.get("title") if isinstance(body.get("title"), str) else ""
+        device = body.get("from") if isinstance(body.get("from"), str) else ""
+        with self.downloads_lock:
+            requests = self._read_downloads()
+            for item in requests:
+                if item.get("url") == url and item.get("state") in ("pending", "planning", "downloading"):
+                    return item
+            request = {
+                "id": secrets.token_hex(6), "url": url, "title": title[:200], "from": device[:60],
+                "state": "pending", "detail": "Waiting for Chrome on the Mac", "createdAt": int(time.time() * 1000),
+            }
+            requests.append(request)
+            self._write_downloads(requests)
+            return request
+
+    def update_download(self, body):
+        """Chrome reports progress. With a planned folder and file names, answers which are already here."""
+        existing = []
+        folder_name = body.get("folder")
+        if isinstance(folder_name, str) and folder_name and "/" not in folder_name and "\\" not in folder_name and not folder_name.startswith("."):
+            folder = self.folder / folder_name
+            names = body.get("files") if isinstance(body.get("files"), list) else []
+            existing = [name for name in names[:2_000] if isinstance(name, str) and "/" not in name and (folder / name).is_file()]
+        with self.downloads_lock:
+            requests = self._read_downloads()
+            for item in requests:
+                if item.get("id") != body.get("id"):
+                    continue
+                if body.get("state") in self.DOWNLOAD_STATES:
+                    item["state"] = body["state"]
+                for key, limit in (("detail", 300), ("title", 200), ("folder", 200)):
+                    if isinstance(body.get(key), str):
+                        item[key] = body[key][:limit]
+                for key in ("done", "total"):
+                    if isinstance(body.get(key), int):
+                        item[key] = body[key]
+                item["updatedAt"] = int(time.time() * 1000)
+                self._write_downloads(requests)
+                break
+        if body.get("state") == "done":
+            self.refresh_series()
+        return {"ok": True, "existing": existing}
 
     def broadcast(self, event, exclude=None):
         frame = ws_encode_text(json.dumps(event))

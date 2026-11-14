@@ -153,3 +153,25 @@ export function seriesDownloadRequest(message: { type: string; plan?: SeriesPlan
     return { queue: await pump() };
   });
 }
+
+/** The current Chrome queue, for the Mac's download requests. */
+export function seriesQueueStatus() {
+  return serialize(load);
+}
+
+/**
+ * Start a queue for a download requested from another device (see remote-downloads.ts).
+ * Returns false when Chrome is already busy with another queue, so the request waits.
+ */
+export function startRequestedSeries(plan: SeriesPlan, selectedPages: string[]) {
+  return serialize(async () => {
+    if (!chrome.downloads) throw new Error('Allow Chrome downloads to start the queue.');
+    const queue = await load();
+    if (queue?.files.some(file => file.state === 'queued' || file.state === 'downloading')) return false;
+    watchDownloads();
+    await save(createQueue(plan, selectedPages));
+    await chrome.alarms.create(alarm, { periodInMinutes: 0.5 });
+    await pump();
+    return true;
+  });
+}

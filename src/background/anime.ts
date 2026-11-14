@@ -4,6 +4,7 @@ import { studyRequest } from '../japanese/storage';
 import { subtitleUrl } from '../japanese/captions';
 import { isAnimeSubtitleSite } from '../japanese/page-captions';
 import { seriesDownloadRequest } from './series-downloads';
+import './remote-downloads';
 import { seriesRoot } from '../japanese/series';
 
 declare const __ARC_BROWSER_ID__: string;
