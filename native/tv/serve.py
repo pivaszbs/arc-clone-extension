@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import socket
 import struct
 import threading
 import hashlib
@@ -58,6 +59,7 @@ def default_queue_path(folder):
     return QUEUE_DIR / f"queue-{digest}.sqlite3"
 MEDIA_PATH = re.compile(r"(?:(\d+)/)?(\d+)/(video|subtitles)")
 POSTER_PATH = re.compile(r"(\d+)/poster")
+WS_SEND_TIMEOUT_SECONDS = 5
 SERIES_ID_RE = re.compile(r"\s-\s(\d+)(?:\s-\s|$)")
 
 
@@ -425,6 +427,9 @@ class TVServer(ThreadingHTTPServer):
         self.episode_state = self.store.load_episodes()   # (series, episode) -> {state, attempts, notBefore, error}
         self.stage_state = self.store.load_stages()      # kind -> {(series, episode) -> {..., result}}
         self.series_samples = self.store.load_samples()
+        # Fingerprint results that found no opening or ending, and those already given a second try.
+        self.empty_fingerprints = set()
+        self.rechecked_fingerprints = set()
         self._requeue_outdated_fingerprints()
         self.store.log_event("coordinator_start", data={"resumedJobs": len(self.worker_jobs)})
         # Master-master library state shared with phones (replica.py).
@@ -473,6 +478,12 @@ class TVServer(ThreadingHTTPServer):
         return None
 
     def add_ws(self, conn):
+        # A client that stops reading (a phone asleep) must not block broadcasts forever: give sends
+        # a timeout, after which broadcast() drops the client. Reads keep blocking as before.
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", WS_SEND_TIMEOUT_SECONDS, 0))
+        except (OSError, struct.error):
+            pass
         with self.ws_lock:
             self.ws_clients.add(conn)
 
@@ -499,7 +510,6 @@ class TVServer(ThreadingHTTPServer):
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"requests": requests[-50:]}, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
-        self.broadcast({"type": "downloads", "requests": requests[-50:]})
 
     def download_requests(self):
         with self.downloads_lock:
@@ -527,7 +537,8 @@ class TVServer(ThreadingHTTPServer):
             }
             requests.append(request)
             self._write_downloads(requests)
-            return request
+        self.broadcast({"type": "downloads", "requests": requests[-50:]})
+        return request
 
     def update_download(self, body):
         """Chrome reports progress. With a planned folder and file names, answers which are already here."""
@@ -553,6 +564,7 @@ class TVServer(ThreadingHTTPServer):
                 item["updatedAt"] = int(time.time() * 1000)
                 self._write_downloads(requests)
                 break
+        self.broadcast({"type": "downloads", "requests": requests[-50:]})
         if body.get("state") == "done":
             self.refresh_series()
         return {"ok": True, "existing": existing}
@@ -906,7 +918,10 @@ class TVServer(ThreadingHTTPServer):
     STAGE_KINDS = ("probe", "fingerprint")
     # Bump when worker.py's OP/ED detection changes so finished episodes are processed again.
     # v2: ending songs matched by soundtrack (audio_print.py).
-    FINGERPRINT_DETECTOR_VERSION = 2
+    # v3: several reference episodes (nearest first, not the first episode); episodes that found
+    #     nothing are checked again once another episode of the series finds its opening or ending.
+    FINGERPRINT_DETECTOR_VERSION = 3
+    FINGERPRINT_REFERENCES = 3
 
     def _requeue_outdated_fingerprints(self):
         outdated = [key for key, info in self.episode_state.items()
@@ -1319,18 +1334,25 @@ class TVServer(ThreadingHTTPServer):
                 "leaseSeconds": self.WORKER_LEASE_SECONDS,
             }
             if kind == "fingerprint":
-                # Prefer cached reference samples from another episode in the same series.
-                # Samples saved before soundtrack matching lack "edAudio"; sample a fresh reference instead.
-                ref_samples = None
-                for (s_name, r_name), cached in self.series_samples.items():
-                    if s_name == series_name and r_name != ep_name and "edAudio" in cached:
-                        if cached.get("edAudio") or ref_samples is None:
-                            ref_samples = cached
-                        if cached.get("edAudio"):
-                            break
+                # Compare against several other episodes of the series, nearest first. One reference is
+                # not enough: a first episode often has no opening (or a special ending), and matching
+                # only against it finds nothing in every later episode.
+                names = [file.name for file, _ in episodes]
+                cached = [(r_name, samples) for (s_name, r_name), samples in self.series_samples.items()
+                          if s_name == series_name and r_name != ep_name and r_name in names and "edAudio" in samples]
+                cached.sort(key=lambda item: (names.index(item[0]) == 0, abs(names.index(item[0]) - ep_idx)))
+                references = [samples for _, samples in cached[:self.FINGERPRINT_REFERENCES]]
+                ref_samples = references[0] if references else None
+                job_payload["referenceSamplesList"] = references
                 ref_episode = None
                 if ref_samples is None:
-                    ref_idx = 0 if ep_idx != 0 else 1
+                    # Sample a neighbour, avoiding the first episode when there is another choice.
+                    if ep_idx - 1 >= 1:
+                        ref_idx = ep_idx - 1
+                    elif ep_idx + 1 < len(episodes):
+                        ref_idx = ep_idx + 1
+                    else:
+                        ref_idx = 0 if ep_idx != 0 else 1
                     ref_file, _ = episodes[ref_idx]
                     ref_episode = {
                         "episode": ref_file.name,
@@ -1465,7 +1487,20 @@ class TVServer(ThreadingHTTPServer):
                 job["progress"] = 100
                 self.store.save_job(job)
                 self._record_done_locked(key, job_id, node_id)
-                if isinstance(themes, dict) and any(isinstance(themes.get(p), dict) for p in ("op", "ed", "recap")):
+                found = isinstance(themes, dict) and any(isinstance(themes.get(p), dict) for p in ("op", "ed", "recap"))
+                if not found:
+                    self.empty_fingerprints.add(key)
+                else:
+                    self.empty_fingerprints.discard(key)
+                    # Episodes of this series that found nothing (often because their only reference
+                    # was an unusual episode) get one more try, now with this episode as a reference.
+                    for other in [k for k in self.empty_fingerprints if k[0] == series_name and k not in self.rechecked_fingerprints]:
+                        self.empty_fingerprints.discard(other)
+                        self.rechecked_fingerprints.add(other)
+                        self.episode_state.pop(other, None)
+                        self.store.delete_episode(other)
+                        self.store.log_event("recheck_requested", data={"series": other[0], "episode": other[1]})
+                if found:
                     sync_payload = {
                         "series": series_idx,
                         "seriesName": series_name,
