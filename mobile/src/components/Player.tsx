@@ -561,7 +561,9 @@ function Scrubber({ time, total, skips, onSeek, onScrub }: {
       accessibilityLabel="Playback position"
       accessibilityValue={{ text: `${clock(shown)} of ${clock(total)}` }}
     >
-      <View style={styles.track}>
+      {/* Touches go to the scrubber itself, never its children: the position is measured from
+          whatever view is under the finger, and from the thumb or an opening/ending mark it is wrong. */}
+      <View style={styles.track} pointerEvents="none">
         {total > 0 && skipOrder.map(part => {
           const range = skips[part];
           if (!range) return null;
@@ -569,7 +571,7 @@ function Scrubber({ time, total, skips, onSeek, onScrub }: {
         })}
         <View style={[styles.fill, { width: `${fraction * 100}%` }]} />
       </View>
-      <View style={[styles.thumb, { left: `${fraction * 100}%` }, drag !== null && styles.thumbActive]} />
+      <View pointerEvents="none" style={[styles.thumb, { left: `${fraction * 100}%` }, drag !== null && styles.thumbActive]} />
     </View>
   );
 }
