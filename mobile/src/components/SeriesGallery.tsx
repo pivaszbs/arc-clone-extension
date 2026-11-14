@@ -48,6 +48,8 @@ export function SeriesGallery({ series, progress, width, onOpen, header }: Props
       numColumns={columns}
       keyExtractor={item => item.folder || '_root'}
       ListHeaderComponent={header}
+      // The header brings its own side padding; cancel the list's so both line up with the covers.
+      ListHeaderComponentStyle={styles.header}
       contentContainerStyle={styles.content}
       columnWrapperStyle={styles.row}
       renderItem={({ item }) => {
@@ -79,6 +81,7 @@ export function SeriesGallery({ series, progress, width, onOpen, header }: Props
 const styles = StyleSheet.create({
   content: { paddingHorizontal: space.l, paddingBottom: space.xl, gap: space.m },
   row: { gap: space.m },
+  header: { marginHorizontal: -space.l },
   card: { backgroundColor: colors.surface, borderRadius: radius.medium, overflow: 'hidden' },
   pressed: { opacity: 0.75, transform: [{ scale: 0.98 }] },
   poster: { width: '100%', aspectRatio: 3 / 4, backgroundColor: colors.surfaceRaised },
