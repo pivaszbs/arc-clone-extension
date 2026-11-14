@@ -4,8 +4,6 @@ import { isPictureInPictureSupported, useVideoPlayer, VideoView } from 'expo-vid
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Animated as RNAnimated, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
-import Animated, { Easing, interpolate, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
-import { scheduleOnRN } from 'react-native-worklets';
 import type { TimeRange } from 'react-native-anime-core';
 
 import { clock, cueAt } from '../lib/format';
@@ -92,6 +90,13 @@ export function Player(props: Props) {
     void player.replaceAsync({ uri: episode.videoUri, metadata: { title: episode.label } });
   }, [episode, player]);
 
+  // The latest props, for callbacks that must stay stable (see save below).
+  const propsRef = useRef(props);
+  useEffect(() => { propsRef.current = props; });
+
+  // Stable across renders: it used to depend on `props` (a new object every render), and the effect
+  // below saves whenever `save` changes, which told App about progress, which re-rendered the
+  // player with new props... thousands of renders a second, the whole app frozen.
   const save = useCallback((finished = false) => {
     let position: number;
     let playerDuration: number;
@@ -103,8 +108,8 @@ export function Player(props: Props) {
     const total = playerDuration || duration;
     saveProgress(episode.key, { position, duration: total, watchedAt: Date.now(), finished: finished || (total > 0 && position >= total - 5) });
     lastSaved.current = Date.now();
-    props.onProgress?.();
-  }, [player, ready, duration, episode.key, props]);
+    propsRef.current.onProgress?.();
+  }, [player, ready, duration, episode.key]);
 
   useEffect(() => () => save(), [save]);
 
@@ -146,7 +151,7 @@ export function Player(props: Props) {
   }, [player]);
   // Hidden controls leave the tree at once (Reanimated's opacity and exit animations left them on
   // screen here); showing them fades in with React Native's own Animated on the native driver.
-  const controlsFade = useRef(new RNAnimated.Value(1)).current;
+  const [controlsFade] = useState(() => new RNAnimated.Value(1));
   useEffect(() => {
     if (!controls) return;
     controlsFade.setValue(0);
@@ -282,44 +287,45 @@ export function Player(props: Props) {
   const videoView = useRef<VideoView>(null);
   // Split View / Slide Over: a narrow window keeps only the essential controls.
   const narrow = width < 560;
-  const reduced = useReducedMotion();
-  const dragY = useSharedValue(0);
+  // React Native's own Animated (native driver) rather than Reanimated: with the player inside a
+  // Reanimated view, React's updates to the controls stopped reaching the screen.
+  const [dragY] = useState(() => new RNAnimated.Value(0));
   const dismiss = useCallback(() => {
     haptics.tap();
     props.onToggleFullscreen(false);
     // With PiP on, the player stays mounted (hidden); put it back in place for when it returns.
-    setTimeout(() => dragY.set(0), 300);
+    setTimeout(() => dragY.setValue(0), 300);
   }, [props, dragY]);
   const swipeDown = usePanGesture({
     enabled: fullscreen,
+    runOnJS: true,
     activeOffsetY: 18,
     failOffsetX: [-24, 24],
     onUpdate: event => {
-      'worklet';
-      dragY.set(Math.max(0, event.translationY));
+      dragY.setValue(Math.max(0, event.translationY));
     },
     onDeactivate: event => {
-      'worklet';
       if (event.translationY > 140 || (event.velocityY > 900 && event.translationY > 40)) {
-        dragY.set(withTiming(screenHeight, { duration: 220, easing: Easing.bezier(0.23, 1, 0.32, 1) }));
-        scheduleOnRN(dismiss);
+        RNAnimated.timing(dragY, { toValue: screenHeight, duration: 220, useNativeDriver: true }).start();
+        dismiss();
       } else {
-        dragY.set(withSpring(0, { duration: 400, dampingRatio: 0.8, velocity: event.velocityY }));
+        RNAnimated.spring(dragY, { toValue: 0, velocity: event.velocityY / 1000, bounciness: 4, useNativeDriver: true }).start();
       }
     },
   });
-  const dragStyle = useAnimatedStyle(() => {
-    const y = dragY.get();
-    return {
-      borderRadius: interpolate(y, [0, 200], [0, 24], 'clamp'),
-      opacity: reduced ? interpolate(y, [0, 300], [1, 0.4], 'clamp') : 1,
-      transform: reduced ? [] : [{ translateY: y }, { scale: interpolate(y, [0, 400], [1, 0.82], 'clamp') }],
-    };
-  });
+  const dragStyle = {
+    transform: [
+      { translateY: dragY },
+      { scale: dragY.interpolate({ inputRange: [0, 400], outputRange: [1, 0.82], extrapolate: 'clamp' }) },
+    ],
+  };
 
   return (
     <GestureDetector gesture={swipeDown}>
-    <Animated.View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline, dragStyle]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
+    <RNAnimated.View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline, dragStyle]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
+      {/* The video gets a wrapper of its own: with PiP the native view adds layers to its parent,
+          and the overlays below must not share that parent or removed ones stay on screen. */}
+      <View style={StyleSheet.absoluteFill} pointerEvents="none" collapsable={false}>
       <VideoView
         ref={videoView}
         player={player}
@@ -332,6 +338,7 @@ export function Player(props: Props) {
         onPictureInPictureStart={() => props.onPictureInPictureChange?.(true, true)}
         onPictureInPictureStop={() => props.onPictureInPictureChange?.(false, isPlaying(player))}
       />
+      </View>
       <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to show or hide the controls, double-tap a side to skip 10 seconds." />
 
       {!ready && <ActivityIndicator style={styles.center} color={colors.text} size="large" />}
@@ -428,7 +435,7 @@ export function Player(props: Props) {
           </Glass>
         </RNAnimated.View>
       )}
-    </Animated.View>
+    </RNAnimated.View>
     </GestureDetector>
   );
 }
