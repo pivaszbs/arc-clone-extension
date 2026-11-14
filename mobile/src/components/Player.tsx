@@ -133,11 +133,22 @@ export function Player(props: Props) {
 
   // ----- Controls visibility -----
 
+  // Hide the controls 3 s after the last touch while the episode plays. Both the reported playing
+  // state and the player itself count, so one missed event can't keep the controls up for good.
+  const playingRef = useRef(false);
+  useEffect(() => { playingRef.current = playing; }, [playing]);
   const poke = useCallback(() => {
     setControls(true);
     clearTimeout(hideTimer.current);
-    hideTimer.current = setTimeout(() => { if (isPlaying(player)) setControls(false); }, HIDE_AFTER_MS);
+    hideTimer.current = setTimeout(() => {
+      if (playingRef.current || isPlaying(player)) setControls(false);
+    }, HIDE_AFTER_MS);
   }, [player]);
+  const controlsOpacity = useSharedValue(1);
+  useEffect(() => {
+    controlsOpacity.set(withTiming(controls ? 1 : 0, { duration: controls ? 150 : 250, easing: Easing.bezier(0.23, 1, 0.32, 1) }));
+  }, [controls, controlsOpacity]);
+  const controlsStyle = useAnimatedStyle(() => ({ opacity: controlsOpacity.get() }));
 
   // Timers must not outlive the player: reading a released player throws and closes the app.
   useEffect(() => () => {
@@ -345,8 +356,8 @@ export function Player(props: Props) {
         ) : null}
       </View>
 
-      {controls && started && (
-        <View pointerEvents="box-none" style={[styles.barArea, fullscreen && styles.barAreaFullscreen]}>
+      {started && (
+        <Animated.View pointerEvents={controls ? 'box-none' : 'none'} style={[styles.barArea, fullscreen && styles.barAreaFullscreen, controlsStyle]}>
           <Glass style={styles.bar}>
             <Scrubber time={time} total={total} skips={study.skips} onSeek={(t) => { seekTo(t); poke(); }} />
             <View style={styles.row}>
@@ -377,7 +388,7 @@ export function Player(props: Props) {
               />
             </View>
           </Glass>
-        </View>
+        </Animated.View>
       )}
     </Animated.View>
     </GestureDetector>
