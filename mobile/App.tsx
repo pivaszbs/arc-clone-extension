@@ -290,7 +290,16 @@ function Study() {
 
   // Like the TV app: a wall of covers, then one series, then the episode on the whole screen.
   const series = library.find(item => item.folder === folder);
-  const episode = series?.episodes.find(item => item.key === episodeKey);
+  const listedEpisode = series?.episodes.find(item => item.key === episodeKey);
+  // A downloaded episode plays from this device even while browsing the Mac's library.
+  // Keyed by identity, not object: a catalog refresh mustn't hand the player a "new" episode and restart it.
+  const seriesFolder = series?.folder;
+  const episodeIdentity = listedEpisode ? `${listedEpisode.key}\n${listedEpisode.videoUri}\n${listedEpisode.subtitleUri ?? ''}` : '';
+  const episode = useMemo(
+    () => (seriesFolder !== undefined && listedEpisode ? episodeDownloads.local(seriesFolder, listedEpisode) : listedEpisode),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [seriesFolder, episodeIdentity],
+  );
   const fullscreen = !!episode && !tvControlling;
   const index = series && episode ? series.episodes.indexOf(episode) : -1;
   const neighbours = useMemo(

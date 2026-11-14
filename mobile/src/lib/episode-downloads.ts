@@ -61,6 +61,21 @@ class EpisodeDownloads {
     } catch { return false; }
   }
 
+  /**
+   * The episode as it is stored on this device, when it was downloaded: plays the local file (and
+   * its subtitles) instead of streaming from the Mac. Same key, so progress still syncs.
+   */
+  local(folder: string, episode: Episode): Episode {
+    try {
+      const dir = new Directory(Paths.document, safeName(folder));
+      const video = new File(dir, safeName(episode.video));
+      if (!video.exists) return episode;
+      const stem = safeName(episode.video).replace(/\.[^.]+$/, '');
+      const subtitle = ['.ass', '.ssa', '.srt', '.vtt'].map(ext => new File(dir, stem + ext)).find(file => file.exists);
+      return { ...episode, videoUri: video.uri, subtitleUri: subtitle?.uri ?? episode.subtitleUri };
+    } catch { return episode; }
+  }
+
   /** Queue episodes of a Mac series that aren't on this device yet. */
   download(series: Series, episodes: Episode[]) {
     for (const episode of episodes) {
