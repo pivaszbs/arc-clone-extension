@@ -2,7 +2,7 @@ import { useEventListener } from 'expo';
 import { SymbolView } from 'expo-symbols';
 import { isPictureInPictureSupported, useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
+import { ActivityIndicator, Animated as RNAnimated, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
 import Animated, { Easing, interpolate, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
 import { scheduleOnRN } from 'react-native-worklets';
@@ -144,11 +144,14 @@ export function Player(props: Props) {
       if (playingRef.current || isPlaying(player)) setControls(false);
     }, HIDE_AFTER_MS);
   }, [player]);
-  const controlsOpacity = useSharedValue(1);
+  // Hidden controls leave the tree at once (Reanimated's opacity and exit animations left them on
+  // screen here); showing them fades in with React Native's own Animated on the native driver.
+  const controlsFade = useRef(new RNAnimated.Value(1)).current;
   useEffect(() => {
-    controlsOpacity.set(withTiming(controls ? 1 : 0, { duration: controls ? 150 : 250, easing: Easing.bezier(0.23, 1, 0.32, 1) }));
-  }, [controls, controlsOpacity]);
-  const controlsStyle = useAnimatedStyle(() => ({ opacity: controlsOpacity.get() }));
+    if (!controls) return;
+    controlsFade.setValue(0);
+    RNAnimated.timing(controlsFade, { toValue: 1, duration: 150, useNativeDriver: true }).start();
+  }, [controls, controlsFade]);
 
   // Timers must not outlive the player: reading a released player throws and closes the app.
   useEffect(() => () => {
@@ -346,9 +349,9 @@ export function Player(props: Props) {
         </View>
       )}
 
-      {started && ready && (
+      {started && ready && controls && (
         // Like the TV: a big round play/pause in the middle, skip buttons beside it. Fades with the bar.
-        <Animated.View pointerEvents={controls ? 'box-none' : 'none'} style={[styles.centerControls, controlsStyle]}>
+        <RNAnimated.View pointerEvents="box-none" style={[styles.centerControls, { opacity: controlsFade }]}>
           <Pressable accessibilityRole="button" accessibilityLabel="Back 10 seconds" onPress={() => seekBy(-SKIP_SECONDS, 'left')} hitSlop={12}>
             {({ pressed }) => (
               <Glass round={34} style={[styles.sideCircle, pressed && styles.circlePressed]}>
@@ -370,7 +373,7 @@ export function Player(props: Props) {
               </Glass>
             )}
           </Pressable>
-        </Animated.View>
+        </RNAnimated.View>
       )}
 
       {showBigPlay && (
@@ -391,8 +394,8 @@ export function Player(props: Props) {
         ) : null}
       </View>
 
-      {started && (
-        <Animated.View pointerEvents={controls ? 'box-none' : 'none'} style={[styles.barArea, fullscreen && styles.barAreaFullscreen, controlsStyle]}>
+      {started && controls && (
+        <RNAnimated.View pointerEvents="box-none" style={[styles.barArea, fullscreen && styles.barAreaFullscreen, { opacity: controlsFade }]}>
           <Glass style={styles.bar}>
             <Scrubber time={time} total={total} skips={study.skips} onSeek={(t) => { seekTo(t); poke(); }} />
             <View style={styles.row}>
@@ -423,7 +426,7 @@ export function Player(props: Props) {
               />
             </View>
           </Glass>
-        </Animated.View>
+        </RNAnimated.View>
       )}
     </Animated.View>
     </GestureDetector>
