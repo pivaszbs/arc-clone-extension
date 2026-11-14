@@ -22,7 +22,8 @@ type Props = {
   autoPlay?: boolean;
   autoSkip: boolean;
   subtitlesOn: boolean;
-  onToggleFullscreen: (value?: boolean) => void;
+  /** `swiped`: closed by the swipe down, which already animated the player away. */
+  onToggleFullscreen: (value?: boolean, swiped?: boolean) => void;
   onToggleSubtitles: () => void;
   onStep?: (direction: -1 | 1, autoplay: boolean) => void;
   hasPrevious: boolean;
@@ -292,7 +293,7 @@ export function Player(props: Props) {
   const [dragY] = useState(() => new RNAnimated.Value(0));
   const dismiss = useCallback(() => {
     haptics.tap();
-    props.onToggleFullscreen(false);
+    props.onToggleFullscreen(false, true);
     // With PiP on, the player stays mounted (hidden); put it back in place for when it returns.
     setTimeout(() => dragY.setValue(0), 300);
   }, [props, dragY]);

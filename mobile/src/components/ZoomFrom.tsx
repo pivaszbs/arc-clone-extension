@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useImperativeHandle, useRef, useState, type ReactNode, type Ref } from 'react';
 import { Animated, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 
 /** Where on screen a transition starts: the card or button that was tapped. */
@@ -25,7 +25,12 @@ export function rectOf(target: unknown): Promise<Rect | null> {
  * measuring fails) it fades in. React Native's Animated on the native driver: Reanimated's
  * animations didn't reach the screen in this app.
  */
-export function ZoomFrom({ origin, children, style }: { origin?: Rect | null; children: ReactNode; style?: StyleProp<ViewStyle> }) {
+/** Lets the owner close the screen by shrinking it back into the card it came from. */
+export type ZoomHandle = { collapse(done: () => void): void };
+
+export function ZoomFrom({ origin, children, style, ref }: {
+  origin?: Rect | null; children: ReactNode; style?: StyleProp<ViewStyle>; ref?: Ref<ZoomHandle>;
+}) {
   const frame = useRef<Measurable | null>(null);
   const [progress] = useState(() => new Animated.Value(0));
   const [geometry, setGeometry] = useState({ dx: 0, dy: 0, scale: 1 });
@@ -34,7 +39,7 @@ export function ZoomFrom({ origin, children, style }: { origin?: Rect | null; ch
   const open = (next?: { dx: number; dy: number; scale: number }) => {
     if (next) {
       setGeometry(next);
-      Animated.spring(progress, { toValue: 1, damping: 22, stiffness: 180, mass: 1, useNativeDriver: true }).start();
+      Animated.spring(progress, { toValue: 1, damping: 24, stiffness: 140, mass: 1.1, useNativeDriver: true }).start();
     } else {
       Animated.timing(progress, { toValue: 1, duration: 220, useNativeDriver: true }).start();
     }
@@ -59,13 +64,21 @@ export function ZoomFrom({ origin, children, style }: { origin?: Rect | null; ch
         open({
           dx: origin.x + origin.width / 2 - (x + width / 2),
           dy: origin.y + origin.height / 2 - (y + height / 2),
-          scale: Math.max(0.05, Math.min(1, origin.width / width)),
+          // Start no bigger than the card on either side, so a wide card still visibly grows.
+          scale: Math.max(0.05, Math.min(1, origin.width / width, origin.height / height)),
         });
       } else {
         open();
       }
     });
   };
+
+  useImperativeHandle(ref, () => ({
+    collapse(done) {
+      // Back into the card it came from (or a fade when it didn't come from one).
+      Animated.timing(progress, { toValue: 0, duration: 280, useNativeDriver: true }).start(() => done());
+    },
+  }), [progress]);
 
   const animated = {
     opacity: progress.interpolate({ inputRange: [0, 0.2, 1], outputRange: [0, 1, 1], extrapolate: 'clamp' as const }),

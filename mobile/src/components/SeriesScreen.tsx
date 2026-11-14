@@ -19,7 +19,8 @@ type Props = {
   width: number;
   autoSkip: boolean;
   onAutoSkip: (value: boolean) => void;
-  onBack: () => void;
+  /** `swiped`: the edge swipe already slid the screen away. */
+  onBack: (swiped?: boolean) => void;
   /** `from` is the tapped card or button, so the player can grow out of it. */
   onPlay: (episode: Episode, from: Rect | null) => void;
   onToggleWatched: (episode: Episode) => void;
@@ -114,7 +115,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
       if (event.translationX > 110 || (event.velocityX > 700 && event.translationX > 30)) {
         Animated.timing(dragX, { toValue: width, duration: 220, useNativeDriver: true }).start();
         haptics.tap();
-        onBack();
+        onBack(true);
       } else {
         Animated.spring(dragX, { toValue: 0, velocity: event.velocityX / 1000, bounciness: 4, useNativeDriver: true }).start();
       }

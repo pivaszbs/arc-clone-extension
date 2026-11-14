@@ -10,7 +10,7 @@ import { PipelinesView, type ImportPipelineState, type LocalScanState } from './
 import { Player } from './src/components/Player';
 import { SeriesGallery } from './src/components/SeriesGallery';
 import { SeriesScreen } from './src/components/SeriesScreen';
-import { ZoomFrom, type Rect } from './src/components/ZoomFrom';
+import { ZoomFrom, type Rect, type ZoomHandle } from './src/components/ZoomFrom';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
 import { StatusDot, TabBar, type Tab } from './src/components/ui';
 import { installCrashLog } from './src/lib/crash-log';
@@ -324,6 +324,8 @@ function Study() {
   // Where the tapped cover / card was, so the series screen and the player grow out of it.
   const [seriesOrigin, setSeriesOrigin] = useState<Rect | null>(null);
   const [playerOrigin, setPlayerOrigin] = useState<Rect | null>(null);
+  const playerZoom = useRef<ZoomHandle>(null);
+  const seriesZoom = useRef<ZoomHandle>(null);
   const [playerHidden, setPlayerHidden] = useState(false);
   const fullscreen = !!episode && !tvControlling && !playerHidden;
   // By key: the playing episode may be the downloaded copy, a different object than the listed one.
@@ -528,7 +530,7 @@ function Study() {
   const closePlayer = () => { setEpisodeKey(null); setPlayerHidden(false); setPipActive(false); };
   const fullscreenPlayer = episode && !tvControlling && (
     <View style={fullscreen && mode === 'watch' ? StyleSheet.absoluteFill : styles.pipHost} pointerEvents={fullscreen && mode === 'watch' ? 'auto' : 'none'}>
-      <ZoomFrom origin={playerOrigin} style={{ backgroundColor: '#000' }}>
+      <ZoomFrom ref={playerZoom} origin={playerOrigin} style={{ backgroundColor: '#000' }}>
       <Player
         episode={episode}
         neighbours={neighbours}
@@ -537,10 +539,12 @@ function Study() {
         autoSkip={settings.autoSkip}
         subtitlesOn={settings.subtitles}
         // The exit button goes back to the series; a double tap in the middle does nothing here.
-        onToggleFullscreen={value => {
+        onToggleFullscreen={(value, swiped) => {
           if (value !== false) return;
           if (pipActive) setPlayerHidden(true);
-          else closePlayer();
+          // The exit button shrinks the player back into its card; a swipe down already moved it away.
+          else if (swiped || !playerZoom.current) closePlayer();
+          else playerZoom.current.collapse(closePlayer);
         }}
         onPictureInPictureChange={(active, stillPlaying) => {
           setPipActive(active);
@@ -636,7 +640,12 @@ function Study() {
       width={width}
       autoSkip={settings.autoSkip}
       onAutoSkip={value => updateSettings({ autoSkip: value })}
-      onBack={() => { setFolder(null); setEpisodeKey(null); }}
+      onBack={swiped => {
+        const back = () => { setFolder(null); setEpisodeKey(null); };
+        // "All titles" shrinks the screen back into its cover; the edge swipe already slid it away.
+        if (swiped || !seriesZoom.current) back();
+        else seriesZoom.current.collapse(back);
+      }}
       onPlay={selectEpisode}
       onToggleWatched={ep => toggleEpisodeWatched(ep, series)}
       fromMac={source === 'server'}
@@ -669,7 +678,7 @@ function Study() {
           <View style={{ flex: 1, backgroundColor: '#000' }} />
         ) : seriesScreen ? (
           // Stays mounted under the player, so the player opens over it and closing finds it as it was.
-          <View style={{ flex: 1 }}>{header}<ZoomFrom origin={seriesOrigin}>{seriesScreen}</ZoomFrom></View>
+          <View style={{ flex: 1 }}>{header}<ZoomFrom ref={seriesZoom} origin={seriesOrigin}>{seriesScreen}</ZoomFrom></View>
         ) : library.length ? (
           <View style={{ flex: 1 }}>
             <SeriesGallery
