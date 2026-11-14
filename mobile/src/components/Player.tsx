@@ -1,6 +1,6 @@
 import { useEventListener } from 'expo';
 import { SymbolView } from 'expo-symbols';
-import { useVideoPlayer, VideoView } from 'expo-video';
+import { isPictureInPictureSupported, useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
@@ -30,7 +30,11 @@ type Props = {
   hasPrevious: boolean;
   hasNext: boolean;
   onProgress?: () => void;
+  /** PiP started or stopped; `stillPlaying` tells a restore (playing) from closing the window (paused). */
+  onPictureInPictureChange?: (active: boolean, stillPlaying: boolean) => void;
 };
+
+const pipSupported = (() => { try { return isPictureInPictureSupported(); } catch { return false; } })();
 
 const DOUBLE_TAP_MS = 280;
 
@@ -253,12 +257,17 @@ export function Player(props: Props) {
   // Swipe down to leave fullscreen: the video follows the finger, shrinks and rounds its corners,
   // then either closes (far enough or flicked) or springs back.
   const { height: screenHeight } = useWindowDimensions();
+  const videoView = useRef<VideoView>(null);
+  // Split View / Slide Over: a narrow window keeps only the essential controls.
+  const narrow = width < 560;
   const reduced = useReducedMotion();
   const dragY = useSharedValue(0);
   const dismiss = useCallback(() => {
     haptics.tap();
     props.onToggleFullscreen(false);
-  }, [props]);
+    // With PiP on, the player stays mounted (hidden); put it back in place for when it returns.
+    setTimeout(() => dragY.set(0), 300);
+  }, [props, dragY]);
   const swipeDown = usePanGesture({
     enabled: fullscreen,
     activeOffsetY: 18,
@@ -289,7 +298,18 @@ export function Player(props: Props) {
   return (
     <GestureDetector gesture={swipeDown}>
     <Animated.View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline, dragStyle]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
-      <VideoView player={player} style={StyleSheet.absoluteFill} nativeControls={false} contentFit="contain" allowsPictureInPicture />
+      <VideoView
+        ref={videoView}
+        player={player}
+        style={StyleSheet.absoluteFill}
+        nativeControls={false}
+        contentFit="contain"
+        allowsPictureInPicture
+        // Going home while an episode plays keeps it on screen in a floating window.
+        startsPictureInPictureAutomatically
+        onPictureInPictureStart={() => props.onPictureInPictureChange?.(true, true)}
+        onPictureInPictureStop={() => props.onPictureInPictureChange?.(false, isPlaying(player))}
+      />
       <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to play or pause, double-tap a side to skip 10 seconds." />
 
       {!ready && <ActivityIndicator style={styles.center} color={colors.text} size="large" />}
@@ -330,12 +350,19 @@ export function Player(props: Props) {
           <Glass style={styles.bar}>
             <Scrubber time={time} total={total} skips={study.skips} onSeek={(t) => { seekTo(t); poke(); }} />
             <View style={styles.row}>
-              <IconButton name="backward.end.fill" label="Previous episode" size={18} disabled={!props.hasPrevious} onPress={() => { haptics.select(); props.onStep?.(-1, playing); }} />
+              {!narrow && <IconButton name="backward.end.fill" label="Previous episode" size={18} disabled={!props.hasPrevious} onPress={() => { haptics.select(); props.onStep?.(-1, playing); }} />}
               <IconButton name="gobackward.10" label="Back 10 seconds" onPress={() => seekBy(-SKIP_SECONDS, 'left')} />
               <IconButton name={playing ? 'pause.fill' : 'play.fill'} label={playing ? 'Pause' : 'Play'} size={26} onPress={togglePlay} />
               <IconButton name="goforward.10" label="Forward 10 seconds" onPress={() => seekBy(SKIP_SECONDS, 'right')} />
-              <IconButton name="forward.end.fill" label="Next episode" size={18} disabled={!props.hasNext} onPress={() => { haptics.select(); props.onStep?.(1, playing); }} />
-              <Text style={styles.time} numberOfLines={1}>{clock(time)} / {clock(total)}</Text>
+              {!narrow && <IconButton name="forward.end.fill" label="Next episode" size={18} disabled={!props.hasNext} onPress={() => { haptics.select(); props.onStep?.(1, playing); }} />}
+              <Text style={styles.time} numberOfLines={1}>{narrow ? clock(time) : `${clock(time)} / ${clock(total)}`}</Text>
+              {pipSupported && (
+                <IconButton
+                  name="pip.enter"
+                  label="Picture in Picture"
+                  onPress={() => { haptics.select(); void videoView.current?.startPictureInPicture().catch(() => {}); poke(); }}
+                />
+              )}
               <IconButton
                 name={subtitlesOn ? 'captions.bubble.fill' : 'captions.bubble'}
                 label={subtitlesOn ? 'Hide subtitles' : 'Show subtitles'}
@@ -411,7 +438,7 @@ const styles = StyleSheet.create({
   subtitleLarge: { fontSize: 28, lineHeight: 38 },
   skipArea: { position: 'absolute', right: space.l, alignItems: 'flex-end' },
   barArea: { position: 'absolute', left: space.s, right: space.s, bottom: space.s },
-  barAreaFullscreen: { left: space.xl * 2, right: space.xl * 2, bottom: space.xl },
+  barAreaFullscreen: { left: space.l, right: space.l, bottom: space.xl },
   bar: { paddingHorizontal: space.s, paddingTop: space.s },
   row: { flexDirection: 'row', alignItems: 'center' },
   time: { flex: 1, color: colors.textSecondary, fontVariant: ['tabular-nums'], fontSize: 13, textAlign: 'right', marginRight: space.s },
