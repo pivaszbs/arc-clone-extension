@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
   import JapaneseStudy from './JapaneseStudy.svelte';
+  import MacServerCard from './MacServerCard.svelte';
   import SeriesDownloads from './SeriesDownloads.svelte';
   import { detectAnimeOpEdIntervals, parseCaptionResponse } from './captions';
   import { castEpisode, findCastDevices, openSafariAirPlay, stopDirectCast, stopSafariAirPlay, updateSafariAirPlay, type CastDevice, type CastSession } from './direct-cast';
@@ -1670,6 +1671,7 @@
     {/if}
   </div>
   <div class="pipelines-dashboard" aria-label="Realtime pipelines">
+    <MacServerCard visible={activeScreen === 'pipelines'} />
     <div class="pipeline-card">
       <div class="pipeline-head">
         <strong>{parallelJobs.length ? `Parallel Scan Jobs (${parallelJobs.length})` : 'Frame Scan Pipeline'}</strong>

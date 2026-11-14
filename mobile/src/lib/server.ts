@@ -85,6 +85,7 @@ export async function fetchRemoteCatalog(baseUrl: string): Promise<{
         folder: item.title,
         title: title || item.title,
         credit,
+        poster: item.poster ? `${url}${item.poster}` : undefined,
         episodes,
       };
     });

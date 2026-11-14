@@ -1,12 +1,17 @@
-import { useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
+import { useEffect, useState } from 'react';
+import { RefreshControl, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 
+import {
+  ago, clock, episodeLabel, fetchServerStatus, headline, nodeLine, nodeTone, routeLabel, seriesLabel,
+  type ServerStatus,
+} from '../../../shared/sync/server-status';
 import { haptics } from '../lib/haptics';
 import type { Series } from '../lib/library';
 import type { PipelineEvent, ScanProgressInfo, TvHttpStatus, TvWsState, WorkerStatusPayload } from '../lib/tv-sync';
 import { DEFAULT_TV_SERVER_URL } from '../lib/tv-sync';
 import type { PhoneWorkerState } from '../lib/worker-node';
-import { colors, radius, space } from '../theme';
+import { colors, radius, space, status as statusColors, type } from '../theme';
+import { Button, ProgressBar, Row, Section, Stat, StatusDot } from './ui';
 
 export type LocalScanState = {
   status: 'idle' | 'scanning' | 'ready' | 'error';
@@ -22,6 +27,7 @@ export type ImportPipelineState = {
 };
 
 type Props = {
+  serverUrl: string;
   serverDraft: string;
   onChangeServerDraft: (value: string) => void;
   onApplyServerUrl: (url: string) => void;
@@ -47,441 +53,332 @@ type Props = {
   onRetryQuarantined: (target: { seriesName: string; episode: string } | { all: true }) => void;
 };
 
-export function PipelinesView({
-  serverDraft,
-  onChangeServerDraft,
-  onApplyServerUrl,
-  onFetchCatalog,
-  wsState,
-  httpStatus,
-  serverError,
-  tvAutoplay,
-  onToggleTvAutoplay,
-  scanProgress,
-  localScan,
-  onRescanLocal,
-  importState,
-  onImportFolder,
-  onImportFiles,
-  coverageSeries,
-  pipelineEvents,
-  onClearEvents,
-  workerStatus,
-  phoneWorker,
-  onTogglePhoneWorker,
-  onRefreshWorkerStatus,
-  onRetryQuarantined,
-}: Props) {
-  const [expandedSeries, setExpandedSeries] = useState<Record<string, boolean>>({});
+const REFRESH_MS = 5000;
+const EVENTS_SHOWN = 6;
 
-  const wsBadgeColor =
-    wsState === 'connected' ? '#34d399' : wsState === 'connecting' ? colors.accent : '#f87171';
-  const httpBadgeColor =
-    httpStatus.state === 'ok' ? '#34d399' : httpStatus.state === 'checking' ? colors.accent : httpStatus.state === 'error' ? '#f87171' : colors.textTertiary;
-  const httpLabel =
-    httpStatus.state === 'ok'
-      ? `HTTP ${httpStatus.statusCode ?? 200}`
-      : httpStatus.state === 'checking'
-        ? 'HTTP checking'
-        : httpStatus.state === 'error'
-          ? (httpStatus.error || 'HTTP error')
-          : 'HTTP idle';
+function phoneWorkerLine(worker: PhoneWorkerState) {
+  if (!worker.running) return 'Off. Turn on to detect openings and endings on this device.';
+  if (worker.currentEpisode) return `${episodeLabel(worker.currentEpisode)} · ${worker.progress}%`;
+  if (worker.waitReason && worker.waitReason !== 'nothing to do') return `Waiting · ${worker.waitReason}`;
+  return 'On · nothing to do right now';
+}
 
-  const totalEpisodes = coverageSeries.reduce((sum, s) => sum + s.episodes.length, 0);
-  const readyEpisodes = coverageSeries.reduce(
-    (sum, s) => sum + s.episodes.filter(ep => !!(ep.frames.op || ep.frames.ed || ep.frames.recap)).length,
-    0,
-  );
-  const scanFraction = scanProgress && scanProgress.total > 0 ? Math.min(1, scanProgress.done / scanProgress.total) : 0;
+/** The Server tab: what the Mac, its workers and every synced device are doing. */
+export function PipelinesView(props: Props) {
+  const {
+    serverUrl, serverDraft, onChangeServerDraft, onApplyServerUrl, onFetchCatalog, wsState, httpStatus, serverError,
+    tvAutoplay, onToggleTvAutoplay, localScan, onRescanLocal, importState, onImportFolder, onImportFiles,
+    coverageSeries, pipelineEvents, onClearEvents, workerStatus, phoneWorker, onTogglePhoneWorker,
+    onRefreshWorkerStatus, onRetryQuarantined,
+  } = props;
+  const [server, setServer] = useState<ServerStatus | null>(null);
+  const [reachable, setReachable] = useState(httpStatus.state !== 'error');
+  const [refreshing, setRefreshing] = useState(false);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [allEvents, setAllEvents] = useState(false);
+  const [editingAddress, setEditingAddress] = useState(false);
+
+  // Refreshes only while this tab is open; the component unmounts when you leave it.
+  useEffect(() => {
+    let stopped = false;
+    const load = async () => {
+      try {
+        const next = await fetchServerStatus(serverUrl);
+        if (stopped) return;
+        setServer(next);
+        setReachable(true);
+      } catch {
+        if (!stopped) setReachable(false);
+      }
+    };
+    void load();
+    const timer = setInterval(() => { void load(); }, REFRESH_MS);
+    return () => { stopped = true; clearInterval(timer); };
+  }, [serverUrl]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    onFetchCatalog();
+    onRefreshWorkerStatus();
+    try {
+      setServer(await fetchServerStatus(serverUrl));
+      setReachable(true);
+    } catch {
+      setReachable(false);
+    }
+    setRefreshing(false);
+  };
+
+  const top = headline(server, reachable);
+  const live = wsState === 'connected';
+  const route = routeLabel(serverUrl, server);
+  const host = serverUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+
+  // Older servers have no status.json: fall back to what the app already knows.
+  const nodes = server?.workers.nodes ?? workerStatus?.nodes ?? [];
+  const jobs = (server?.workers.jobs ?? workerStatus?.jobs ?? []).filter(job => job.status !== 'completed' && job.status !== 'failed');
+  const counts = server?.workers.counts ?? workerStatus?.counts;
+  const quarantined = server?.workers.quarantinedEpisodes ?? workerStatus?.quarantinedEpisodes ?? [];
+  const localReady = coverageSeries.reduce((sum, s) => sum + s.episodes.filter(ep => !!(ep.frames.op || ep.frames.ed || ep.frames.recap)).length, 0);
+  const localTotal = coverageSeries.reduce((sum, s) => sum + s.episodes.length, 0);
+  const ready = server?.library.withTimings ?? localReady;
+  const total = server?.library.episodes ?? localTotal;
+  const perSeries = server?.library.perSeries
+    ?? coverageSeries.map(s => ({ folder: s.folder, title: s.title, episodes: s.episodes.length, withTimings: s.episodes.filter(ep => !!(ep.frames.op || ep.frames.ed || ep.frames.recap)).length }));
+  const events = allEvents ? pipelineEvents : pipelineEvents.slice(0, EVENTS_SHOWN);
 
   return (
-    <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.label}>Mac TV Companion</Text>
-          <View style={styles.pillsRow}>
-            <View style={styles.pill}>
-              <View style={[styles.dot, { backgroundColor: wsBadgeColor }]} />
-              <Text style={styles.pillText}>WS: {wsState}</Text>
-            </View>
-            <View style={styles.pill}>
-              <View style={[styles.dot, { backgroundColor: httpBadgeColor }]} />
-              <Text style={styles.pillText} numberOfLines={1}>{httpLabel}</Text>
-            </View>
+    <ScrollView
+      style={styles.scroll}
+      contentContainerStyle={styles.content}
+      keyboardShouldPersistTaps="handled"
+      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { void refresh(); }} tintColor={colors.textSecondary} />}
+    >
+      <View style={styles.summary}>
+        <View style={styles.summaryTop}>
+          <StatusDot tone={top.tone} size={10} />
+          <View style={{ flex: 1, gap: 2 }}>
+            <Text style={type.title}>{top.title}</Text>
+            <Text style={type.subhead}>{top.detail}</Text>
           </View>
         </View>
-        <TextInput
-          value={serverDraft}
-          onChangeText={onChangeServerDraft}
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-          placeholder={DEFAULT_TV_SERVER_URL}
-          placeholderTextColor={colors.textTertiary}
-          style={styles.input}
-          onSubmitEditing={() => onApplyServerUrl(serverDraft)}
+        <View style={styles.stats}>
+          <Stat value={total ? `${ready}/${total}` : '–'} label="Episodes ready" />
+          <Stat value={counts ? String(counts.pending + counts.inProgress) : '–'} label="In queue" tone={quarantined.length ? 'danger' : undefined} />
+          <Stat value={server ? String(server.devices.length) : '–'} label="Devices synced" />
+        </View>
+        {total > 0 && <ProgressBar value={ready / total} tone={ready === total ? 'ok' : 'accent'} />}
+      </View>
+
+      {quarantined.length > 0 && (
+        <Section
+          title="Needs attention"
+          action={quarantined.length > 1 ? <Button variant="plain" title="Retry all" onPress={() => onRetryQuarantined({ all: true })} /> : undefined}
+        >
+          {quarantined.map((item, index) => (
+            <Row
+              key={`${item.seriesName}/${item.episode}`}
+              first={index === 0}
+              tone="danger"
+              title={`${seriesLabel(item.seriesName)} · ${episodeLabel(item.episode)}`}
+              detail={`Failed ${item.attempts} time${item.attempts === 1 ? '' : 's'}${item.error ? ` · ${item.error}` : ''}`}
+              right={<Button variant="danger" title="Retry" onPress={() => onRetryQuarantined({ seriesName: item.seriesName, episode: item.episode })} />}
+            />
+          ))}
+        </Section>
+      )}
+
+      <Section title="Now">
+        <Row
+          first
+          icon="tv"
+          tone={server?.tv.active ? 'ok' : 'idle'}
+          title={server?.tv.active ? `${server.tv.seriesLabel ?? 'TV'} · ${server.tv.episodeLabel ?? ''}` : 'TV is idle'}
+          detail={server?.tv.active
+            ? `${server.tv.paused ? 'Paused' : 'Playing'} at ${clock(server.tv.position)}${server.tv.duration ? ` of ${clock(server.tv.duration)}` : ''}`
+            : server ? null : 'Shown when the Mac server is updated'}
         />
-        <View style={styles.buttonRow}>
-          <Pressable onPress={() => { haptics.select(); onApplyServerUrl(serverDraft); }} style={styles.primaryBtn}>
-            <Text style={styles.primaryBtnText}>Save & Reconnect</Text>
-          </Pressable>
-          <Pressable onPress={() => { haptics.select(); onApplyServerUrl(DEFAULT_TV_SERVER_URL); }} style={styles.secondaryBtn}>
-            <Text style={styles.secondaryBtnText}>Reset Default</Text>
-          </Pressable>
-          <Pressable onPress={() => { haptics.select(); onFetchCatalog(); }} style={styles.secondaryBtn}>
-            <Text style={styles.secondaryBtnText}>Fetch Catalog</Text>
-          </Pressable>
-        </View>
-        {!!serverError && <Text style={styles.errorText}>{serverError}</Text>}
-      </View>
-
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.label}>TV Playback</Text>
-          <Text style={styles.meta}>{tvAutoplay ? 'Autoplay On' : 'Autoplay Stopped'}</Text>
-        </View>
-        <View style={styles.switchRow}>
-          <Text style={styles.switchText}>Stop TV autoplay</Text>
-          <Switch
-            value={!tvAutoplay}
-            onValueChange={stop => {
-              haptics.select();
-              onToggleTvAutoplay(!stop);
-            }}
-            trackColor={{ true: colors.accent }}
+        {jobs.map(job => (
+          <Row
+            key={job.jobId}
+            icon="waveform"
+            tone="ok"
+            title={`${seriesLabel(job.seriesName)} · ${episodeLabel(job.episode)}`}
+            detail={`${(job as { kind?: string }).kind === 'probe' ? 'Reading file' : 'Finding opening and ending'}${job.nodeName ? ` on ${job.nodeName}` : ''}`}
+            right={<Text style={styles.percent}>{Math.round(job.progress ?? 0)}%</Text>}
+          >
+            <ProgressBar value={(job.progress ?? 0) / 100} tone="ok" />
+          </Row>
+        ))}
+        {(server?.workers.next.length ?? 0) > 0 && jobs.length === 0 && (
+          <Row
+            icon="clock"
+            title={`Next: ${seriesLabel(server!.workers.next[0].seriesName)} · ${episodeLabel(server!.workers.next[0].episode)}`}
+            detail={counts ? `${counts.pending} waiting${server!.workers.tvBusy ? ' · paused while the TV plays' : ''}` : null}
           />
-        </View>
-      </View>
+        )}
+      </Section>
 
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.label}>Worker Nodes & Queue</Text>
-          <View style={styles.pillsRow}>
-            {workerStatus && (
-              <Text style={styles.meta}>
-                {workerStatus.counts.completed} / {workerStatus.counts.total} done
-              </Text>
-            )}
-            <Pressable onPress={() => { haptics.select(); onRefreshWorkerStatus(); }} hitSlop={8}>
-              <Text style={styles.clearText}>Refresh</Text>
-            </Pressable>
-          </View>
-        </View>
-        <View style={styles.switchRow}>
-          <View style={{ flex: 1, marginRight: space.m }}>
-            <Text style={styles.switchText}>Phone Worker Node</Text>
-            <Text style={styles.workerSub}>
-              {phoneWorker.running
-                ? phoneWorker.currentEpisode
-                  ? `Scanning ${phoneWorker.currentEpisode} (${phoneWorker.progress}%)`
-                  : phoneWorker.waitReason && phoneWorker.waitReason !== 'nothing to do'
-                    ? `Waiting · ${phoneWorker.waitReason}`
-                    : 'Polling coordinator for jobs…'
-                : 'Off · Tap to process OP/ED jobs on this device'}
-            </Text>
-          </View>
-          <Switch
-            value={phoneWorker.running}
-            onValueChange={() => {
-              haptics.select();
-              onTogglePhoneWorker();
-            }}
-            trackColor={{ true: colors.accent }}
+      <Section title="Workers">
+        {nodes.map((node, index) => (
+          <Row
+            key={node.nodeId}
+            first={index === 0}
+            tone={nodeTone(node)}
+            title={node.nodeName}
+            detail={nodeLine(node)}
+            right={<Text style={type.caption}>{node.platform === 'ios' ? 'iPhone' : node.platform === 'mac' ? 'Mac' : node.platform ?? ''}</Text>}
           />
-        </View>
-        {!!phoneWorker.lastError && <Text style={styles.errorText}>{phoneWorker.lastError}</Text>}
-        {workerStatus && (
-          <>
-            <View style={styles.progressTrack}>
-              <View
-                style={[
-                  styles.progressFill,
-                  {
-                    width: `${
-                      workerStatus.counts.total > 0
-                        ? Math.min(100, (workerStatus.counts.completed / workerStatus.counts.total) * 100)
-                        : 0
-                    }%`,
-                  },
-                ]}
-              />
-            </View>
-            <View style={styles.kvRow}>
-              <Text style={styles.kvKey}>Queue</Text>
-              <Text style={styles.kvVal}>
-                {workerStatus.counts.pending} pending · {workerStatus.counts.inProgress} active · {workerStatus.counts.completed} done
-                {(workerStatus.counts.retrying ?? 0) > 0 ? ` · ${workerStatus.counts.retrying} retrying` : ''}
-                {(workerStatus.counts.quarantined ?? workerStatus.counts.failed) > 0
-                  ? ` · ${workerStatus.counts.quarantined ?? workerStatus.counts.failed} need attention`
-                  : ''}
-              </Text>
-            </View>
-            {(workerStatus.quarantinedEpisodes?.length ?? 0) > 0 && (
-              <View style={styles.quarantineBox}>
-                <View style={styles.quarantineHeader}>
-                  <Text style={styles.quarantineTitle}>
-                    Needs attention ({workerStatus.quarantinedEpisodes!.length})
-                  </Text>
-                  {workerStatus.quarantinedEpisodes!.length > 1 && (
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel="Retry all quarantined episodes"
-                      onPress={() => onRetryQuarantined({ all: true })}
-                      hitSlop={8}
-                      style={({ pressed }) => [styles.retryButton, pressed && { opacity: 0.6 }]}
-                    >
-                      <Text style={styles.retryButtonText}>Retry all</Text>
-                    </Pressable>
-                  )}
-                </View>
-                {workerStatus.quarantinedEpisodes!.map(item => (
-                  <View key={`${item.seriesName}/${item.episode}`} style={styles.quarantineRow}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.workerName} numberOfLines={1}>{item.episode}</Text>
-                      <Text style={styles.workerSub} numberOfLines={2}>
-                        {item.seriesName} · failed {item.attempts}×{item.error ? ` · ${item.error}` : ''}
-                      </Text>
-                    </View>
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`Retry ${item.episode}`}
-                      onPress={() => onRetryQuarantined({ seriesName: item.seriesName, episode: item.episode })}
-                      hitSlop={8}
-                      style={({ pressed }) => [styles.retryButton, pressed && { opacity: 0.6 }]}
-                    >
-                      <Text style={styles.retryButtonText}>Retry</Text>
-                    </Pressable>
-                  </View>
-                ))}
-              </View>
-            )}
-            {workerStatus.nodes.length === 0 ? (
-              <Text style={styles.body}>No worker nodes connected yet.</Text>
-            ) : (
-              workerStatus.nodes.map(node => {
-                const nodeColor =
-                  node.status === 'working' ? '#34d399' : node.status === 'idle' ? colors.accent : '#f87171';
-                return (
-                  <View key={node.nodeId} style={styles.workerRow}>
-                    <View style={[styles.dot, { backgroundColor: nodeColor }]} />
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.workerName} numberOfLines={1}>
-                        {node.nodeName} ({node.platform})
-                      </Text>
-                      <Text style={styles.workerSub} numberOfLines={1}>
-                        {node.status === 'working' && node.currentEpisode
-                          ? `${node.currentEpisode} · ${node.progress}%`
-                          : node.status}
-                      </Text>
-                    </View>
-                  </View>
-                );
-              })
-            )}
-          </>
+        ))}
+        {nodes.length === 0 && (
+          <Row first tone="idle" title="No workers connected" detail="Run npm run mac:up on the Mac, or use this device below." />
         )}
-      </View>
+        <Row
+          icon="iphone"
+          tone={phoneWorker.running ? 'ok' : undefined}
+          title="Use this device as a worker"
+          detail={phoneWorkerLine(phoneWorker)}
+          right={(
+            <Switch
+              value={phoneWorker.running}
+              onValueChange={() => { haptics.select(); onTogglePhoneWorker(); }}
+              trackColor={{ true: colors.accent }}
+            />
+          )}
+        >
+          {phoneWorker.running && !!phoneWorker.currentEpisode && <ProgressBar value={phoneWorker.progress / 100} tone="ok" />}
+          {!!phoneWorker.lastError && <Text style={styles.error}>{phoneWorker.lastError}</Text>}
+        </Row>
+      </Section>
 
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.label}>Frame Scan Pipeline</Text>
-          <Text style={styles.meta}>
-            {scanProgress ? `${scanProgress.done} / ${scanProgress.total}` : 'Idle'}
-          </Text>
-        </View>
-        {scanProgress ? (
-          <>
-            <View style={styles.progressTrack}>
-              <View style={[styles.progressFill, { width: `${scanFraction * 100}%` }]} />
-            </View>
-            <Text style={styles.body}>
-              Checking {scanProgress.seriesName || 'Series'} ({scanProgress.done} of {scanProgress.total})
-            </Text>
-          </>
-        ) : (
-          <Text style={styles.body}>No active frame scan reported by Mac server.</Text>
-        )}
-      </View>
+      {server && (
+        <Section title="Devices">
+          {server.devices.map((device, index) => (
+            <Row
+              key={device.node}
+              first={index === 0}
+              icon={device.kind === 'iPhone' ? 'iphone' : device.kind === 'Chrome' ? 'macwindow' : device.kind === 'TV' ? 'tv' : 'desktopcomputer'}
+              title={device.kind}
+              detail={`Synced ${ago(device.secondsAgo)}`}
+              right={<StatusDot tone={device.secondsAgo < 900 ? 'ok' : 'idle'} />}
+            />
+          ))}
+          {server.devices.length === 0 && <Row first tone="idle" title="No device has synced yet" detail="Progress and skip timings sync when a device opens the app." />}
+        </Section>
+      )}
 
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.label}>Local Scan & Import</Text>
-          <Text style={styles.meta}>{localScan.status}</Text>
-        </View>
-        <View style={styles.kvRow}>
-          <Text style={styles.kvKey}>Local Library</Text>
-          <Text style={styles.kvVal}>
-            {localScan.seriesCount} {localScan.seriesCount === 1 ? 'series' : 'series'} · {localScan.episodeCount} episodes
-            {localScan.lastScannedAt ? ` (${localScan.lastScannedAt})` : ''}
-          </Text>
-        </View>
-        <View style={styles.kvRow}>
-          <Text style={styles.kvKey}>Skip Detection</Text>
-          <Text style={styles.kvVal}>
-            {readyEpisodes} / {totalEpisodes} episodes with OP/ED/Recap timings
-          </Text>
-        </View>
-        <View style={styles.kvRow}>
-          <Text style={styles.kvKey}>Import Pipeline</Text>
-          <Text style={styles.kvVal}>
-            {importState.status === 'idle' ? 'Ready' : importState.detail || importState.status}
-          </Text>
-        </View>
-        {!!localScan.error && <Text style={styles.errorText}>{localScan.error}</Text>}
-        <View style={styles.buttonRow}>
-          <Pressable onPress={() => { haptics.select(); onRescanLocal(); }} style={styles.secondaryBtn}>
-            <Text style={styles.secondaryBtnText}>Rescan Local</Text>
-          </Pressable>
-          <Pressable onPress={() => { haptics.select(); onImportFolder(); }} style={styles.secondaryBtn}>
-            <Text style={styles.secondaryBtnText}>Import Folder…</Text>
-          </Pressable>
-          <Pressable onPress={() => { haptics.select(); onImportFiles(); }} style={styles.secondaryBtn}>
-            <Text style={styles.secondaryBtnText}>Import Files…</Text>
-          </Pressable>
-        </View>
-      </View>
-
-      {coverageSeries.length > 0 && (
-        <View style={styles.card}>
-          <View style={styles.cardHeader}>
-            <Text style={styles.label}>Series Coverage</Text>
-            <Text style={styles.meta}>
-              {coverageSeries.length} {coverageSeries.length === 1 ? 'series' : 'series'}
-            </Text>
-          </View>
-          {coverageSeries.map(series => {
-            const key = series.folder || '_root';
-            const readyCount = series.episodes.filter(ep => !!(ep.frames.op || ep.frames.ed || ep.frames.recap)).length;
-            const expanded = !!expandedSeries[key];
+      {perSeries.length > 0 && (
+        <Section title="Library">
+          {perSeries.map((item, index) => {
+            const local = coverageSeries.find(s => s.folder === item.folder || s.title === item.title);
+            const open = !!expanded[item.folder];
+            const done = item.withTimings === item.episodes;
             return (
-              <View key={key} style={styles.coverageItem}>
-                <Pressable
-                  onPress={() => {
-                    haptics.select();
-                    setExpandedSeries(prev => ({ ...prev, [key]: !expanded }));
-                  }}
-                  style={styles.coverageHeader}
-                >
-                  <Text style={styles.coverageCaret}>{expanded ? '▾' : '▸'}</Text>
-                  <Text style={styles.coverageTitle} numberOfLines={1}>{series.title}</Text>
-                  <Text style={styles.coverageCount}>{readyCount} / {series.episodes.length}</Text>
-                </Pressable>
-                {expanded && (
-                  <View style={styles.coverageEpisodes}>
-                    {series.episodes.map(ep => {
-                      const parts = [
-                        ep.frames.recap ? 'Recap' : '',
-                        ep.frames.op ? 'OP' : '',
-                        ep.frames.ed ? 'ED' : '',
-                      ].filter(Boolean);
+              <Row
+                key={item.folder}
+                first={index === 0}
+                title={seriesLabel(item.title)}
+                detail={done ? `All ${item.episodes} episodes ready` : `${item.withTimings} of ${item.episodes} episodes ready`}
+                onPress={local ? () => setExpanded(prev => ({ ...prev, [item.folder]: !open })) : undefined}
+                right={<Text style={[styles.percent, done && { color: statusColors.ok }]}>{item.episodes ? Math.round((item.withTimings / item.episodes) * 100) : 0}%</Text>}
+              >
+                {!done && <ProgressBar value={item.episodes ? item.withTimings / item.episodes : 0} />}
+                {open && local && (
+                  <View style={styles.episodes}>
+                    {local.episodes.map(ep => {
+                      const parts = [ep.frames.recap ? 'Recap' : '', ep.frames.op ? 'Opening' : '', ep.frames.ed ? 'Ending' : ''].filter(Boolean);
                       return (
-                        <View key={ep.key} style={styles.coverageEpRow}>
-                          <Text style={styles.coverageEpName} numberOfLines={1}>{ep.label}</Text>
-                          <Text style={[styles.coverageEpBadge, parts.length ? styles.coverageEpDone : styles.coverageEpPending]}>
-                            {parts.length ? parts.join(' · ') : 'No timings'}
-                          </Text>
+                        <View key={ep.key} style={styles.episode}>
+                          <Text style={type.subhead} numberOfLines={1}>{ep.label}</Text>
+                          <Text style={[type.caption, parts.length > 0 && { color: statusColors.ok }]}>{parts.length ? parts.join(' · ') : 'Not found yet'}</Text>
                         </View>
                       );
                     })}
                   </View>
                 )}
-              </View>
+              </Row>
             );
           })}
-        </View>
+        </Section>
       )}
 
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.label}>Live Event Feed</Text>
-          <View style={styles.pillsRow}>
-            <Text style={styles.meta}>{pipelineEvents.length} events</Text>
-            {pipelineEvents.length > 0 && (
-              <Pressable onPress={() => { haptics.select(); onClearEvents(); }} hitSlop={8}>
-                <Text style={styles.clearText}>Clear</Text>
-              </Pressable>
-            )}
+      <Section title="This device">
+        <Row
+          first
+          icon="internaldrive"
+          title={`${localScan.seriesCount} series · ${localScan.episodeCount} episodes saved here`}
+          detail={localScan.error ? localScan.error : importState.status !== 'idle' ? (importState.detail || importState.status) : localScan.lastScannedAt ? `Checked at ${localScan.lastScannedAt}` : null}
+          tone={localScan.error ? 'danger' : undefined}
+        >
+          <View style={styles.buttons}>
+            <Button title="Rescan" icon="arrow.clockwise" onPress={onRescanLocal} loading={localScan.status === 'scanning'} />
+            <Button title="Import folder" onPress={onImportFolder} disabled={importState.status === 'importing'} />
+            <Button title="Import files" onPress={onImportFiles} disabled={importState.status === 'importing'} />
           </View>
-        </View>
-        {pipelineEvents.length === 0 ? (
-          <Text style={styles.body}>Waiting for WebSocket or scan events…</Text>
-        ) : (
-          pipelineEvents.map(ev => (
-            <View key={ev.id} style={styles.eventRow}>
-              <Text style={styles.eventTime}>{ev.time}</Text>
-              <Text style={styles.eventKind}>{ev.kind}</Text>
-              <Text style={styles.eventDetail} numberOfLines={2}>{ev.detail}</Text>
+        </Row>
+        <Row
+          icon="play.tv"
+          title="TV plays the next episode automatically"
+          right={<Switch value={tvAutoplay} onValueChange={value => { haptics.select(); onToggleTvAutoplay(value); }} trackColor={{ true: colors.accent }} />}
+        />
+      </Section>
+
+      <Section title="Connection">
+        <Row
+          first
+          tone={reachable ? 'ok' : 'danger'}
+          title={reachable ? `${route} · ${host}` : `Can't reach ${host}`}
+          detail={reachable
+            ? `${live ? 'Live updates on' : 'Live updates reconnecting'}${server?.tailscale.running ? ' · Tailscale available' : ''}`
+            : serverError ?? httpStatus.error ?? 'Check that the Mac is awake and on the same network or Tailscale.'}
+          right={<Button variant="plain" title={editingAddress ? 'Done' : 'Change'} onPress={() => setEditingAddress(value => !value)} />}
+        >
+          {editingAddress && (
+            <View style={{ gap: space.s }}>
+              <TextInput
+                value={serverDraft}
+                onChangeText={onChangeServerDraft}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="url"
+                returnKeyType="go"
+                placeholder={DEFAULT_TV_SERVER_URL}
+                placeholderTextColor={colors.textTertiary}
+                style={styles.input}
+                onSubmitEditing={() => { onApplyServerUrl(serverDraft); setEditingAddress(false); }}
+              />
+              <View style={styles.buttons}>
+                <Button variant="primary" title="Save and reconnect" onPress={() => { onApplyServerUrl(serverDraft); setEditingAddress(false); }} />
+                <Button title="Use default" onPress={() => { onApplyServerUrl(DEFAULT_TV_SERVER_URL); setEditingAddress(false); }} />
+              </View>
             </View>
-          ))
+          )}
+        </Row>
+        {(server?.addresses.length ?? 0) > 1 && (
+          <Row
+            icon="point.3.connected.trianglepath.dotted"
+            title="The Mac also answers on"
+            detail={server!.addresses.map(url => url.replace(/^https?:\/\//, '').replace(/\/.*$/, '')).filter(item => item !== host).join('\n')}
+          />
         )}
-      </View>
+      </Section>
+
+      <Section
+        title="Activity"
+        action={pipelineEvents.length > 0 ? <Button variant="plain" title="Clear" onPress={onClearEvents} /> : undefined}
+      >
+        {events.map((event, index) => (
+          <View key={event.id} style={[styles.event, index > 0 && styles.eventDivider]}>
+            <Text style={styles.eventTime}>{event.time}</Text>
+            <View style={{ flex: 1, gap: 1 }}>
+              <Text style={styles.eventKind}>{event.kind}</Text>
+              <Text style={type.subhead} numberOfLines={3}>{event.detail}</Text>
+            </View>
+          </View>
+        ))}
+        {pipelineEvents.length === 0 && <Row first tone="idle" title="Nothing yet" detail="Scans, syncs and connection changes appear here." />}
+        {pipelineEvents.length > EVENTS_SHOWN && (
+          <Row title={allEvents ? 'Show fewer' : `Show all ${pipelineEvents.length}`} onPress={() => setAllEvents(value => !value)} />
+        )}
+      </Section>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  quarantineBox: {
-    marginTop: 8,
-    padding: 10,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: 'rgba(248,113,113,0.35)',
-    backgroundColor: 'rgba(248,113,113,0.08)',
-    gap: 8,
-  },
-  quarantineHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  quarantineTitle: { color: '#f87171', fontSize: 13, fontWeight: '600' },
-  quarantineRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  retryButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: 'rgba(248,113,113,0.5)',
-  },
-  retryButtonText: { color: '#f87171', fontSize: 13, fontWeight: '600' },
   scroll: { flex: 1 },
-  content: { padding: space.l, gap: space.m, paddingBottom: space.xl },
-  card: { backgroundColor: colors.surface, borderRadius: radius.medium, padding: space.l, gap: space.s },
-  cardHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space.s },
-  label: { color: colors.text, fontSize: 16, fontWeight: '700' },
-  meta: { color: colors.textSecondary, fontSize: 13, fontWeight: '600', textTransform: 'capitalize' },
-  pillsRow: { flexDirection: 'row', alignItems: 'center', gap: space.s },
-  pill: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: colors.surfaceRaised, borderRadius: radius.pill, paddingHorizontal: 10, paddingVertical: 4, maxWidth: 160 },
-  dot: { width: 8, height: 8, borderRadius: 4 },
-  pillText: { color: colors.text, fontSize: 12, fontWeight: '600', textTransform: 'capitalize' },
-  input: { backgroundColor: colors.surfaceRaised, color: colors.text, borderRadius: radius.small, paddingHorizontal: 12, paddingVertical: 10, fontSize: 13 },
-  buttonRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.s },
-  primaryBtn: { backgroundColor: colors.accent, borderRadius: radius.pill, paddingHorizontal: 14, paddingVertical: 8 },
-  primaryBtnText: { color: colors.background, fontSize: 13, fontWeight: '700' },
-  secondaryBtn: { backgroundColor: colors.surfaceRaised, borderRadius: radius.pill, paddingHorizontal: 14, paddingVertical: 8 },
-  secondaryBtnText: { color: colors.text, fontSize: 13, fontWeight: '600' },
-  body: { color: colors.textSecondary, fontSize: 14, lineHeight: 20 },
-  errorText: { color: '#f87171', fontSize: 13 },
-  switchRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: colors.surfaceRaised, borderRadius: radius.small, paddingHorizontal: space.m, paddingVertical: space.xs },
-  switchText: { color: colors.text, fontSize: 14, flex: 1, marginRight: space.m },
-  progressTrack: { height: 6, borderRadius: 3, backgroundColor: colors.surfaceRaised, overflow: 'hidden' },
-  progressFill: { height: 6, backgroundColor: colors.accent },
-  kvRow: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', gap: space.m },
-  kvKey: { color: colors.textSecondary, fontSize: 13, fontWeight: '600' },
-  kvVal: { color: colors.text, fontSize: 13, flex: 1, textAlign: 'right' },
-  coverageItem: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.separator, paddingTop: space.s, gap: space.xs },
-  coverageHeader: { flexDirection: 'row', alignItems: 'center', gap: space.s, paddingVertical: 2 },
-  coverageCaret: { color: colors.textSecondary, fontSize: 13, width: 14 },
-  coverageTitle: { color: colors.text, fontSize: 14, fontWeight: '600', flex: 1 },
-  coverageCount: { color: colors.textSecondary, fontSize: 13, fontVariant: ['tabular-nums'] },
-  coverageEpisodes: { paddingLeft: 22, gap: 4, paddingTop: 4 },
-  coverageEpRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space.s, paddingVertical: 2 },
-  coverageEpName: { color: colors.textSecondary, fontSize: 13, flex: 1 },
-  coverageEpBadge: { fontSize: 12, fontWeight: '600' },
-  coverageEpDone: { color: '#34d399' },
-  coverageEpPending: { color: colors.textTertiary },
-  clearText: { color: colors.accent, fontSize: 13, fontWeight: '600' },
-  eventRow: { flexDirection: 'row', alignItems: 'flex-start', gap: space.s, paddingTop: 6, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.separator },
-  eventTime: { color: colors.textTertiary, fontSize: 12, fontVariant: ['tabular-nums'] },
-  eventKind: { color: colors.accent, fontSize: 12, fontWeight: '700', minWidth: 74 },
-  eventDetail: { color: colors.textSecondary, fontSize: 12, flex: 1 },
-  workerRow: { flexDirection: 'row', alignItems: 'center', gap: space.s, paddingTop: 6, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.separator },
-  workerName: { color: colors.text, fontSize: 13, fontWeight: '600' },
-  workerSub: { color: colors.textSecondary, fontSize: 12 },
+  content: { paddingHorizontal: space.l, paddingTop: space.s, paddingBottom: space.xl * 2, gap: space.xl },
+  summary: { backgroundColor: colors.surface, borderRadius: radius.large, borderCurve: 'continuous', padding: space.l, gap: space.l },
+  summaryTop: { flexDirection: 'row', alignItems: 'flex-start', gap: space.m, paddingTop: 2 },
+  stats: { flexDirection: 'row', gap: space.m },
+  percent: { color: colors.textSecondary, fontSize: 13, fontWeight: '600', fontVariant: ['tabular-nums'] },
+  error: { color: statusColors.danger, fontSize: 13 },
+  episodes: { gap: space.s, paddingTop: space.xs },
+  episode: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space.m },
+  buttons: { flexDirection: 'row', flexWrap: 'wrap', gap: space.s },
+  input: { backgroundColor: colors.surfaceRaised, color: colors.text, borderRadius: radius.small, paddingHorizontal: space.m, paddingVertical: 10, fontSize: 14 },
+  event: { flexDirection: 'row', gap: space.m, paddingHorizontal: space.l, paddingVertical: space.s + 2 },
+  eventDivider: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.separator },
+  eventTime: { color: colors.textTertiary, fontSize: 12, fontVariant: ['tabular-nums'], width: 58, paddingTop: 1 },
+  eventKind: { color: colors.accent, fontSize: 12, fontWeight: '700' },
 });

@@ -1,4 +1,4 @@
-import { seriesRoot, type SeriesPlan } from '../japanese/series';
+import { seriesFiles, type SeriesPlan } from '../japanese/series';
 
 const key = 'arc_series_downloads';
 const alarm = 'arc-series-downloads';
@@ -20,32 +20,14 @@ async function save(queue: SeriesQueue) {
   await chrome.storage.local.set({ [key]: queue });
 }
 
-function safeName(name: string) {
-  return name.replace(/[^\p{L}\p{N} -]/gu, '').trim().slice(0, 60) || 'Series';
-}
-
 function createQueue(plan: SeriesPlan, selectedPages: string[]): SeriesQueue {
-  const series = seriesRoot(plan.series);
-  const edition = plan.edition && plan.edition !== 'Japanese subtitles' ? ` - ${safeName(plan.edition)}` : '';
-  const folder = `Arc Anime/${safeName(plan.title)} - ${series.pathname.match(/\d+$/)![0]}${edition}`;
-  const files: FileJob[] = [];
-  const selection = new Set(selectedPages);
-  for (const [index, episode] of plan.episodes.entries()) {
-    if (!episode.video || !selection.has(episode.page)) continue;
-    const video = new URL(episode.video.url);
-    const videoId = video.pathname.match(/^\/translations\/mp4\/(\d+)\/?$/i)?.[1];
-    if (video.origin !== series.origin || video.username || video.password || !videoId) throw new Error('An episode has an invalid video link.');
-    const name = `${folder}/Episode ${String(index + 1).padStart(3, '0')} - ${videoId}`;
-    if (episode.subtitle) {
-      const subtitle = new URL(episode.subtitle);
-      const sub = subtitle.pathname.match(/^\/translations\/(ass|ssa|srt|vtt)\/(\d+)\/?$/i);
-      if (subtitle.origin !== series.origin || subtitle.username || subtitle.password || sub?.[2] !== videoId) throw new Error('An episode has mismatched download links.');
-      files.push({ url: subtitle.href, filename: `${name}.${sub[1].toLowerCase()}`, state: 'queued' });
-    }
-    files.push({ url: video.href, filename: `${name}.mp4`, state: 'queued' });
-  }
-  if (!files.length) throw new Error('There are no downloadable episodes in this edition.');
-  return { title: plan.title, folder, paused: false, files };
+  const { folder, files } = seriesFiles(plan, selectedPages);
+  return {
+    title: plan.title,
+    folder: `Arc Anime/${folder}`,
+    paused: false,
+    files: files.map(file => ({ url: file.url, filename: `Arc Anime/${folder}/${file.name}`, state: 'queued' as const }))
+  };
 }
 
 function isCompletedFile(download?: chrome.downloads.DownloadItem) {
@@ -169,5 +151,27 @@ export function seriesDownloadRequest(message: { type: string; plan?: SeriesPlan
     await save(queue);
     await chrome.alarms.create(alarm, { periodInMinutes: 0.5 });
     return { queue: await pump() };
+  });
+}
+
+/** The current Chrome queue, for the Mac's download requests. */
+export function seriesQueueStatus() {
+  return serialize(load);
+}
+
+/**
+ * Start a queue for a download requested from another device (see remote-downloads.ts).
+ * Returns false when Chrome is already busy with another queue, so the request waits.
+ */
+export function startRequestedSeries(plan: SeriesPlan, selectedPages: string[]) {
+  return serialize(async () => {
+    if (!chrome.downloads) throw new Error('Allow Chrome downloads to start the queue.');
+    const queue = await load();
+    if (queue?.files.some(file => file.state === 'queued' || file.state === 'downloading')) return false;
+    watchDownloads();
+    await save(createQueue(plan, selectedPages));
+    await chrome.alarms.create(alarm, { periodInMinutes: 0.5 });
+    await pump();
+    return true;
   });
 }

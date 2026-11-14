@@ -330,7 +330,15 @@ def process_job(base_url, node_id, job, ffmpeg_bin, ffprobe_bin):
         ref_fp = sampled_ref
 
     report_progress(90)
-    themes = match_video_themes(current_fp, ref_fp) if ref_fp else {}
+    # Newer coordinators send several references (nearest episodes first); take the first match of
+    # each part, so one unusual episode (no opening, special ending) doesn't hide the others.
+    references = [ref for ref in (job.get("referenceSamplesList") or []) if isinstance(ref, dict)] or ([ref_fp] if ref_fp else [])
+    themes = {}
+    for reference in references:
+        for part, found in match_video_themes(current_fp, reference).items():
+            themes.setdefault(part, found)
+        if "op" in themes and "ed" in themes:
+            break
     report_progress(98)
 
     complete_payload = {

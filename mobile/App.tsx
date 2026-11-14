@@ -2,14 +2,18 @@ import * as ScreenOrientation from 'expo-screen-orientation';
 import { StatusBar } from 'expo-status-bar';
 import { SymbolView } from 'expo-symbols';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActionSheetIOS, Alert, AppState, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
-import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { ActionSheetIOS, Alert, AppState, Platform, Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { EpisodeList } from './src/components/EpisodeList';
+import { DownloadView } from './src/components/DownloadView';
 import { PipelinesView, type ImportPipelineState, type LocalScanState } from './src/components/PipelinesView';
 import { Player } from './src/components/Player';
+import { SeriesGallery } from './src/components/SeriesGallery';
+import { SeriesScreen } from './src/components/SeriesScreen';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
-import { AutoSync, installCrashLog, type AutoSyncState } from './src/lib/auto-sync';
+import { StatusDot, TabBar, type Tab } from './src/components/ui';
+import { installCrashLog } from './src/lib/crash-log';
+import { episodeDownloads } from './src/lib/episode-downloads';
 import { haptics } from './src/lib/haptics';
 import { importFiles, importFolder, readLibrary, type Episode, type Series } from './src/lib/library';
 import { fetchRemoteCatalog } from './src/lib/server';
@@ -28,38 +32,13 @@ import {
   type WorkerStatusPayload,
 } from './src/lib/tv-sync';
 import { PhoneWorkerNode, type PhoneWorkerState } from './src/lib/worker-node';
-import { colors, radius, space } from './src/theme';
+import { colors, radius, space, type } from './src/theme';
 
-// Write the cause of any crash to Documents/.anime-study/auto-sync-errors.log.
+// Write the cause of any crash to Documents/.anime-study/errors.log.
 installCrashLog();
 
-type AppMode = 'watch' | 'pipelines';
+type AppMode = 'watch' | 'download' | 'pipelines';
 type LibrarySource = 'server' | 'local';
-
-function latestEpisode(series: Series) {
-  const progress = allProgress();
-  let best: Episode | undefined;
-  let at = 0;
-  for (const episode of series.episodes) {
-    const saved = progress[episode.key];
-    if (saved && saved.watchedAt > at) { at = saved.watchedAt; best = episode; }
-  }
-  if (!best) return series.episodes[0];
-  // A finished episode continues with the next one.
-  const index = series.episodes.indexOf(best);
-  return progress[best.key]?.finished && series.episodes[index + 1] ? series.episodes[index + 1] : best;
-}
-
-function autoSyncLine(state: AutoSyncState) {
-  const kept = state.kept ? `${state.kept} episode${state.kept === 1 ? '' : 's'} kept from the Mac` : 'Keeps your next episodes from the Mac';
-  switch (state.status) {
-    case 'checking': return `Auto sync · checking the Mac…`;
-    case 'downloading': return `Auto sync · saving ${state.detail ?? ''}`;
-    case 'waiting': return `Auto sync paused · ${state.detail ?? ''} · ${kept}`;
-    case 'error': return `Auto sync · ${state.detail ?? 'error'}`;
-    default: return `Auto sync · ${state.detail ? `${state.detail} · ` : ''}${kept}`;
-  }
-}
 
 export default function App() {
   return (
@@ -71,9 +50,14 @@ export default function App() {
 
 function Study() {
   const { width } = useWindowDimensions();
-  const wide = width >= 700;
+  const insets = useSafeAreaInsets();
   const initialServerUrl = normalizeTvServerUrl(savedSettings().tvServerUrl || DEFAULT_TV_SERVER_URL);
-  const [mode, setMode] = useState<AppMode>('watch');
+  const [mode, setModeState] = useState<AppMode>(() => {
+    const saved = savedSettings().tab;
+    return saved === 'download' || saved === 'pipelines' ? saved : 'watch';
+  });
+  // Reopen on the tab you left.
+  const setMode = useCallback((next: AppMode) => { setModeState(next); saveSettings({ tab: next }); }, []);
   const [source, setSource] = useState<LibrarySource>('server');
   const [serverUrl, setServerUrl] = useState(initialServerUrl);
   const [serverDraft, setServerDraft] = useState(initialServerUrl);
@@ -92,7 +76,6 @@ function Study() {
   const [library, setLibrary] = useState<Series[]>([]);
   const [folder, setFolder] = useState<string | null>(null);
   const [episodeKey, setEpisodeKey] = useState<string | null>(null);
-  const [fullscreen, setFullscreen] = useState(false);
   const [settings, setSettings] = useState(savedSettings);
   const [, setRevision] = useState(0);
   const refreshProgress = useCallback(() => setRevision(value => value + 1), []);
@@ -104,8 +87,6 @@ function Study() {
   libraryRef.current = library;
   const tvSyncRef = useRef<TvSyncClient | null>(null);
   const phoneWorkerRef = useRef<PhoneWorkerNode | null>(null);
-  const autoSyncRef = useRef<AutoSync | null>(null);
-  const [autoSync, setAutoSync] = useState<AutoSyncState>({ status: 'idle', kept: 0, queued: 0 });
   const prevTvActiveRef = useRef(false);
   const lastPhoneSyncRef = useRef(0);
 
@@ -209,7 +190,6 @@ function Study() {
 
   const scan = useCallback(() => {
     scheduleSync(0);
-    autoSyncRef.current?.kick();
     if (sourceRef.current === 'server') {
       void loadRemote();
     } else {
@@ -291,20 +271,12 @@ function Study() {
       (kind, detail) => client.log(kind, detail),
     );
     phoneWorkerRef.current = worker;
-    const mirror = new AutoSync(
-      () => serverUrlRef.current,
-      setAutoSync,
-      // New copies show up in Local Files right away; the counts update either way.
-      () => scanLocal(sourceRef.current === 'local'),
-      (kind, detail) => client.log(kind, detail),
-    );
-    autoSyncRef.current = mirror;
+    // Downloaded episodes show up in Local Files right away.
+    episodeDownloads.onLibraryChanged = () => scanLocal(sourceRef.current === 'local');
     client.connect();
     scanLocal(false);
-    mirror.kick();
     return () => {
-      mirror.stop();
-      autoSyncRef.current = null;
+      episodeDownloads.onLibraryChanged = () => {};
       worker.stop();
       phoneWorkerRef.current = null;
       client.destroy();
@@ -323,13 +295,23 @@ function Study() {
 
   const tvControlling = Boolean(tvState?.active) && source === 'server' && !playOnPhoneOverride;
 
-  const series = library.find(item => item.folder === folder) ?? library[0];
-  const episode = series?.episodes.find(item => item.key === episodeKey) ?? (series ? latestEpisode(series) : undefined);
-  const tvEpisodeKey = useMemo(() => {
-    if (!tvControlling || !series || !tvState?.episode) return undefined;
-    if (tvState.seriesName && series.folder !== tvState.seriesName) return undefined;
-    return series.episodes.find(item => item.video === tvState.episode)?.key;
-  }, [series, tvControlling, tvState?.episode, tvState?.seriesName]);
+  // Like the TV app: a wall of covers, then one series, then the episode on the whole screen.
+  const series = library.find(item => item.folder === folder);
+  const listedEpisode = series?.episodes.find(item => item.key === episodeKey);
+  // A downloaded episode plays from this device even while browsing the Mac's library.
+  // Keyed by identity, not object: a catalog refresh mustn't hand the player a "new" episode and restart it.
+  const seriesFolder = series?.folder;
+  const episodeIdentity = listedEpisode ? `${listedEpisode.key}\n${listedEpisode.videoUri}\n${listedEpisode.subtitleUri ?? ''}` : '';
+  const episode = useMemo(
+    () => (seriesFolder !== undefined && listedEpisode ? episodeDownloads.local(seriesFolder, listedEpisode) : listedEpisode),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [seriesFolder, episodeIdentity],
+  );
+  // Picture in Picture: leaving the player while PiP is on keeps it mounted (hidden) so the video
+  // goes on in its floating window while you browse.
+  const [pipActive, setPipActive] = useState(false);
+  const [playerHidden, setPlayerHidden] = useState(false);
+  const fullscreen = !!episode && !tvControlling && !playerHidden;
   const index = series && episode ? series.episodes.indexOf(episode) : -1;
   const neighbours = useMemo(
     () => (series && index >= 0 ? series.episodes.slice(Math.max(0, index - 2), index + 3) : []),
@@ -392,6 +374,7 @@ function Study() {
       return;
     }
     setEpisodeKey(next.key);
+    setPlayerHidden(false);
     if (source === 'server' && series) {
       void tvSyncRef.current?.pushSync({ playingFolder: series.folder, playingEpisode: next.video });
     }
@@ -458,8 +441,9 @@ function Study() {
     }
   };
 
-  const wsBadgeColor =
-    wsState === 'connected' ? '#34d399' : wsState === 'connecting' ? colors.accent : '#f87171';
+  const online = wsState === 'connected' || httpStatus.state === 'ok';
+  const connecting = !online && (wsState === 'connecting' || httpStatus.state === 'checking');
+  const screenTitle = mode === 'pipelines' ? 'Server' : mode === 'download' ? 'Download' : 'Library';
 
   const header = (
     <View style={[styles.header, tvControlling && styles.headerCompact]}>
@@ -467,120 +451,50 @@ function Study() {
         <View style={{ flex: 1 }}>
           <View style={styles.kickerRow}>
             <Text style={styles.kicker}>Anime Study</Text>
-            <View style={[styles.wsDot, { backgroundColor: wsBadgeColor }]} />
-            <Text style={styles.wsText}>{wsState}</Text>
+            <StatusDot tone={online ? 'ok' : connecting ? 'warn' : 'danger'} size={6} />
+            <Text style={type.caption}>{online ? 'Mac connected' : connecting ? 'Connecting…' : 'Mac offline'}</Text>
           </View>
-          {!tvControlling && (
-            <>
-              <Text style={styles.title} numberOfLines={2}>
-                {mode === 'pipelines' ? 'Pipelines' : (series?.title ?? (source === 'server' ? 'Mac Server' : 'Offline Study'))}
-              </Text>
-              {mode === 'watch' && !!series?.credit && (
-                <View style={styles.credit}><Text style={styles.creditText} numberOfLines={1}>{series.credit}</Text></View>
-              )}
-            </>
-          )}
+          {!tvControlling && <Text style={type.largeTitle} numberOfLines={1}>{screenTitle}</Text>}
         </View>
-        <View style={styles.headerActions}>
-          <View style={styles.modeSwitch}>
-            {(['watch', 'pipelines'] as const).map(item => {
-              const active = mode === item;
-              return (
-                <Pressable
-                  key={item}
-                  onPress={() => { haptics.select(); setMode(item); }}
-                  style={[styles.modePill, active && styles.modePillActive]}
-                >
-                  <Text style={[styles.modePillText, active && styles.modePillTextActive]}>
-                    {item === 'watch' ? 'Watch' : 'Pipelines'}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-          {mode === 'watch' && source === 'local' && (
-            <Pressable accessibilityRole="button" accessibilityLabel="Add episodes" onPress={pickSource} hitSlop={10} style={styles.addButton}>
-              <SymbolView name="plus" size={20} tintColor={colors.accent} />
-            </Pressable>
-          )}
-        </View>
+        {mode === 'watch' && source === 'local' && (
+          <Pressable accessibilityRole="button" accessibilityLabel="Add episodes" onPress={pickSource} hitSlop={10} style={({ pressed }) => [styles.addButton, pressed && { opacity: 0.6 }]}>
+            <SymbolView name="plus" size={18} tintColor={colors.accent} />
+          </Pressable>
+        )}
+        {mode === 'watch' && source === 'server' && !series && (
+          <Pressable accessibilityRole="button" accessibilityLabel="Refresh" onPress={() => { haptics.select(); void loadRemote(); }} hitSlop={10} style={({ pressed }) => [styles.addButton, pressed && { opacity: 0.6 }]}>
+            <SymbolView name="arrow.clockwise" size={16} tintColor={colors.accent} />
+          </Pressable>
+        )}
       </View>
-      {mode === 'watch' && (
-        <>
-          {!tvControlling && (
-            <View style={styles.sourceRow}>
-              {(['server', 'local'] as const).map(item => {
-                const active = source === item;
-                return (
-                  <Pressable
-                    key={item}
-                    onPress={() => {
-                      haptics.select();
-                      setSource(item);
-                      setFolder(null);
-                      setEpisodeKey(null);
-                    }}
-                    style={[styles.sourceChip, active && styles.sourceChipActive]}
-                  >
-                    <Text style={[styles.sourceChipText, active && styles.sourceChipTextActive]}>
-                      {item === 'server' ? 'Mac Server' : 'Local Files'}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-              {source === 'server' && (
-                <Pressable onPress={() => { haptics.select(); void loadRemote(); }} style={styles.refreshChip}>
-                  <Text style={styles.refreshChipText}>Refresh</Text>
-                </Pressable>
-              )}
-            </View>
-          )}
-          {!tvControlling && source === 'local' && (
-            <Text style={styles.autoSync} numberOfLines={2}>{autoSyncLine(autoSync)}</Text>
-          )}
-          {library.length > 1 && (
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
-              {library.map(item => {
-                const active = item.folder === series?.folder;
-                return (
-                  <Pressable
-                    key={item.folder || '_root'}
-                    onPress={() => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
-                    style={[styles.chip, active && styles.chipActive]}
-                  >
-                    <Text style={[styles.chipText, active && { color: colors.background }]} numberOfLines={1}>{item.title}</Text>
-                  </Pressable>
-                );
-              })}
-            </ScrollView>
-          )}
-          {!tvControlling && (
-            <View style={styles.settingRow}>
-              <Text style={styles.settingText}>Auto-skip opening, ending and recap</Text>
-              <Switch
-                value={settings.autoSkip}
-                onValueChange={value => { haptics.select(); updateSettings({ autoSkip: value }); }}
-                trackColor={{ true: colors.accent }}
-              />
-            </View>
-          )}
-        </>
+      {mode === 'watch' && !series && !tvControlling && (
+        <View style={styles.segmented} accessibilityRole="tablist">
+          {(['server', 'local'] as const).map(item => {
+            const active = source === item;
+            return (
+              <Pressable
+                key={item}
+                accessibilityRole="tab"
+                accessibilityState={{ selected: active }}
+                onPress={() => {
+                  if (active) return;
+                  haptics.select();
+                  setSource(item);
+                  setFolder(null);
+                  setEpisodeKey(null);
+                }}
+                style={[styles.segment, active && styles.segmentActive]}
+              >
+                <Text style={[styles.segmentText, active && styles.segmentTextActive]}>
+                  {item === 'server' ? 'On the Mac' : `On this ${Platform.OS === 'ios' && Platform.isPad ? 'iPad' : 'iPhone'}`}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
       )}
     </View>
   );
-
-  const tvSwitchBanner = tvState?.active && source === 'server' && playOnPhoneOverride && !fullscreen ? (
-    <Pressable
-      accessibilityRole="button"
-      onPress={() => { haptics.select(); setPlayOnPhoneOverride(false); }}
-      style={styles.tvBanner}
-    >
-      <View style={styles.tvBannerDot} />
-      <Text style={styles.tvBannerText} numberOfLines={1}>
-        TV is playing {tvState.episodeLabel || tvState.episode || ''} · Tap for TV remote
-      </Text>
-    </Pressable>
-  ) : null;
 
   const player = tvControlling && tvState ? (
     <TvRemotePanel
@@ -589,16 +503,31 @@ function Study() {
       onCommand={command => tvSyncRef.current?.sendTvControl(command)}
       onPlayOnPhone={() => setPlayOnPhoneOverride(true)}
     />
-  ) : episode && (
-    <View style={fullscreen ? { flex: 1 } : { gap: space.s }}>
-      {tvSwitchBanner}
+  ) : null;
+
+  const closePlayer = () => { setEpisodeKey(null); setPlayerHidden(false); setPipActive(false); };
+  const fullscreenPlayer = episode && !tvControlling && (
+    <View style={fullscreen && mode === 'watch' ? StyleSheet.absoluteFill : styles.pipHost} pointerEvents={fullscreen && mode === 'watch' ? 'auto' : 'none'}>
       <Player
         episode={episode}
         neighbours={neighbours}
-        fullscreen={fullscreen}
+        fullscreen
+        autoPlay
         autoSkip={settings.autoSkip}
         subtitlesOn={settings.subtitles}
-        onToggleFullscreen={value => setFullscreen(current => value ?? !current)}
+        // The exit button goes back to the series; a double tap in the middle does nothing here.
+        onToggleFullscreen={value => {
+          if (value !== false) return;
+          if (pipActive) setPlayerHidden(true);
+          else closePlayer();
+        }}
+        onPictureInPictureChange={(active, stillPlaying) => {
+          setPipActive(active);
+          if (active || !playerHidden) return;
+          // Back from PiP: "restore" keeps playing and returns to the player; closing the window stops it.
+          if (stillPlaying) setPlayerHidden(false);
+          else closePlayer();
+        }}
         onToggleSubtitles={() => updateSettings({ subtitles: !settings.subtitles })}
         onStep={direction => step(direction)}
         hasPrevious={index > 0}
@@ -643,6 +572,7 @@ function Study() {
 
   const pipelinesScreen = (
     <PipelinesView
+      serverUrl={serverUrl}
       serverDraft={serverDraft}
       onChangeServerDraft={setServerDraft}
       onApplyServerUrl={applyServerUrl}
@@ -677,51 +607,62 @@ function Study() {
     />
   );
 
-  const list = series && (
-    <EpisodeList
-      episodes={series.episodes}
-      current={tvControlling ? tvEpisodeKey : episode?.key}
+  const seriesScreen = series && (
+    <SeriesScreen
+      series={series}
       progress={allProgress()}
-      onSelect={selectEpisode}
+      width={width}
+      autoSkip={settings.autoSkip}
+      onAutoSkip={value => updateSettings({ autoSkip: value })}
+      onBack={() => { setFolder(null); setEpisodeKey(null); }}
+      onPlay={selectEpisode}
       onToggleWatched={ep => toggleEpisodeWatched(ep, series)}
-      header={wide ? header : undefined}
+      fromMac={source === 'server'}
+      extra={player}
     />
   );
 
-  // Hidden sections keep their place in the tree so the video player is never remounted.
-  const hide = fullscreen ? styles.hidden : undefined;
+  const tabs: Tab<AppMode>[] = [
+    { key: 'watch', title: 'Library', icon: 'play.rectangle.on.rectangle' },
+    { key: 'download', title: 'Download', icon: 'arrow.down.circle' },
+    { key: 'pipelines', title: 'Server', icon: 'server.rack', badge: !online && !connecting },
+  ];
+  const playing = mode === 'watch' && fullscreen;
 
   return (
     <View style={styles.root}>
       <StatusBar style="light" hidden={fullscreen} />
-      <SafeAreaView style={styles.root} edges={fullscreen ? [] : ['top', 'left', 'right']}>
+      <SafeAreaView style={styles.root} edges={playing ? [] : ['top', 'left', 'right']}>
         {mode === 'pipelines' ? (
           <View style={{ flex: 1 }}>
             {header}
             {pipelinesScreen}
           </View>
-        ) : !series ? (
-          <View style={{ flex: 1 }}>{header}{empty}</View>
-        ) : wide ? (
-          <View style={styles.split}>
-            <View style={[styles.sidebar, { width: Math.min(380, width * 0.36) }, hide]}>{list}</View>
-            <View style={[styles.main, fullscreen && styles.mainFullscreen]}>
-              {player}
-              {!tvControlling && (
-                <View style={hide}>
-                  <Text style={styles.nowPlaying} numberOfLines={1}>{episode?.label}</Text>
-                  <Text style={styles.fileName} numberOfLines={1}>{episode?.video}</Text>
-                </View>
-              )}
-            </View>
+        ) : mode === 'download' ? (
+          <View style={{ flex: 1 }}>
+            {header}
+            <DownloadView serverUrl={serverUrl} onMacProgress={() => { void loadRemote(); }} />
+          </View>
+        ) : playing ? (
+          <View style={{ flex: 1, backgroundColor: '#000' }} />
+        ) : seriesScreen ? (
+          <View style={{ flex: 1 }}>{header}{seriesScreen}</View>
+        ) : library.length ? (
+          <View style={{ flex: 1 }}>
+            <SeriesGallery
+              series={library}
+              progress={allProgress()}
+              width={width}
+              header={header}
+              onOpen={item => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
+            />
           </View>
         ) : (
-          <View style={{ flex: 1 }}>
-            <View style={hide}>{header}</View>
-            <View style={fullscreen ? styles.phoneFullscreen : styles.phonePlayer}>{player}</View>
-            <View style={[{ flex: 1 }, hide]}>{list}</View>
-          </View>
+          <View style={{ flex: 1 }}>{header}{empty}</View>
         )}
+        {!playing && <TabBar tabs={tabs} current={mode} onChange={setMode} bottomInset={insets.bottom} />}
+        {/* Always the last child, so showing or hiding it never remounts the player (and its PiP window). */}
+        {fullscreenPlayer}
       </SafeAreaView>
     </View>
   );
@@ -729,6 +670,7 @@ function Study() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.background },
+  pipHost: { position: 'absolute', left: 0, top: 0, width: 1, height: 1, opacity: 0 },
   hidden: { display: 'none' },
   split: { flex: 1, flexDirection: 'row' },
   sidebar: { borderRightWidth: StyleSheet.hairlineWidth, borderRightColor: colors.separator },
@@ -738,12 +680,11 @@ const styles = StyleSheet.create({
   phoneFullscreen: { flex: 1 },
   header: { paddingHorizontal: space.l, paddingTop: space.s, paddingBottom: space.m, gap: space.m },
   headerCompact: { paddingBottom: space.s, gap: space.s },
-  titleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: space.m },
-  kicker: { color: colors.accent, fontSize: 13, fontWeight: '700', letterSpacing: 0.6, textTransform: 'uppercase' },
-  title: { color: colors.text, fontSize: 28, fontWeight: '800', marginTop: 2 },
+  titleRow: { flexDirection: 'row', alignItems: 'center', gap: space.m },
+  kicker: { color: colors.accent, fontSize: 12, fontWeight: '700', letterSpacing: 0.6, textTransform: 'uppercase', marginRight: 2 },
   credit: { alignSelf: 'flex-start', marginTop: space.s, backgroundColor: colors.surfaceRaised, borderRadius: radius.pill, paddingHorizontal: 10, paddingVertical: 4 },
   creditText: { color: colors.textSecondary, fontSize: 13, fontWeight: '600' },
-  addButton: { width: 40, height: 40, borderRadius: 20, backgroundColor: colors.accentMuted, alignItems: 'center', justifyContent: 'center' },
+  addButton: { width: 36, height: 36, borderRadius: 18, backgroundColor: colors.accentMuted, alignItems: 'center', justifyContent: 'center' },
   chips: { gap: space.s },
   chip: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: radius.pill, backgroundColor: colors.surfaceRaised, maxWidth: 240 },
   chipActive: { backgroundColor: colors.accent },
@@ -760,23 +701,12 @@ const styles = StyleSheet.create({
   emptyActions: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: space.s, marginTop: space.s },
   emptySecondaryButton: { backgroundColor: colors.surfaceRaised },
   emptySecondaryButtonText: { color: colors.text, fontSize: 16, fontWeight: '700' },
-  kickerRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  wsDot: { width: 8, height: 8, borderRadius: 4 },
-  wsText: { color: colors.textSecondary, fontSize: 12, fontWeight: '600', textTransform: 'capitalize' },
-  headerActions: { flexDirection: 'row', alignItems: 'center', gap: space.s },
-  modeSwitch: { flexDirection: 'row', backgroundColor: colors.surfaceRaised, borderRadius: radius.pill, padding: 3 },
-  modePill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: radius.pill },
-  modePillActive: { backgroundColor: colors.accent },
-  modePillText: { color: colors.textSecondary, fontSize: 12, fontWeight: '700' },
-  modePillTextActive: { color: colors.background },
-  sourceRow: { flexDirection: 'row', alignItems: 'center', gap: space.s },
-  autoSync: { color: colors.textSecondary, fontSize: 13 },
-  sourceChip: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: radius.pill, backgroundColor: colors.surfaceRaised },
-  sourceChipActive: { backgroundColor: colors.accentMuted },
-  sourceChipText: { color: colors.textSecondary, fontSize: 13, fontWeight: '600' },
-  sourceChipTextActive: { color: colors.accent },
-  refreshChip: { marginLeft: 'auto', paddingHorizontal: 12, paddingVertical: 6, borderRadius: radius.pill, backgroundColor: colors.surface },
-  refreshChipText: { color: colors.text, fontSize: 13, fontWeight: '600' },
+  kickerRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 2 },
+  segmented: { flexDirection: 'row', backgroundColor: colors.surface, borderRadius: radius.small + 2, padding: 3 },
+  segment: { flex: 1, alignItems: 'center', justifyContent: 'center', minHeight: 32, borderRadius: radius.small },
+  segmentActive: { backgroundColor: colors.surfaceRaised },
+  segmentText: { color: colors.textSecondary, fontSize: 13, fontWeight: '600' },
+  segmentTextActive: { color: colors.text },
   tvBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.accentMuted, borderRadius: radius.medium, paddingHorizontal: space.m, paddingVertical: space.s },
   tvBannerDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#34d399' },
   tvBannerText: { color: colors.accent, fontSize: 13, fontWeight: '600', flex: 1 },

@@ -1,8 +1,11 @@
 import { useEventListener } from 'expo';
 import { SymbolView } from 'expo-symbols';
-import { useVideoPlayer, VideoView } from 'expo-video';
+import { isPictureInPictureSupported, useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
+import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
+import Animated, { Easing, interpolate, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
+import { scheduleOnRN } from 'react-native-worklets';
 import type { TimeRange } from 'react-native-anime-core';
 
 import { clock, cueAt } from '../lib/format';
@@ -17,6 +20,8 @@ type Props = {
   episode: Episode;
   neighbours: Episode[];
   fullscreen: boolean;
+  /** Start playing as soon as the episode is ready (episodes opened from the series screen). */
+  autoPlay?: boolean;
   autoSkip: boolean;
   subtitlesOn: boolean;
   onToggleFullscreen: (value?: boolean) => void;
@@ -25,9 +30,26 @@ type Props = {
   hasPrevious: boolean;
   hasNext: boolean;
   onProgress?: () => void;
+  /** PiP started or stopped; `stillPlaying` tells a restore (playing) from closing the window (paused). */
+  onPictureInPictureChange?: (active: boolean, stillPlaying: boolean) => void;
 };
 
+const pipSupported = (() => { try { return isPictureInPictureSupported(); } catch { return false; } })();
+
 const DOUBLE_TAP_MS = 280;
+
+/** False for a player that was already released (closing the episode), instead of throwing. */
+function isPlaying(player: { playing: boolean }) {
+  try { return player.playing; } catch { return false; }
+}
+
+/**
+ * Run something on the video player, or fall back if the native player is already released.
+ * A released player throws on every call and would otherwise close the app.
+ */
+function safe<T>(action: () => T, fallback: T): T {
+  try { return action(); } catch { return fallback; }
+}
 const SKIP_SECONDS = 10;
 const HIDE_AFTER_MS = 3000;
 const skipOrder: SkipPart[] = ['recap', 'op', 'ed'];
@@ -71,9 +93,14 @@ export function Player(props: Props) {
   }, [episode, player]);
 
   const save = useCallback((finished = false) => {
-    const position = player.currentTime;
+    let position: number;
+    let playerDuration: number;
+    try {
+      position = player.currentTime;
+      playerDuration = player.duration;
+    } catch { return; /* Already released (the episode was closed). */ }
     if (!ready || !Number.isFinite(position)) return;
-    const total = player.duration || duration;
+    const total = playerDuration || duration;
     saveProgress(episode.key, { position, duration: total, watchedAt: Date.now(), finished: finished || (total > 0 && position >= total - 5) });
     lastSaved.current = Date.now();
     props.onProgress?.();
@@ -84,8 +111,11 @@ export function Player(props: Props) {
   useEventListener(player, 'statusChange', ({ status }) => {
     if (status !== 'readyToPlay' || ready) return;
     setReady(true);
-    setDuration(player.duration);
-    if (resumeAt.current > 1) player.currentTime = resumeAt.current;
+    safe(() => {
+      setDuration(player.duration);
+      if (resumeAt.current > 1) player.currentTime = resumeAt.current;
+      if (props.autoPlay) player.play();
+    }, undefined);
   });
   useEventListener(player, 'playingChange', ({ isPlaying }) => {
     setPlaying(isPlaying);
@@ -98,16 +128,33 @@ export function Player(props: Props) {
   });
   useEventListener(player, 'timeUpdate', ({ currentTime }) => {
     setTime(currentTime);
-    if (Date.now() - lastSaved.current > 5000 && player.playing) save();
+    if (Date.now() - lastSaved.current > 5000 && isPlaying(player)) save();
   });
 
   // ----- Controls visibility -----
 
+  // Hide the controls 3 s after the last touch while the episode plays. Both the reported playing
+  // state and the player itself count, so one missed event can't keep the controls up for good.
+  const playingRef = useRef(false);
+  useEffect(() => { playingRef.current = playing; }, [playing]);
   const poke = useCallback(() => {
     setControls(true);
     clearTimeout(hideTimer.current);
-    hideTimer.current = setTimeout(() => { if (player.playing) setControls(false); }, HIDE_AFTER_MS);
+    hideTimer.current = setTimeout(() => {
+      if (playingRef.current || isPlaying(player)) setControls(false);
+    }, HIDE_AFTER_MS);
   }, [player]);
+  const controlsOpacity = useSharedValue(1);
+  useEffect(() => {
+    controlsOpacity.set(withTiming(controls ? 1 : 0, { duration: controls ? 150 : 250, easing: Easing.bezier(0.23, 1, 0.32, 1) }));
+  }, [controls, controlsOpacity]);
+  const controlsStyle = useAnimatedStyle(() => ({ opacity: controlsOpacity.get() }));
+
+  // Timers must not outlive the player: reading a released player throws and closes the app.
+  useEffect(() => () => {
+    clearTimeout(hideTimer.current);
+    clearTimeout(tapTimer.current);
+  }, []);
 
   useEffect(() => {
     if (playing) poke();
@@ -117,22 +164,21 @@ export function Player(props: Props) {
   // ----- Playback actions -----
 
   const seekTo = useCallback((seconds: number) => {
-    const total = player.duration || duration;
+    const total = safe(() => player.duration, 0) || duration;
     const target = Math.max(0, total ? Math.min(total - 0.25, seconds) : seconds);
-    player.currentTime = target;
+    safe(() => { player.currentTime = target; }, undefined);
     setTime(target);
   }, [player, duration]);
 
   const togglePlay = useCallback(() => {
-    if (player.playing) player.pause();
-    else player.play();
+    safe(() => { if (player.playing) player.pause(); else player.play(); }, undefined);
     haptics.tap();
     poke();
   }, [player, poke]);
 
   const seekBy = useCallback((seconds: number, side: 'left' | 'right') => {
-    const total = player.duration || duration;
-    const at = player.currentTime;
+    const total = safe(() => player.duration, 0) || duration;
+    const at = safe(() => player.currentTime, 0);
     if ((seconds < 0 && at <= 0.5) || (seconds > 0 && total && at >= total - 1)) haptics.edge();
     else haptics.seek();
     seekTo(at + seconds);
@@ -161,16 +207,18 @@ export function Player(props: Props) {
     }
     clearTimeout(tapTimer.current);
     tapTimer.current = setTimeout(() => {
-      if (!started) { player.play(); haptics.tap(); return; }
-      if (!controls && player.playing) { poke(); return; }
-      togglePlay();
+      try {
+        if (!started) { player.play(); haptics.tap(); return; }
+        if (!controls && player.playing) { poke(); return; }
+        togglePlay();
+      } catch { /* The player was closed in the meantime. */ }
     }, DOUBLE_TAP_MS);
   }, [width, props, seekBy, togglePlay, started, controls, player, poke]);
 
   const playFullscreen = useCallback(() => {
     haptics.tap();
     props.onToggleFullscreen(true);
-    player.play();
+    safe(() => player.play(), undefined);
   }, [player, props]);
 
   // ----- Opening / ending / recap -----
@@ -185,14 +233,14 @@ export function Player(props: Props) {
 
   const skip = useCallback((part: SkipPart, range: TimeRange, automatic: boolean) => {
     dismissed.current.add(part);
-    const total = player.duration || duration;
+    const total = safe(() => player.duration, 0) || duration;
     // An ending that runs to the end of the file goes straight to the next episode.
     if (part === 'ed' && total && range.end >= total - 3 && props.hasNext) {
       save(true);
       props.onStep?.(1, true);
       return;
     }
-    setUndo({ part, from: player.currentTime });
+    setUndo({ part, from: safe(() => player.currentTime, range.start) });
     seekTo(range.end);
     haptics.skipped();
     if (!automatic) poke();
@@ -214,12 +262,65 @@ export function Player(props: Props) {
   const cueIndex = subtitlesOn ? cueAt(study.cues, time) : -1;
   const cue = cueIndex >= 0 ? study.cues[cueIndex] : undefined;
 
-  const total = duration || player.duration || 0;
+  const total = duration || safe(() => player.duration, 0) || 0;
   const showBigPlay = !started && !fullscreen && ready;
 
+  // Swipe down to leave fullscreen: the video follows the finger, shrinks and rounds its corners,
+  // then either closes (far enough or flicked) or springs back.
+  const { height: screenHeight } = useWindowDimensions();
+  const videoView = useRef<VideoView>(null);
+  // Split View / Slide Over: a narrow window keeps only the essential controls.
+  const narrow = width < 560;
+  const reduced = useReducedMotion();
+  const dragY = useSharedValue(0);
+  const dismiss = useCallback(() => {
+    haptics.tap();
+    props.onToggleFullscreen(false);
+    // With PiP on, the player stays mounted (hidden); put it back in place for when it returns.
+    setTimeout(() => dragY.set(0), 300);
+  }, [props, dragY]);
+  const swipeDown = usePanGesture({
+    enabled: fullscreen,
+    activeOffsetY: 18,
+    failOffsetX: [-24, 24],
+    onUpdate: event => {
+      'worklet';
+      dragY.set(Math.max(0, event.translationY));
+    },
+    onDeactivate: event => {
+      'worklet';
+      if (event.translationY > 140 || (event.velocityY > 900 && event.translationY > 40)) {
+        dragY.set(withTiming(screenHeight, { duration: 220, easing: Easing.bezier(0.23, 1, 0.32, 1) }));
+        scheduleOnRN(dismiss);
+      } else {
+        dragY.set(withSpring(0, { duration: 400, dampingRatio: 0.8, velocity: event.velocityY }));
+      }
+    },
+  });
+  const dragStyle = useAnimatedStyle(() => {
+    const y = dragY.get();
+    return {
+      borderRadius: interpolate(y, [0, 200], [0, 24], 'clamp'),
+      opacity: reduced ? interpolate(y, [0, 300], [1, 0.4], 'clamp') : 1,
+      transform: reduced ? [] : [{ translateY: y }, { scale: interpolate(y, [0, 400], [1, 0.82], 'clamp') }],
+    };
+  });
+
   return (
-    <View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
-      <VideoView player={player} style={StyleSheet.absoluteFill} nativeControls={false} contentFit="contain" allowsPictureInPicture />
+    <GestureDetector gesture={swipeDown}>
+    <Animated.View style={[styles.frame, fullscreen ? styles.fullscreen : styles.inline, dragStyle]} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
+      <VideoView
+        ref={videoView}
+        player={player}
+        style={StyleSheet.absoluteFill}
+        nativeControls={false}
+        contentFit="contain"
+        allowsPictureInPicture
+        // Going home while an episode plays keeps it on screen in a floating window.
+        startsPictureInPictureAutomatically
+        onPictureInPictureStart={() => props.onPictureInPictureChange?.(true, true)}
+        onPictureInPictureStop={() => props.onPictureInPictureChange?.(false, isPlaying(player))}
+      />
       <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to play or pause, double-tap a side to skip 10 seconds." />
 
       {!ready && <ActivityIndicator style={styles.center} color={colors.text} size="large" />}
@@ -255,17 +356,24 @@ export function Player(props: Props) {
         ) : null}
       </View>
 
-      {controls && started && (
-        <View pointerEvents="box-none" style={[styles.barArea, fullscreen && styles.barAreaFullscreen]}>
+      {started && (
+        <Animated.View pointerEvents={controls ? 'box-none' : 'none'} style={[styles.barArea, fullscreen && styles.barAreaFullscreen, controlsStyle]}>
           <Glass style={styles.bar}>
             <Scrubber time={time} total={total} skips={study.skips} onSeek={(t) => { seekTo(t); poke(); }} />
             <View style={styles.row}>
-              <IconButton name="backward.end.fill" label="Previous episode" size={18} disabled={!props.hasPrevious} onPress={() => { haptics.select(); props.onStep?.(-1, playing); }} />
+              {!narrow && <IconButton name="backward.end.fill" label="Previous episode" size={18} disabled={!props.hasPrevious} onPress={() => { haptics.select(); props.onStep?.(-1, playing); }} />}
               <IconButton name="gobackward.10" label="Back 10 seconds" onPress={() => seekBy(-SKIP_SECONDS, 'left')} />
               <IconButton name={playing ? 'pause.fill' : 'play.fill'} label={playing ? 'Pause' : 'Play'} size={26} onPress={togglePlay} />
               <IconButton name="goforward.10" label="Forward 10 seconds" onPress={() => seekBy(SKIP_SECONDS, 'right')} />
-              <IconButton name="forward.end.fill" label="Next episode" size={18} disabled={!props.hasNext} onPress={() => { haptics.select(); props.onStep?.(1, playing); }} />
-              <Text style={styles.time} numberOfLines={1}>{clock(time)} / {clock(total)}</Text>
+              {!narrow && <IconButton name="forward.end.fill" label="Next episode" size={18} disabled={!props.hasNext} onPress={() => { haptics.select(); props.onStep?.(1, playing); }} />}
+              <Text style={styles.time} numberOfLines={1}>{narrow ? clock(time) : `${clock(time)} / ${clock(total)}`}</Text>
+              {pipSupported && (
+                <IconButton
+                  name="pip.enter"
+                  label="Picture in Picture"
+                  onPress={() => { haptics.select(); void videoView.current?.startPictureInPicture().catch(() => {}); poke(); }}
+                />
+              )}
               <IconButton
                 name={subtitlesOn ? 'captions.bubble.fill' : 'captions.bubble'}
                 label={subtitlesOn ? 'Hide subtitles' : 'Show subtitles'}
@@ -276,13 +384,14 @@ export function Player(props: Props) {
               <IconButton
                 name={fullscreen ? 'arrow.down.right.and.arrow.up.left' : 'arrow.up.left.and.arrow.down.right'}
                 label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-                onPress={() => { haptics.select(); props.onToggleFullscreen(); poke(); }}
+                onPress={() => { haptics.select(); props.onToggleFullscreen(!fullscreen); poke(); }}
               />
             </View>
           </Glass>
-        </View>
+        </Animated.View>
       )}
-    </View>
+    </Animated.View>
+    </GestureDetector>
   );
 }
 
@@ -340,7 +449,7 @@ const styles = StyleSheet.create({
   subtitleLarge: { fontSize: 28, lineHeight: 38 },
   skipArea: { position: 'absolute', right: space.l, alignItems: 'flex-end' },
   barArea: { position: 'absolute', left: space.s, right: space.s, bottom: space.s },
-  barAreaFullscreen: { left: space.xl * 2, right: space.xl * 2, bottom: space.xl },
+  barAreaFullscreen: { left: space.l, right: space.l, bottom: space.xl },
   bar: { paddingHorizontal: space.s, paddingTop: space.s },
   row: { flexDirection: 'row', alignItems: 'center' },
   time: { flex: 1, color: colors.textSecondary, fontVariant: ['tabular-nums'], fontSize: 13, textAlign: 'right', marginRight: space.s },

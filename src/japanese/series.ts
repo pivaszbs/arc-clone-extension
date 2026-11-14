@@ -37,7 +37,41 @@ export function seriesRoot(value: string) {
   return new URL(`/catalog/${path}`, url);
 }
 
-type CatalogLink = { href: string; textContent: string; className: string };
+function safeName(name: string) {
+  return name.replace(/[^\p{L}\p{N} -]/gu, '').trim().slice(0, 60) || 'Series';
+}
+
+export type SeriesFile = { url: string; name: string; kind: 'video' | 'subtitle' };
+
+/**
+ * The folder and file names for the chosen episodes, shared by Chrome and the phone so a series
+ * downloaded on either one has the same names (progress and skip timings are keyed by them).
+ */
+export function seriesFiles(plan: SeriesPlan, selectedPages: string[]): { folder: string; files: SeriesFile[] } {
+  const series = seriesRoot(plan.series);
+  const edition = plan.edition && plan.edition !== 'Japanese subtitles' ? ` - ${safeName(plan.edition)}` : '';
+  const folder = `${safeName(plan.title)} - ${series.pathname.match(/\d+$/)![0]}${edition}`;
+  const files: SeriesFile[] = [];
+  const selection = new Set(selectedPages);
+  for (const [index, episode] of plan.episodes.entries()) {
+    if (!episode.video || !selection.has(episode.page)) continue;
+    const video = new URL(episode.video.url);
+    const videoId = video.pathname.match(/^\/translations\/mp4\/(\d+)\/?$/i)?.[1];
+    if (video.origin !== series.origin || video.username || video.password || !videoId) throw new Error('An episode has an invalid video link.');
+    const name = `Episode ${String(index + 1).padStart(3, '0')} - ${videoId}`;
+    if (episode.subtitle) {
+      const subtitle = new URL(episode.subtitle);
+      const sub = subtitle.pathname.match(/^\/translations\/(ass|ssa|srt|vtt)\/(\d+)\/?$/i);
+      if (subtitle.origin !== series.origin || subtitle.username || subtitle.password || sub?.[2] !== videoId) throw new Error('An episode has mismatched download links.');
+      files.push({ url: subtitle.href, name: `${name}.${sub[1].toLowerCase()}`, kind: 'subtitle' });
+    }
+    files.push({ url: video.href, name: `${name}.mp4`, kind: 'video' });
+  }
+  if (!files.length) throw new Error('There are no downloadable episodes in this edition.');
+  return { folder, files };
+}
+
+type CatalogLink ={ href: string; textContent: string; className: string };
 type CatalogPage = { links: CatalogLink[]; title: string; editionTitle: string };
 type CatalogNode = DefaultTreeAdapterTypes.Node;
 

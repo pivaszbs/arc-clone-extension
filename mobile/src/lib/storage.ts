@@ -5,7 +5,7 @@ import { canonicalEpisodeKey, setLocal } from './replica';
 export const DEFAULT_TV_SERVER_URL = 'http://10.131.140.3:46158/cf7f1d1d391d8231/';
 
 export type Progress = { position: number; duration: number; watchedAt: number; finished: boolean };
-export type Settings = { autoSkip: boolean; subtitles: boolean; tvServerUrl: string };
+export type Settings = { autoSkip: boolean; subtitles: boolean; tvServerUrl: string; /** The tab to reopen on. */ tab?: 'watch' | 'download' | 'pipelines' };
 type State = { progress: Record<string, Progress>; settings: Settings };
 
 const folder = new Directory(Paths.document, '.anime-study');

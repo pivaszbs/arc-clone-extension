@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import socket
 import struct
 import threading
 import hashlib
@@ -58,6 +59,7 @@ def default_queue_path(folder):
     return QUEUE_DIR / f"queue-{digest}.sqlite3"
 MEDIA_PATH = re.compile(r"(?:(\d+)/)?(\d+)/(video|subtitles)")
 POSTER_PATH = re.compile(r"(\d+)/poster")
+WS_SEND_TIMEOUT_SECONDS = 5
 SERIES_ID_RE = re.compile(r"\s-\s(\d+)(?:\s-\s|$)")
 
 
@@ -136,7 +138,7 @@ class TVHandler(BaseHTTPRequestHandler):
         resource = self.path[len(prefix):] if self.path.startswith(prefix) else None
         if resource in ASSETS:
             label = ASSETS[resource][0]
-        elif resource in ("library.json", "catalog.json", "sync", "worker/status", "worker/claim", "worker/progress", "worker/complete", "worker/retry", "replica/sync") or (resource and MEDIA_PATH.fullmatch(resource)):
+        elif resource in ("library.json", "catalog.json", "status.json", "sync", "worker/status", "worker/claim", "worker/progress", "worker/complete", "worker/retry", "replica/sync") or (resource and MEDIA_PATH.fullmatch(resource)):
             label = resource
         else:
             label = "unknown resource"
@@ -170,6 +172,8 @@ class TVHandler(BaseHTTPRequestHandler):
         if path == f"/{self.server.token}/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
             self.handle_websocket()
             return
+        if path == f"/{self.server.token}/downloads":
+            return self._send_json({"requests": self.server.download_requests()})
         if path == f"/{self.server.token}/worker/status":
             data = json.dumps(self.server.get_worker_status()).encode("utf-8")
             self.respond("application/json; charset=utf-8", len(data))
@@ -282,6 +286,17 @@ class TVHandler(BaseHTTPRequestHandler):
                 if body is None:
                     return self.send_error(400)
                 self._send_json(self.server.replica_sync(body))
+            elif resource == "downloads/request":
+                body = self._read_json_body(16_384)
+                if body is None:
+                    return self.send_error(400)
+                request = self.server.request_download(body)
+                self._send_json({"request": request} if request else {"error": "Open an Anime365 series first."}, code=200 if request else 400)
+            elif resource == "downloads/update":
+                body = self._read_json_body(262_144)
+                if body is None:
+                    return self.send_error(400)
+                self._send_json(self.server.update_download(body))
             elif resource == "worker/retry":
                 body = self._read_json_body(65_536)
                 if body is None:
@@ -300,8 +315,9 @@ class TVHandler(BaseHTTPRequestHandler):
             return self.send_error(404)
         resource = path[len(prefix):]
         try:
-            if resource in ("library.json", "catalog.json"):
-                payload = self.server.library(0) if resource == "library.json" else self.server.catalog()
+            if resource in ("library.json", "catalog.json", "status.json"):
+                payload = (self.server.library(0) if resource == "library.json"
+                           else self.server.status() if resource == "status.json" else self.server.catalog())
                 data = json.dumps(payload).encode("utf-8")
                 self.respond("application/json; charset=utf-8", len(data))
                 if self.command == "GET":
@@ -400,6 +416,7 @@ class TVServer(ThreadingHTTPServer):
         self.meta_lock = threading.Lock()
         self.ws_lock = threading.Lock()
         self.worker_lock = threading.Lock()
+        self.downloads_lock = threading.Lock()
         self.ws_clients = set()
         self.tv_state = {"type": "tv_state", "active": False}
         self.tv_state_conn = None
@@ -411,6 +428,9 @@ class TVServer(ThreadingHTTPServer):
         self.episode_state = self.store.load_episodes()   # (series, episode) -> {state, attempts, notBefore, error}
         self.stage_state = self.store.load_stages()      # kind -> {(series, episode) -> {..., result}}
         self.series_samples = self.store.load_samples()
+        # Fingerprint results that found no opening or ending, and those already given a second try.
+        self.empty_fingerprints = set()
+        self.rechecked_fingerprints = set()
         self._requeue_outdated_fingerprints()
         self.store.log_event("coordinator_start", data={"resumedJobs": len(self.worker_jobs)})
         # Master-master library state shared with phones (replica.py).
@@ -459,12 +479,96 @@ class TVServer(ThreadingHTTPServer):
         return None
 
     def add_ws(self, conn):
+        # A client that stops reading (a phone asleep) must not block broadcasts forever: give sends
+        # a timeout, after which broadcast() drops the client. Reads keep blocking as before.
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", WS_SEND_TIMEOUT_SECONDS, 0))
+        except (OSError, struct.error):
+            pass
         with self.ws_lock:
             self.ws_clients.add(conn)
 
     def remove_ws(self, conn):
         with self.ws_lock:
             self.ws_clients.discard(conn)
+
+    # Series download requests: a phone or iPad asks for a series, and Chrome on this Mac (signed in to
+    # Anime365) claims the request, downloads it into this library and reports progress back here.
+    DOWNLOAD_STATES = ("pending", "planning", "downloading", "done", "failed")
+
+    def _downloads_path(self):
+        return self.folder / ".anime-study-download-requests.json"
+
+    def _read_downloads(self):
+        try:
+            saved = json.loads(self._downloads_path().read_text(encoding="utf-8"))
+            return [item for item in saved.get("requests", []) if isinstance(item, dict)]
+        except (OSError, ValueError, AttributeError):
+            return []
+
+    def _write_downloads(self, requests):
+        path = self._downloads_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"requests": requests[-50:]}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+
+    def download_requests(self):
+        with self.downloads_lock:
+            return self._read_downloads()
+
+    def request_download(self, body):
+        url = body.get("url")
+        if not isinstance(url, str) or len(url) > 2_000:
+            return None
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        anime365 = any(host == domain or host.endswith("." + domain) for domain in ("smotret-anime.com", "smotret-anime.net"))
+        if parts.scheme != "https" or not anime365 or parts.username or parts.password or parts.port or not parts.path.startswith("/catalog/"):
+            return None
+        title = body.get("title") if isinstance(body.get("title"), str) else ""
+        device = body.get("from") if isinstance(body.get("from"), str) else ""
+        with self.downloads_lock:
+            requests = self._read_downloads()
+            for item in requests:
+                if item.get("url") == url and item.get("state") in ("pending", "planning", "downloading"):
+                    return item
+            request = {
+                "id": secrets.token_hex(6), "url": url, "title": title[:200], "from": device[:60],
+                "state": "pending", "detail": "Waiting for Chrome on the Mac", "createdAt": int(time.time() * 1000),
+            }
+            requests.append(request)
+            self._write_downloads(requests)
+        self.broadcast({"type": "downloads", "requests": requests[-50:]})
+        return request
+
+    def update_download(self, body):
+        """Chrome reports progress. With a planned folder and file names, answers which are already here."""
+        existing = []
+        folder_name = body.get("folder")
+        if isinstance(folder_name, str) and folder_name and "/" not in folder_name and "\\" not in folder_name and not folder_name.startswith("."):
+            folder = self.folder / folder_name
+            names = body.get("files") if isinstance(body.get("files"), list) else []
+            existing = [name for name in names[:2_000] if isinstance(name, str) and "/" not in name and (folder / name).is_file()]
+        with self.downloads_lock:
+            requests = self._read_downloads()
+            for item in requests:
+                if item.get("id") != body.get("id"):
+                    continue
+                if body.get("state") in self.DOWNLOAD_STATES:
+                    item["state"] = body["state"]
+                for key, limit in (("detail", 300), ("title", 200), ("folder", 200)):
+                    if isinstance(body.get(key), str):
+                        item[key] = body[key][:limit]
+                for key in ("done", "total"):
+                    if isinstance(body.get(key), int):
+                        item[key] = body[key]
+                item["updatedAt"] = int(time.time() * 1000)
+                self._write_downloads(requests)
+                break
+        self.broadcast({"type": "downloads", "requests": requests[-50:]})
+        if body.get("state") == "done":
+            self.refresh_series()
+        return {"ok": True, "existing": existing}
 
     def broadcast(self, event, exclude=None):
         frame = ws_encode_text(json.dumps(event))
@@ -727,6 +831,55 @@ class TVServer(ThreadingHTTPServer):
         except (OSError, ValueError):
             return None
 
+    DEVICE_KINDS = {"ios": "iPhone", "chrome": "Chrome", "tv": "TV", "phone": "iPhone", "mac": "Mac"}
+
+    def status(self):
+        """Everything a dashboard needs in one request (phone "Server" screen, extension Pipelines)."""
+        workers = self.get_worker_status()
+        series = [self.library(index) for index in range(len(self.series))]
+        episodes = [ep for item in series for ep in item["episodes"]]
+        with_timings = sum(1 for ep in episodes
+                           if any(isinstance((ep["saved"].get("themes") or {}).get(part), dict) for part in ("op", "ed", "recap")))
+        name, ts_ip = tailscale_self()
+        with self.ws_lock:
+            live = len(self.ws_clients)
+        now = time.time()
+        devices = []
+        for node, last in self.store.sync_peers():
+            prefix = node.split("-", 1)[0]
+            devices.append({"node": node, "kind": self.DEVICE_KINDS.get(prefix, prefix or "Device"),
+                            "lastSync": last, "secondsAgo": max(0, int(now - last))})
+        return {
+            "version": 1,
+            "serverTime": now,
+            "detectorVersion": self.FINGERPRINT_DETECTOR_VERSION,
+            "addresses": self.addresses(),
+            "tailscale": {"running": bool(name or ts_ip), "name": name},
+            "library": {
+                "series": len(series),
+                "episodes": len(episodes),
+                "withTimings": with_timings,
+                "perSeries": [{
+                    "folder": item["folder"], "title": item["title"], "episodes": len(item["episodes"]),
+                    "withTimings": sum(1 for ep in item["episodes"]
+                                       if any(isinstance((ep["saved"].get("themes") or {}).get(part), dict) for part in ("op", "ed", "recap"))),
+                } for item in series],
+            },
+            "tv": self.get_tv_state(),
+            "liveConnections": live,
+            "devices": devices,
+            "workers": {
+                "nodes": workers.get("nodes", []),
+                "counts": workers.get("counts", {}),
+                "stages": workers.get("stages", {}),
+                "tvBusy": workers.get("tvBusy", False),
+                "jobs": workers.get("jobs", []),
+                "next": [{"seriesName": item.get("seriesName"), "episode": item.get("episode"), "kind": item.get("kind")}
+                         for item in (workers.get("pendingPreview") or [])[:5]],
+                "quarantinedEpisodes": workers.get("quarantinedEpisodes", []),
+            },
+        }
+
     def catalog(self):
         self.refresh_series()
         return {
@@ -815,7 +968,10 @@ class TVServer(ThreadingHTTPServer):
     STAGE_KINDS = ("probe", "fingerprint")
     # Bump when worker.py's OP/ED detection changes so finished episodes are processed again.
     # v2: ending songs matched by soundtrack (audio_print.py).
-    FINGERPRINT_DETECTOR_VERSION = 2
+    # v3: several reference episodes (nearest first, not the first episode); episodes that found
+    #     nothing are checked again once another episode of the series finds its opening or ending.
+    FINGERPRINT_DETECTOR_VERSION = 3
+    FINGERPRINT_REFERENCES = 3
 
     def _requeue_outdated_fingerprints(self):
         outdated = [key for key, info in self.episode_state.items()
@@ -1228,18 +1384,25 @@ class TVServer(ThreadingHTTPServer):
                 "leaseSeconds": self.WORKER_LEASE_SECONDS,
             }
             if kind == "fingerprint":
-                # Prefer cached reference samples from another episode in the same series.
-                # Samples saved before soundtrack matching lack "edAudio"; sample a fresh reference instead.
-                ref_samples = None
-                for (s_name, r_name), cached in self.series_samples.items():
-                    if s_name == series_name and r_name != ep_name and "edAudio" in cached:
-                        if cached.get("edAudio") or ref_samples is None:
-                            ref_samples = cached
-                        if cached.get("edAudio"):
-                            break
+                # Compare against several other episodes of the series, nearest first. One reference is
+                # not enough: a first episode often has no opening (or a special ending), and matching
+                # only against it finds nothing in every later episode.
+                names = [file.name for file, _ in episodes]
+                cached = [(r_name, samples) for (s_name, r_name), samples in self.series_samples.items()
+                          if s_name == series_name and r_name != ep_name and r_name in names and "edAudio" in samples]
+                cached.sort(key=lambda item: (names.index(item[0]) == 0, abs(names.index(item[0]) - ep_idx)))
+                references = [samples for _, samples in cached[:self.FINGERPRINT_REFERENCES]]
+                ref_samples = references[0] if references else None
+                job_payload["referenceSamplesList"] = references
                 ref_episode = None
                 if ref_samples is None:
-                    ref_idx = 0 if ep_idx != 0 else 1
+                    # Sample a neighbour, avoiding the first episode when there is another choice.
+                    if ep_idx - 1 >= 1:
+                        ref_idx = ep_idx - 1
+                    elif ep_idx + 1 < len(episodes):
+                        ref_idx = ep_idx + 1
+                    else:
+                        ref_idx = 0 if ep_idx != 0 else 1
                     ref_file, _ = episodes[ref_idx]
                     ref_episode = {
                         "episode": ref_file.name,
@@ -1374,7 +1537,20 @@ class TVServer(ThreadingHTTPServer):
                 job["progress"] = 100
                 self.store.save_job(job)
                 self._record_done_locked(key, job_id, node_id)
-                if isinstance(themes, dict) and any(isinstance(themes.get(p), dict) for p in ("op", "ed", "recap")):
+                found = isinstance(themes, dict) and any(isinstance(themes.get(p), dict) for p in ("op", "ed", "recap"))
+                if not found:
+                    self.empty_fingerprints.add(key)
+                else:
+                    self.empty_fingerprints.discard(key)
+                    # Episodes of this series that found nothing (often because their only reference
+                    # was an unusual episode) get one more try, now with this episode as a reference.
+                    for other in [k for k in self.empty_fingerprints if k[0] == series_name and k not in self.rechecked_fingerprints]:
+                        self.empty_fingerprints.discard(other)
+                        self.rechecked_fingerprints.add(other)
+                        self.episode_state.pop(other, None)
+                        self.store.delete_episode(other)
+                        self.store.log_event("recheck_requested", data={"series": other[0], "episode": other[1]})
+                if found:
                     sync_payload = {
                         "series": series_idx,
                         "seriesName": series_name,
