@@ -209,8 +209,9 @@ export function Player(props: Props) {
     tapTimer.current = setTimeout(() => {
       try {
         if (!started) { player.play(); haptics.tap(); return; }
-        if (!controls && player.playing) { poke(); return; }
-        togglePlay();
+        // A tap shows or hides the controls (play and pause are on the bar), like the TV and YouTube.
+        if (controls) { clearTimeout(hideTimer.current); setControls(false); }
+        else poke();
       } catch { /* The player was closed in the meantime. */ }
     }, DOUBLE_TAP_MS);
   }, [width, props, seekBy, togglePlay, started, controls, player, poke]);
@@ -321,7 +322,7 @@ export function Player(props: Props) {
         onPictureInPictureStart={() => props.onPictureInPictureChange?.(true, true)}
         onPictureInPictureStop={() => props.onPictureInPictureChange?.(false, isPlaying(player))}
       />
-      <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to play or pause, double-tap a side to skip 10 seconds." />
+      <Pressable style={StyleSheet.absoluteFill} onPress={onSurfacePress} accessibilityLabel="Video. Tap to show or hide the controls, double-tap a side to skip 10 seconds." />
 
       {!ready && <ActivityIndicator style={styles.center} color={colors.text} size="large" />}
 
