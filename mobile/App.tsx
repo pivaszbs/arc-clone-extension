@@ -2,13 +2,14 @@ import * as ScreenOrientation from 'expo-screen-orientation';
 import { StatusBar } from 'expo-status-bar';
 import { SymbolView } from 'expo-symbols';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActionSheetIOS, Alert, AppState, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
+import { ActionSheetIOS, Alert, AppState, Platform, Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import { DownloadView } from './src/components/DownloadView';
-import { EpisodeList } from './src/components/EpisodeList';
 import { PipelinesView, type ImportPipelineState, type LocalScanState } from './src/components/PipelinesView';
 import { Player } from './src/components/Player';
+import { SeriesGallery } from './src/components/SeriesGallery';
+import { SeriesScreen } from './src/components/SeriesScreen';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
 import { AutoSync, installCrashLog, type AutoSyncState } from './src/lib/auto-sync';
 import { haptics } from './src/lib/haptics';
@@ -37,20 +38,6 @@ installCrashLog();
 type AppMode = 'watch' | 'download' | 'pipelines';
 type LibrarySource = 'server' | 'local';
 
-function latestEpisode(series: Series) {
-  const progress = allProgress();
-  let best: Episode | undefined;
-  let at = 0;
-  for (const episode of series.episodes) {
-    const saved = progress[episode.key];
-    if (saved && saved.watchedAt > at) { at = saved.watchedAt; best = episode; }
-  }
-  if (!best) return series.episodes[0];
-  // A finished episode continues with the next one.
-  const index = series.episodes.indexOf(best);
-  return progress[best.key]?.finished && series.episodes[index + 1] ? series.episodes[index + 1] : best;
-}
-
 function autoSyncLine(state: AutoSyncState) {
   const kept = state.kept ? `${state.kept} episode${state.kept === 1 ? '' : 's'} kept from the Mac` : 'Keeps your next episodes from the Mac';
   switch (state.status) {
@@ -72,7 +59,6 @@ export default function App() {
 
 function Study() {
   const { width } = useWindowDimensions();
-  const wide = width >= 700;
   const initialServerUrl = normalizeTvServerUrl(savedSettings().tvServerUrl || DEFAULT_TV_SERVER_URL);
   const [mode, setMode] = useState<AppMode>('watch');
   const [source, setSource] = useState<LibrarySource>('server');
@@ -93,7 +79,6 @@ function Study() {
   const [library, setLibrary] = useState<Series[]>([]);
   const [folder, setFolder] = useState<string | null>(null);
   const [episodeKey, setEpisodeKey] = useState<string | null>(null);
-  const [fullscreen, setFullscreen] = useState(false);
   const [settings, setSettings] = useState(savedSettings);
   const [, setRevision] = useState(0);
   const refreshProgress = useCallback(() => setRevision(value => value + 1), []);
@@ -325,13 +310,10 @@ function Study() {
 
   const tvControlling = Boolean(tvState?.active) && source === 'server' && !playOnPhoneOverride;
 
-  const series = library.find(item => item.folder === folder) ?? library[0];
-  const episode = series?.episodes.find(item => item.key === episodeKey) ?? (series ? latestEpisode(series) : undefined);
-  const tvEpisodeKey = useMemo(() => {
-    if (!tvControlling || !series || !tvState?.episode) return undefined;
-    if (tvState.seriesName && series.folder !== tvState.seriesName) return undefined;
-    return series.episodes.find(item => item.video === tvState.episode)?.key;
-  }, [series, tvControlling, tvState?.episode, tvState?.seriesName]);
+  // Like the TV app: a wall of covers, then one series, then the episode on the whole screen.
+  const series = library.find(item => item.folder === folder);
+  const episode = series?.episodes.find(item => item.key === episodeKey);
+  const fullscreen = !!episode && !tvControlling;
   const index = series && episode ? series.episodes.indexOf(episode) : -1;
   const neighbours = useMemo(
     () => (series && index >= 0 ? series.episodes.slice(Math.max(0, index - 2), index + 3) : []),
@@ -475,11 +457,8 @@ function Study() {
           {!tvControlling && (
             <>
               <Text style={styles.title} numberOfLines={2}>
-                {mode === 'pipelines' ? 'Pipelines' : mode === 'download' ? 'Download' : (series?.title ?? (source === 'server' ? 'Mac Server' : 'Offline Study'))}
+                {mode === 'pipelines' ? 'Pipelines' : mode === 'download' ? 'Download' : 'Library'}
               </Text>
-              {mode === 'watch' && !!series?.credit && (
-                <View style={styles.credit}><Text style={styles.creditText} numberOfLines={1}>{series.credit}</Text></View>
-              )}
             </>
           )}
         </View>
@@ -507,7 +486,7 @@ function Study() {
           )}
         </View>
       </View>
-      {mode === 'watch' && (
+      {mode === 'watch' && !series && (
         <>
           {!tvControlling && (
             <View style={styles.sourceRow}>
@@ -540,49 +519,10 @@ function Study() {
           {!tvControlling && source === 'local' && (
             <Text style={styles.autoSync} numberOfLines={2}>{autoSyncLine(autoSync)}</Text>
           )}
-          {library.length > 1 && (
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
-              {library.map(item => {
-                const active = item.folder === series?.folder;
-                return (
-                  <Pressable
-                    key={item.folder || '_root'}
-                    onPress={() => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
-                    style={[styles.chip, active && styles.chipActive]}
-                  >
-                    <Text style={[styles.chipText, active && { color: colors.background }]} numberOfLines={1}>{item.title}</Text>
-                  </Pressable>
-                );
-              })}
-            </ScrollView>
-          )}
-          {!tvControlling && (
-            <View style={styles.settingRow}>
-              <Text style={styles.settingText}>Auto-skip opening, ending and recap</Text>
-              <Switch
-                value={settings.autoSkip}
-                onValueChange={value => { haptics.select(); updateSettings({ autoSkip: value }); }}
-                trackColor={{ true: colors.accent }}
-              />
-            </View>
-          )}
         </>
       )}
     </View>
   );
-
-  const tvSwitchBanner = tvState?.active && source === 'server' && playOnPhoneOverride && !fullscreen ? (
-    <Pressable
-      accessibilityRole="button"
-      onPress={() => { haptics.select(); setPlayOnPhoneOverride(false); }}
-      style={styles.tvBanner}
-    >
-      <View style={styles.tvBannerDot} />
-      <Text style={styles.tvBannerText} numberOfLines={1}>
-        TV is playing {tvState.episodeLabel || tvState.episode || ''} · Tap for TV remote
-      </Text>
-    </Pressable>
-  ) : null;
 
   const player = tvControlling && tvState ? (
     <TvRemotePanel
@@ -591,16 +531,19 @@ function Study() {
       onCommand={command => tvSyncRef.current?.sendTvControl(command)}
       onPlayOnPhone={() => setPlayOnPhoneOverride(true)}
     />
-  ) : episode && (
-    <View style={fullscreen ? { flex: 1 } : { gap: space.s }}>
-      {tvSwitchBanner}
+  ) : null;
+
+  const fullscreenPlayer = episode && (
+    <View style={{ flex: 1 }}>
       <Player
         episode={episode}
         neighbours={neighbours}
-        fullscreen={fullscreen}
+        fullscreen
+        autoPlay
         autoSkip={settings.autoSkip}
         subtitlesOn={settings.subtitles}
-        onToggleFullscreen={value => setFullscreen(current => value ?? !current)}
+        // The exit button goes back to the series; a double tap in the middle does nothing here.
+        onToggleFullscreen={value => { if (value === false) setEpisodeKey(null); }}
         onToggleSubtitles={() => updateSettings({ subtitles: !settings.subtitles })}
         onStep={direction => step(direction)}
         hasPrevious={index > 0}
@@ -679,19 +622,19 @@ function Study() {
     />
   );
 
-  const list = series && (
-    <EpisodeList
-      episodes={series.episodes}
-      current={tvControlling ? tvEpisodeKey : episode?.key}
+  const seriesScreen = series && (
+    <SeriesScreen
+      series={series}
       progress={allProgress()}
-      onSelect={selectEpisode}
+      width={width}
+      autoSkip={settings.autoSkip}
+      onAutoSkip={value => updateSettings({ autoSkip: value })}
+      onBack={() => { setFolder(null); setEpisodeKey(null); }}
+      onPlay={selectEpisode}
       onToggleWatched={ep => toggleEpisodeWatched(ep, series)}
-      header={wide ? header : undefined}
+      extra={player}
     />
   );
-
-  // Hidden sections keep their place in the tree so the video player is never remounted.
-  const hide = fullscreen ? styles.hidden : undefined;
 
   return (
     <View style={styles.root}>
@@ -707,27 +650,22 @@ function Study() {
             {header}
             <DownloadView serverUrl={serverUrl} onMacProgress={kickAutoSync} />
           </View>
-        ) : !series ? (
-          <View style={{ flex: 1 }}>{header}{empty}</View>
-        ) : wide ? (
-          <View style={styles.split}>
-            <View style={[styles.sidebar, { width: Math.min(380, width * 0.36) }, hide]}>{list}</View>
-            <View style={[styles.main, fullscreen && styles.mainFullscreen]}>
-              {player}
-              {!tvControlling && (
-                <View style={hide}>
-                  <Text style={styles.nowPlaying} numberOfLines={1}>{episode?.label}</Text>
-                  <Text style={styles.fileName} numberOfLines={1}>{episode?.video}</Text>
-                </View>
-              )}
-            </View>
+        ) : fullscreenPlayer ? (
+          fullscreenPlayer
+        ) : seriesScreen ? (
+          <View style={{ flex: 1 }}>{header}{seriesScreen}</View>
+        ) : library.length ? (
+          <View style={{ flex: 1 }}>
+            <SeriesGallery
+              series={library}
+              progress={allProgress()}
+              width={width}
+              header={header}
+              onOpen={item => { haptics.select(); setFolder(item.folder); setEpisodeKey(null); }}
+            />
           </View>
         ) : (
-          <View style={{ flex: 1 }}>
-            <View style={hide}>{header}</View>
-            <View style={fullscreen ? styles.phoneFullscreen : styles.phonePlayer}>{player}</View>
-            <View style={[{ flex: 1 }, hide]}>{list}</View>
-          </View>
+          <View style={{ flex: 1 }}>{header}{empty}</View>
         )}
       </SafeAreaView>
     </View>

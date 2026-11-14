@@ -17,6 +17,8 @@ type Props = {
   episode: Episode;
   neighbours: Episode[];
   fullscreen: boolean;
+  /** Start playing as soon as the episode is ready (episodes opened from the series screen). */
+  autoPlay?: boolean;
   autoSkip: boolean;
   subtitlesOn: boolean;
   onToggleFullscreen: (value?: boolean) => void;
@@ -86,6 +88,7 @@ export function Player(props: Props) {
     setReady(true);
     setDuration(player.duration);
     if (resumeAt.current > 1) player.currentTime = resumeAt.current;
+    if (props.autoPlay) player.play();
   });
   useEventListener(player, 'playingChange', ({ isPlaying }) => {
     setPlaying(isPlaying);
@@ -276,7 +279,7 @@ export function Player(props: Props) {
               <IconButton
                 name={fullscreen ? 'arrow.down.right.and.arrow.up.left' : 'arrow.up.left.and.arrow.down.right'}
                 label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-                onPress={() => { haptics.select(); props.onToggleFullscreen(); poke(); }}
+                onPress={() => { haptics.select(); props.onToggleFullscreen(!fullscreen); poke(); }}
               />
             </View>
           </Glass>

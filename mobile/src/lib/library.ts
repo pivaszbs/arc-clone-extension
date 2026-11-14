@@ -17,6 +17,8 @@ export type Series = {
   folder: string;
   title: string;
   credit: string;
+  /** Cover image (the Mac's poster, or poster.jpg in the folder), if there is one. */
+  poster?: string;
   episodes: Episode[];
 };
 
@@ -50,6 +52,7 @@ function readSeries(folder: Directory, name: string): Series | null {
     folder: name,
     title: title || name,
     credit,
+    poster: byName.get('poster.jpg')?.uri,
     episodes: pairs.map(pair => ({
       ...pair,
       key: name ? `${name}/${pair.video}` : pair.video,
