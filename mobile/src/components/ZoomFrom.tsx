@@ -1,8 +1,6 @@
 import { useEffect, useImperativeHandle, useRef, useState, type ReactNode, type Ref } from 'react';
 import { Animated, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 
-import { logError } from '../lib/crash-log';
-
 /** Where on screen a transition starts: the card or button that was tapped. */
 export type Rect = { x: number; y: number; width: number; height: number };
 
@@ -57,7 +55,7 @@ export function ZoomFrom({ origin, children, style, contentStyle, backdrop, ref 
     // Generous: a heavy screen (a list of episodes) can take a while to lay out, and the zoom
     // must win over this fallback whenever it can.
     const timer = setTimeout(() => {
-      if (!started.current) { started.current = true; logError('zoom-debug', `fallback fade, origin=${JSON.stringify(origin)}`); open(); }
+      if (!started.current) { started.current = true; open(); }
     }, 500);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -69,7 +67,6 @@ export function ZoomFrom({ origin, children, style, contentStyle, backdrop, ref 
     node.measureInWindow((x, y, width, height) => {
       if (started.current) return;
       started.current = true;
-      logError('zoom-debug', `measured, origin=${origin ? 'yes' : 'none'} frame=${Math.round(width)}x${Math.round(height)}`);
       if (origin && width > 0 && height > 0) {
         open({
           dx: origin.x + origin.width / 2 - (x + width / 2),
