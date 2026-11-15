@@ -1,6 +1,6 @@
 import { Given, When, Then } from '@cucumber/cucumber';
 import { expect } from '@playwright/test';
-import { mkdtempDisposable, copyFile, writeFile } from 'node:fs/promises';
+import { mkdtempDisposable, copyFile, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -117,6 +117,85 @@ Then('unchecking the first two episodes submits only episode three', async funct
   await this.videoPage.getByRole('button', { name: 'Download 1 episode', exact: true }).click();
   await expect.poll(() => this.videoPage.evaluate(() => window.seriesDownloadRequest?.selectedPages))
     .toEqual([`${root}/3-seriya-30003`]);
+});
+
+Given('a downloaded series with two newer episodes on Anime365', async function () {
+  const folderName = 'Fixture series - 20001 - Fixture Dub';
+  const episode = n => `${root}/${n}-seriya-3000${n}`;
+  await this.context.route('https://smotret-anime.com/api/series/20001?fields=url', route =>
+    route.fulfill({ json: { data: { url: root.replace('.com', '.co') } } }));
+  await this.context.route('https://smotret-anime.com/api/translations/50001?fields=url', route =>
+    route.fulfill({ json: { data: { url: `${episode(1)}/ozvuchka-50001` } } }));
+  await this.context.route(root, route => route.fulfill({
+    contentType: 'text/html',
+    body: '<h1>Fixture series</h1>' + [1, 2, 3].map(n => `<a href="${episode(n)}">Episode ${n}</a>`).join('')
+  }));
+  this.checkedUpdatePages = [];
+  await this.context.route(`${root}/*/ozvuchka*`, route => {
+    const href = route.request().url();
+    this.checkedUpdatePages.push(href);
+    const n = Number(href.match(/(\d)-seriya-/)[1]);
+    const primary = n === 2;
+    const id = primary ? 50002 : 60003;
+    return route.fulfill({
+      contentType: 'text/html',
+      body: `<a href="${episode(n)}/ozvuchka-${id}">${primary ? 'Fixture Dub' : 'Other Dub'}</a>
+        <a href="/translations/mp4/${id}?height=1080">1080p</a>`
+    });
+  });
+  this.videoPage = await this.context.newPage();
+  const media = Array.from(await readFile('src/preview/japanese-qa.mp4'));
+  await this.videoPage.addInitScript(({ media, folderName }) => {
+    window.showDirectoryPicker = async () => {
+      const root = await navigator.storage.getDirectory();
+      const library = await root.getDirectoryHandle('Arc Anime', { create: true });
+      const folder = await library.getDirectoryHandle(folderName, { create: true });
+      window.writeSeriesEpisode = async name => {
+        const file = await folder.getFileHandle(name, { create: true });
+        const writer = await file.createWritable();
+        await writer.write(new Uint8Array(media));
+        await writer.close();
+      };
+      await window.writeSeriesEpisode('Episode 001 - 50001.mp4');
+      return library;
+    };
+  }, { media, folderName });
+  await this.videoPage.goto(`chrome-extension://${this.animeExtensionId}/offline.html`);
+  await this.videoPage.evaluate(() => {
+    const send = chrome.runtime.sendMessage.bind(chrome.runtime);
+    chrome.permissions.request = async () => true;
+    chrome.runtime.sendMessage = async message => {
+      if (message.type !== 'SERIES_DOWNLOAD_ADD') return send(message);
+      window.seriesDownloadRequest = message;
+      return { queue: null };
+    };
+  });
+  await this.videoPage.getByRole('button', { name: 'Gallery', exact: true }).click();
+  await this.videoPage.getByRole('button', { name: 'Connect download folder' }).click();
+  await this.videoPage.getByRole('button', { name: 'Watch', exact: true }).click();
+  await expect(this.videoPage.getByRole('heading', { name: 'Episode 1' })).toBeVisible();
+});
+
+When('I click Load more and choose a dubbing for episode three', async function () {
+  const page = this.videoPage;
+  await page.getByRole('button', { name: 'Load more', exact: true }).click();
+  await expect(page.getByRole('group', { name: 'Choose dubbing for new episodes' })).toBeVisible();
+  await expect(page.getByRole('combobox', { name: 'Episode 2', exact: true })).toHaveCount(0);
+  await page.getByRole('combobox', { name: 'Episode 3', exact: true }).selectOption('Other Dub');
+  await page.getByRole('button', { name: 'Download episodes', exact: true }).click();
+});
+
+Then('only the new episodes are queued in the current series folder', async function () {
+  await expect.poll(() => this.videoPage.evaluate(() => window.seriesDownloadRequest)).toMatchObject({
+    folder: 'Fixture series - 20001 - Fixture Dub',
+    selectedPages: [`${root}/2-seriya-30002`, `${root}/3-seriya-30003`],
+    plan: { episodes: [{ label: 'Episode 1' }, { team: 'Fixture Dub' }, { team: 'Other Dub' }] }
+  });
+  expect(this.checkedUpdatePages.every(url => !url.includes('/1-seriya-'))).toBe(true);
+  await this.videoPage.evaluate(() => window.writeSeriesEpisode('Episode 002 - 50002.mp4'));
+  await expect(this.videoPage.getByRole('complementary', { name: 'Episodes' }).getByRole('button', { name: 'Episode 2' }))
+    .toBeVisible({ timeout: 8000 });
+  await expect(this.videoPage.getByRole('heading', { name: 'Episode 1' })).toBeVisible();
 });
 
 When('I open a downloaded series folder', async function () {

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
   import JapaneseStudy from './JapaneseStudy.svelte';
+  import LoadMoreEpisodes from './LoadMoreEpisodes.svelte';
   import MacServerCard from './MacServerCard.svelte';
   import SeriesDownloads from './SeriesDownloads.svelte';
   import { detectAnimeOpEdIntervals, parseCaptionResponse } from './captions';
@@ -178,6 +179,23 @@
   const animeName = $derived(folderTitle(seriesFolderName).title);
   const translationCredit = $derived(folderTitle(seriesFolderName).credit);
   const episodeIndex = $derived(episodes.findIndex(item => item.path === selected));
+  const updateSeriesId = $derived(seriesFolderName.match(/^.+? - (\d+)(?: - .+)?$/)?.[1]);
+  const downloadedEpisodes = $derived.by(() => {
+    const numbers = new Set<number>();
+    let latest = 0;
+    let translationId: string | undefined;
+    for (const { video } of episodes) {
+      const number = extractEpisodeNumberFromName(video.name);
+      if (number === null || number < 1) continue;
+      numbers.add(number);
+      if (number <= latest) continue;
+      latest = number;
+      translationId = video.name.match(/ - (\d+)(?: \(\d+\))?\.[^.]+$/)?.[1];
+    }
+    return { numbers, translationId };
+  });
+  const canLoadMore = $derived(!!updateSeriesId && downloadedEpisodes.numbers.size > 0);
+  const showEpisodeRail = $derived(episodes.length > 1 || canLoadMore);
 
   $effect(() => {
     document.title = animeName ? `${animeName} · Anime Study` : 'Offline study · Anime Study';
@@ -1341,7 +1359,7 @@
   </nav>
 </header>
 
-<div class="watch-layout" class:with-episodes={episodes.length > 1} hidden={activeScreen !== 'watch'}>
+<div class="watch-layout" class:with-episodes={showEpisodeRail} hidden={activeScreen !== 'watch'}>
   <div class="watch-main">
 {#if videoUrl}
   <div class="player" bind:this={player}>
@@ -1487,7 +1505,7 @@
 {/if}
   </div>
 
-  {#if episodes.length > 1}
+  {#if showEpisodeRail}
     <aside class="episode-rail" aria-label="Episodes">
       <div class="rail-heading">
         <h2>Episodes</h2><span>{episodes.length} available</span>
@@ -1514,6 +1532,12 @@
           </li>
         {/each}
       </ul>
+      {#if canLoadMore && updateSeriesId}
+        {#key seriesFolderName}
+          <LoadMoreEpisodes id={updateSeriesId} folder={seriesFolderName} credit={translationCredit}
+            downloaded={downloadedEpisodes.numbers} translationId={downloadedEpisodes.translationId} connected={folderGranted} />
+        {/key}
+      {/if}
     </aside>
   {/if}
 </div>

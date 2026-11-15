@@ -100,7 +100,7 @@ function pageMetadata(html: string): CatalogPage {
 }
 
 async function readPage(url: URL) {
-  const response = await fetch(url.href, { credentials: 'include', signal: AbortSignal.timeout(12000) });
+  const response = await fetch(url.href, { credentials: 'include', cache: 'no-cache', signal: AbortSignal.timeout(12000) });
   if (!response.ok || new URL(response.url).origin !== url.origin) throw new Error('Anime365 did not return the page.');
   return { ...pageMetadata(await response.text()), url: new URL(response.url) };
 }
@@ -179,12 +179,12 @@ export type PlanProgress = (checked: number, total: number, partial?: SeriesPlan
 export async function planSeries(
   value: string,
   onProgress: PlanProgress,
-  options: { priorities?: string[] } = {}
+  options: { priorities?: string[]; update?: { category: string; downloaded: ReadonlySet<number> } } = {}
 ): Promise<SeriesPlan> {
   const series = seriesRoot(value);
   const source = new URL(value);
   const [, episodeSlug, editionSlug] = source.pathname.slice(series.pathname.length).split('/');
-  const category = editionSlug?.replace(/-\d+$/, '') || 'yaponskie-subtitry';
+  const category = options.update?.category || editionSlug?.replace(/-\d+$/, '') || 'yaponskie-subtitry';
   const studyEdition = category === 'yaponskie-subtitry';
   const isDub = category === 'ozvuchka' || category === 'angliyskaya-ozvuchka';
   const sourceEpisode = episodeSlug && new URL(`${series.pathname}/${episodeSlug}`, series);
@@ -209,12 +209,14 @@ export async function planSeries(
   const plan: SeriesPlan = { series: series.href, title: catalog.title || series.pathname.split('/').at(-1)!, edition, primaryTeam: team, episodes: list };
   // A link to one exact dub picks only that team unless other dubbings are allowed; a general dub
   // link takes whatever each episode has.
-  const order = isDub ? normalizeTeamOrder([team, ...(options.priorities || []), ...(team ? [] : [AUTO_FALLBACK])]) : [];
+  const order = isDub && !options.update ? normalizeTeamOrder([team, ...(options.priorities || []), ...(team ? [] : [AUTO_FALLBACK])]) : [];
   const resolveDubs = order.length > 0 && (order.length > 1 || order[0] !== AUTO_FALLBACK || !!team);
   let checked = 0;
-  onProgress(0, list.length, plan);
+  // Keep the full catalog in the plan so seriesFiles uses the original episode numbers.
+  const targets = list.filter((_, index) => !options.update?.downloaded.has(index + 1));
+  onProgress(0, targets.length, plan);
 
-  await eachLimited(list, async episode => {
+  await eachLimited(targets, async episode => {
     try {
       const episodeUrl = new URL(episode.page);
       const variant = new URL(`${episode.page}/${category}`);
@@ -253,7 +255,7 @@ export async function planSeries(
       Object.assign(episode, downloads);
     } finally {
       checked += 1;
-      onProgress(checked, list.length, plan);
+      onProgress(checked, targets.length, plan);
     }
   });
   if (!resolveDubs) return { ...plan, episodes: [...list] };

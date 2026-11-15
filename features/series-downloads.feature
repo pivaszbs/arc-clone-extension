@@ -12,6 +12,11 @@ Feature: Anime365 series downloads
     And unchecking the first two episodes submits only episode three
     And adding a fallback makes episode four available
 
+  Scenario: Load more keeps the current dub and asks for a replacement where needed
+    Given a downloaded series with two newer episodes on Anime365
+    When I click Load more and choose a dubbing for episode three
+    Then only the new episodes are queued in the current series folder
+
   Scenario: A downloaded series folder pairs video and subtitles offline
     Given the offline study page is open without a network connection
     When I open a downloaded series folder
