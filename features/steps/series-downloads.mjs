@@ -204,43 +204,47 @@ Then('only the new episodes are queued in the current series folder', async func
   await expect(this.videoPage.getByRole('heading', { name: 'Episode 1' })).toBeVisible();
 });
 
-Given('a connected series with a watched download and an unwatched download', async function () {
+Given('a connected library with watched and unwatched downloads in two series', async function () {
   const folderName = 'Fixture series - 20001 - Fixture Dub';
+  const otherFolder = 'Second series - 20002';
   const media = Array.from(await readFile('src/preview/japanese-qa.mp4'));
   this.videoPage = await this.context.newPage();
-  await this.videoPage.addInitScript(({ media, folderName, subtitles }) => {
-    const getSeries = async () => {
+  await this.videoPage.addInitScript(({ media, folderName, otherFolder, subtitles }) => {
+    const getLibrary = async () => {
       const root = await navigator.storage.getDirectory();
-      const library = await root.getDirectoryHandle('Arc Anime', { create: true });
-      return { library, series: await library.getDirectoryHandle(folderName, { create: true }) };
+      return root.getDirectoryHandle('Arc Anime', { create: true });
     };
-    window.savedDownloads = async () => {
-      const { series } = await getSeries();
+    window.savedDownloads = async (name = folderName) => {
+      const library = await getLibrary();
+      const series = await library.getDirectoryHandle(name);
       const names = [];
       for await (const name of series.keys()) names.push(name);
       return names.sort();
     };
     window.showDirectoryPicker = async () => {
-      const { library, series } = await getSeries();
+      const library = await getLibrary();
       const video = new Uint8Array(media);
-      for (const [name, body] of [
-        ['Episode 001 - 50001.mp4', video], ['Episode 001 - 50001.ass', subtitles],
-        ['Episode 002 - 50002.mp4', video], ['Episode 002 - 50002.ass', subtitles],
-        ['notes.txt', 'Keep these notes']
-      ]) {
-        const handle = await series.getFileHandle(name, { create: true });
-        const writer = await handle.createWritable();
-        await writer.write(body);
-        await writer.close();
-        if (name === 'Episode 001 - 50001.mp4') {
-          const file = await handle.getFile();
-          const key = `arc-offline:${encodeURIComponent(name)}/${file.size}/${file.lastModified}:progress`;
-          localStorage.setItem(key, JSON.stringify({ watchedAt: Date.now(), position: 0, finished: true }));
+      for (const [folder, id, watchedAt] of [[folderName, 50000, Date.now()], [otherFolder, 60000, Date.now() - 1000]]) {
+        const series = await library.getDirectoryHandle(folder, { create: true });
+        for (const [name, body] of [
+          [`Episode 001 - ${id + 1}.mp4`, video], [`Episode 001 - ${id + 1}.ass`, subtitles],
+          [`Episode 002 - ${id + 2}.mp4`, video], [`Episode 002 - ${id + 2}.ass`, subtitles],
+          ['notes.txt', 'Keep these notes']
+        ]) {
+          const handle = await series.getFileHandle(name, { create: true });
+          const writer = await handle.createWritable();
+          await writer.write(body);
+          await writer.close();
+          if (name.endsWith(`${id + 1}.mp4`)) {
+            const file = await handle.getFile();
+            const key = `arc-offline:${encodeURIComponent(name)}/${file.size}/${file.lastModified}:progress`;
+            localStorage.setItem(key, JSON.stringify({ watchedAt, position: 0, finished: true }));
+          }
         }
       }
       return library;
     };
-  }, { media, folderName, subtitles: ass('保存した字幕です。') });
+  }, { media, folderName, otherFolder, subtitles: ass('保存した字幕です。') });
   await this.context.route('https://smotret-anime.com/api/series/20001?fields=url', route =>
     route.fulfill({ json: { data: { url: root } } }));
   await this.context.route('https://smotret-anime.com/api/translations/50002?fields=url', route =>
@@ -259,26 +263,32 @@ Given('a connected series with a watched download and an unwatched download', as
   await this.videoPage.getByRole('button', { name: 'Connect download folder' }).click();
 });
 
-When('I confirm deletion of the watched downloads', async function () {
+When('I confirm deletion of all watched downloads in Settings', async function () {
   const page = this.videoPage;
-  const start = page.getByRole('button', { name: 'Delete watched downloads' });
-  const confirm = page.getByRole('dialog', { name: 'Delete watched downloads?' });
+  await page.getByRole('link', { name: 'Settings' }).click();
+  const start = page.getByRole('region', { name: 'Settings' }).getByRole('button', { name: 'Delete all watched downloads' });
+  const confirm = page.getByRole('dialog', { name: 'Delete all watched downloads?' });
   await start.click();
-  await expect(confirm.getByText(/Permanently delete 1 watched episode/)).toBeVisible();
+  await expect(confirm).toContainText('Permanently delete 2 watched episodes');
+  await expect(confirm).toContainText('across 2 series folders');
   await confirm.getByRole('button', { name: 'Cancel' }).click();
   expect(await page.evaluate(() => window.savedDownloads())).toHaveLength(5);
+  expect(await page.evaluate(() => window.savedDownloads('Second series - 20002'))).toHaveLength(5);
   await start.click();
   await confirm.getByRole('button', { name: 'Delete files' }).click();
 });
 
-Then('only the watched episode and its subtitles are gone', async function () {
+Then('only the watched episodes and their subtitles are gone', async function () {
   const page = this.videoPage;
-  await expect(page.getByText(/Deleted 1 watched episode/)).toBeVisible();
+  await expect(page.getByText('Deleted 2 watched episodes.')).toBeVisible();
   expect(await page.evaluate(() => window.savedDownloads())).toEqual([
     'Episode 002 - 50002.ass', 'Episode 002 - 50002.mp4', 'notes.txt'
   ]);
-  expect(await page.evaluate(() => Object.keys(localStorage).some(key => key.startsWith('arc-offline:Episode%20001') &&
-    JSON.parse(localStorage.getItem(key))?.finished === true))).toBe(true);
+  expect(await page.evaluate(() => window.savedDownloads('Second series - 20002'))).toEqual([
+    'Episode 002 - 60002.ass', 'Episode 002 - 60002.mp4', 'notes.txt'
+  ]);
+  expect(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('arc-offline:Episode%20001') &&
+    JSON.parse(localStorage.getItem(key))?.finished === true))).toHaveLength(2);
 });
 
 Then('Load more does not offer the deleted episode again', async function () {
