@@ -17,6 +17,12 @@ Feature: Anime365 series downloads
     When I click Load more and choose a dubbing for episode three
     Then only the new episodes are queued in the current series folder
 
+  Scenario: Settings deletes watched downloads across the library
+    Given a connected library with watched and unwatched downloads in two series
+    When I confirm deletion of all watched downloads in Settings
+    Then only the watched episodes and their subtitles are gone
+    And Load more does not offer the deleted episode again
+
   Scenario: A downloaded series folder pairs video and subtitles offline
     Given the offline study page is open without a network connection
     When I open a downloaded series folder

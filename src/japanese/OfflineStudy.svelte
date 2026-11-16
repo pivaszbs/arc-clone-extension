@@ -12,7 +12,7 @@
   import { parseEpisodeKey, recordChange, replica } from './replica';
   import { forgetFrameChecks, VideoThemeQueue, type ScanStatus } from './video-theme-queue';
   import { DesktopVideoStream } from '../video/desktop-stream';
-  import { directoryPicker, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, type DownloadFolder, type EpisodeFolder } from './offline-library';
+  import { directoryPicker, episodeStem, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, rememberRemovedEpisode, removeLibraryFile, removedEpisodeNames, type DownloadFolder, type EpisodeFolder } from './offline-library';
   import { buildTvPlaybackData, TvSyncClient, writeTvPlaybackToFolder as persistTvPlayback, type EpisodeProgress as Progress, type PipelineEvent, type TvWsState } from './tv-sync';
   import { extractEpisodeNumberFromName, extractSeriesIdFromName, parseSeriesArcMetadata, selectStoryCuesForExplainer, type ArcExplainerData } from './arc-explainer';
 
@@ -152,6 +152,11 @@
   let folderGranted = $state(false);
   let folderBusy = $state(false);
   let folderStatus = $state('');
+  let cleanupDialog = $state<HTMLDialogElement>();
+  type WatchedBatch = { series: EpisodeFolder; videos: File[] };
+  let cleanupPlan = $state.raw<{ folder: DownloadFolder; batches: WatchedBatch[]; count: number }>();
+  let cleanupStatus = $state('');
+  let cleanupRevision = $state(0);
   let episodeFolders = $state<EpisodeFolder[]>([]);
   let selectedFolder = $state<string>();
   let episodeList = $state<HTMLUListElement>();
@@ -183,16 +188,18 @@
   const episodeIndex = $derived(episodes.findIndex(item => item.path === selected));
   const updateSeriesId = $derived(seriesFolderName.match(/^.+? - (\d+)(?: - .+)?$/)?.[1]);
   const downloadedEpisodes = $derived.by(() => {
+    void cleanupRevision;
     const numbers = new Set<number>();
     let latest = 0;
     let translationId: string | undefined;
-    for (const { video } of episodes) {
-      const number = extractEpisodeNumberFromName(video.name);
+    const names = [...episodes.map(({ video }) => video.name), ...removedEpisodeNames(seriesFolderName)];
+    for (const name of names) {
+      const number = extractEpisodeNumberFromName(name);
       if (number === null || number < 1) continue;
       numbers.add(number);
       if (number <= latest) continue;
       latest = number;
-      translationId = video.name.match(/ - (\d+)(?: \(\d+\))?\.[^.]+$/)?.[1];
+      translationId = name.match(/ - (\d+)(?: \(\d+\))?\.[^.]+$/)?.[1];
     }
     return { numbers, translationId };
   });
@@ -207,6 +214,15 @@
     void progressRevision;
     return new Map(episodes.map(episode => [episode.path, episodeProgress(episode.video)]));
   });
+  const watchedDownloads = $derived.by(() => {
+    if (!folderGranted || activeScreen !== 'gallery') return [];
+    void progressRevision;
+    return episodeFolders.map(series => ({
+      series,
+      videos: series.files.filter(file => isEpisodeVideo(file.name) && canDeleteWatchedFile(file))
+    })).filter(batch => batch.videos.length > 0);
+  });
+  const watchedDownloadCount = $derived(watchedDownloads.reduce((count, batch) => count + batch.videos.length, 0));
   const savedPosition = $derived(episodes[episodeIndex] ? episodeProgress(episodes[episodeIndex].video)?.position || 0 : 0);
 
   $effect(() => {
@@ -856,7 +872,7 @@
 
   function setEpisodeFiles(files: File[]) {
     const path = (file: File) => file.webkitRelativePath || file.name;
-    const stem = (file: File) => path(file).replace(/\.[^.]+$/, '');
+    const stem = (file: File) => episodeStem(path(file));
     const subtitles = new Map(files.filter(file => /\.(ass|ssa|srt|vtt)$/i.test(file.name)).map(file => [stem(file), file]));
     episodes = files.filter(file => isEpisodeVideo(file.name))
       .sort((a, b) => path(a).localeCompare(path(b), undefined, { numeric: true }))
@@ -867,6 +883,100 @@
       const watched = next || latest;
       const preferred = episodes.find(item => matchesPreferredEpisode(item.video));
       selected = (watched || preferred || episodes[0])?.path || '';
+    }
+  }
+
+  function canDeleteWatchedFile(file: File) {
+    const identity = fileIdentity(file);
+    if (identity === localSource && (!videoPaused || safariAirPlayId || castSession || castBusy || airPlayBusy || desktopPipActive)) return false;
+    try {
+      // Destructive actions require the exact file's progress. Older filename-only keys are shared across series.
+      return JSON.parse(localStorage.getItem(`${identity}:progress`) || 'null')?.finished === true;
+    } catch { return false; }
+  }
+
+  function confirmWatchedCleanup() {
+    if (!folder || folderBusy || !watchedDownloadCount) return;
+    cleanupStatus = '';
+    cleanupPlan = { folder, batches: watchedDownloads, count: watchedDownloadCount };
+    cleanupDialog?.showModal();
+  }
+
+  async function deleteWatchedBatch(handle: DownloadFolder, { series, videos }: WatchedBatch, onRemoved: (file: File) => void) {
+    let directory: FileSystemDirectoryHandle;
+    try {
+      directory = series.key ? await handle.getDirectoryHandle(series.key) : handle;
+    } catch { return videos.length; }
+    const removedStems = new Set<string>();
+    let failed = 0;
+    for (const file of videos) {
+      try {
+        if (!await removeLibraryFile(directory, file, () => canDeleteWatchedFile(file))) {
+          failed++;
+          continue;
+        }
+        removedStems.add(episodeStem(file.name));
+        onRemoved(file);
+      } catch { failed++; }
+    }
+    if (!removedStems.size) return failed;
+    try {
+      for await (const file of directory.values()) {
+        if (file.kind === 'file' && isEpisodeVideo(file.name)) removedStems.delete(episodeStem(file.name));
+      }
+    } catch {
+      return failed + series.files.filter(file => !isEpisodeVideo(file.name) && removedStems.has(episodeStem(file.name))).length;
+    }
+    for (const file of series.files) {
+      if (isEpisodeVideo(file.name) || !removedStems.has(episodeStem(file.name))) continue;
+      try { if (!await removeLibraryFile(directory, file)) failed++; }
+      catch { failed++; }
+    }
+    return failed;
+  }
+
+  async function deleteWatchedDownloads() {
+    const plan = cleanupPlan;
+    if (!plan || folderBusy || plan.folder !== folder) return;
+    folderBusy = true;
+    cleanupDialog?.close();
+    cleanupStatus = 'Deleting watched downloads…';
+    let count = 0;
+    let failed = 0;
+    let remembered = true;
+    let removedCurrent = false;
+    try {
+      if (await plan.folder.requestPermission({ mode: 'readwrite' }) !== 'granted') {
+        cleanupStatus = 'Allow write access to delete downloads.';
+        return;
+      }
+      for (const batch of plan.batches) {
+        failed += await deleteWatchedBatch(plan.folder, batch, file => {
+          count++;
+          try { rememberRemovedEpisode(batch.series.name, file.name); }
+          catch { remembered = false; }
+          if (fileIdentity(file) !== localSource) return;
+          removedCurrent = true;
+          opening++;
+          progressReady = false;
+          video?.pause();
+          URL.revokeObjectURL(videoUrl);
+          videoUrl = '';
+          currentVideoFile = undefined;
+          localSource = '';
+        });
+      }
+      cleanupStatus = count ? `Deleted ${count} watched ${count === 1 ? 'episode' : 'episodes'}.`
+        : 'No episodes were deleted.';
+      if (failed) cleanupStatus += ` Could not delete ${failed} ${failed === 1 ? 'file' : 'files'}.`;
+      if (!remembered) cleanupStatus += ' Load more may offer these episodes again.';
+      cleanupRevision++;
+      await refreshFolder(plan.folder);
+      if (removedCurrent && folder === plan.folder && !videoUrl) selectEpisode(false);
+    } catch {
+      cleanupStatus = count ? 'Downloads deleted. Reconnect the folder to refresh the library.' : 'Could not open the folder to delete downloads.';
+    } finally {
+      folderBusy = false;
     }
   }
 
@@ -1513,7 +1623,7 @@
   <section class="empty-player">
     <h2>Watch from your library</h2>
     <p>Open a downloaded series or an episode to start watching.</p>
-    <a href="#library">Open library</a>
+    <a href="#library" onclick={() => { activeScreen = 'gallery'; }}>Open library</a>
   </section>
 {/if}
   </div>
@@ -1554,6 +1664,21 @@
     </aside>
   {/if}
 </div>
+
+<dialog bind:this={cleanupDialog} aria-labelledby="cleanup-title">
+  <h2 id="cleanup-title">Delete all watched downloads?</h2>
+  {#if cleanupPlan}
+    <p>
+      Permanently delete {cleanupPlan.count} watched {cleanupPlan.count === 1 ? 'episode' : 'episodes'}
+      and any matching subtitles across {cleanupPlan.batches.length}
+      {cleanupPlan.batches.length === 1 ? 'series folder' : 'series folders'}? Your watch progress will be kept.
+    </p>
+    <form method="dialog">
+      <button>Cancel</button>
+      <button type="button" onclick={deleteWatchedDownloads}>Delete files</button>
+    </form>
+  {/if}
+</dialog>
 
 <dialog bind:this={castHelp} aria-labelledby="cast-title">
   <h2 id="cast-title">Cast to TV</h2>
@@ -1900,6 +2025,14 @@
       <button onclick={exportPredictions}>Export saved skip predictions</button>
     </div>
     {#if exportStatus}<p role="status">{exportStatus}</p>{/if}
+    <div class="episode-bar">
+      <button disabled={folderBusy || !watchedDownloadCount} onclick={confirmWatchedCleanup}>
+        Delete all watched downloads
+      </button>
+    </div>
+    {#if cleanupStatus}<p role="status">{cleanupStatus}</p>
+    {:else if !folderGranted}<p>Connect a download folder in Gallery.</p>
+    {:else if !watchedDownloadCount}<p>No watched downloads available to delete.</p>{/if}
   </section>
   <section id="downloads" aria-label="Downloads" hidden={activeScreen !== 'downloads'}>
     <SeriesDownloads bind:expanded={downloadsOpen} />
