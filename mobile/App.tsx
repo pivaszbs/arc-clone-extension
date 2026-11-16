@@ -544,7 +544,8 @@ function Study() {
     </View>
   );
 
-  const player = tvControlling && tvState ? (
+  // TV controls belong to the app, not the selected library or series.
+  const tvRemote = tvState?.active && !fullscreen ? (
     <TvRemotePanel
       tvState={tvState}
       tvAutoplay={tvAutoplay}
@@ -690,7 +691,6 @@ function Study() {
       onPlay={selectEpisode}
       onToggleWatched={ep => toggleEpisodeWatched(ep, series)}
       fromMac={source === 'server'}
-      extra={player}
     />
   );
 
@@ -763,6 +763,7 @@ function Study() {
             {pipelinesScreen}
           </View>
         )}
+        {tvRemote && <View style={styles.tvRemote}>{tvRemote}</View>}
         <TabBar tabs={tabs} current={mode} onChange={setMode} bottomInset={insets.bottom} />
       </SafeAreaView>
       {/* Always the last child, over everything (outside the safe area), so showing or hiding it never
@@ -774,6 +775,7 @@ function Study() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.background },
+  tvRemote: { paddingHorizontal: space.m, paddingTop: space.s },
   pipHost: { position: 'absolute', left: 0, top: 0, width: 1, height: 1, opacity: 0 },
   tabScreen: { flex: 1 },
   hidden: { display: 'none' },
