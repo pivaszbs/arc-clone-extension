@@ -32,6 +32,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const source = new URL(sender.tab?.url || '');
         seriesRoot(source.href);
         url.searchParams.set('series', new URL(source.pathname, source.origin).href);
+        url.searchParams.set('view', 'downloads');
       }
       await chrome.tabs.create({ url: url.href });
       sendResponse({ ok: true });

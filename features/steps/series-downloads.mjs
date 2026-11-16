@@ -71,10 +71,16 @@ Given('a catalog where the current dub is available for three episodes', async f
   });
   this.videoPage = await this.context.newPage();
   this.catalogCspErrors = [];
-  this.videoPage.on('console', message => {
+  this.context.on('console', message => {
     if (/inline event handler.*Content Security Policy/.test(message.text())) this.catalogCspErrors.push(message.text());
   });
-  await this.videoPage.goto(`chrome-extension://${this.animeExtensionId}/offline.html?series=${encodeURIComponent(selected)}`);
+  await this.videoPage.goto(selected);
+  const opened = this.context.waitForEvent('page');
+  await this.videoPage.getByRole('button', { name: 'Offline', exact: true }).click();
+  this.videoPage = await opened;
+  await expect(this.videoPage.getByRole('link', { name: 'Downloads', exact: true })).toHaveAttribute('aria-current', 'page');
+  await expect(this.videoPage.getByLabel('Anime365 series or episode link')).toHaveValue(selected);
+  await expect(this.videoPage.locator('video')).toHaveCount(0);
 });
 
 Then('episodes with the selected dub are offered first', async function () {

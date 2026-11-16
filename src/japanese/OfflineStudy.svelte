@@ -16,7 +16,9 @@
   import { buildTvPlaybackData, TvSyncClient, writeTvPlaybackToFolder as persistTvPlayback, type EpisodeProgress as Progress, type PipelineEvent, type TvWsState } from './tv-sync';
   import { extractEpisodeNumberFromName, extractSeriesIdFromName, parseSeriesArcMetadata, selectStoryCuesForExplainer, type ArcExplainerData } from './arc-explainer';
 
-  const preferredParams = new URLSearchParams(location.search).get('series');
+  const params = new URLSearchParams(location.search);
+  const preferredParams = params.get('series');
+  const openDownloads = params.get('view') === 'downloads';
   const preferredSeriesId = preferredParams?.match(/\/catalog\/[^/]+-(\d+)(?:\/|[?#]|$)/)?.[1];
   const preferredSlugWords = (preferredParams?.match(/\/catalog\/([^/?#]+)/)?.[1] || '')
     .replace(/-\d+$/, '')
@@ -68,7 +70,7 @@
   let arcExplainer = $state<ArcExplainerData | null>(null);
   let arcExplainerLoading = $state(false);
   let arcExplainerError = $state('');
-  let activeScreen = $state<'watch' | 'gallery' | 'pipelines'>('watch');
+  let activeScreen = $state<'watch' | 'gallery' | 'pipelines' | 'downloads'>(openDownloads ? 'downloads' : 'watch');
   let tvWsState = $state<TvWsState>('disconnected');
   let tvAutoplay = $state(true);
   let pipelineEvents = $state<PipelineEvent[]>([]);
@@ -162,7 +164,7 @@
   let airPlayStatus = $state('');
   let safariAirPlayId = $state('');
   let progressRevision = $state(0);
-  let downloadsOpen = $state(!!preferredParams);
+  let downloadsOpen = $state(openDownloads || !!preferredParams);
   // Download folders are named "Смотреть аниме <title> онлайн - <id> - <translation>".
   function folderTitle(name: string) {
     const plain = name.replace(/^Смотреть аниме\s+/i, '');
@@ -889,6 +891,16 @@
     return true;
   }
 
+  function showWatch() {
+    if (activeScreen === 'downloads' && !videoUrl && !opening) {
+      const entry = episodeFolders.find(item => item.key === selectedFolder);
+      if (entry && (matchesPreferredSeries(entry) || entry.files.some(matchesPreferredTranslation))) {
+        selectEpisode(false);
+      }
+    }
+    activeScreen = 'watch';
+  }
+
   function matchesPreferredSeries(entry: EpisodeFolder) {
     if (preferredSeriesId && new RegExp(` - ${preferredSeriesId}(?: - |$)`).test(entry.name)) return true;
     if (preferredSlugWords.length >= 2) {
@@ -921,7 +933,7 @@
     folderStatus = episodes.length ? '' : scoped
       ? 'This series is not downloaded in the connected folder.'
       : 'No finished videos in this folder yet.';
-    if (matched.length && !keepCurrent && chosen && !videoUrl && !opening) selectEpisode(true);
+    if (activeScreen !== 'downloads' && matched.length && !keepCurrent && chosen && !videoUrl && !opening) selectEpisode(true);
     if (scanQueue && scanFolder === handle) {
       if (scanSeries === undefined && chosen) {
         scanSeries = chosen.key;
@@ -978,7 +990,7 @@
         await refreshFolder(handle);
         if (mounted && folder === handle) {
           restoreScanQueue(handle);
-          if (!videoUrl && !opening && !folderBusy) resumeRememberedEpisode();
+          if (activeScreen !== 'downloads' && !videoUrl && !opening && !folderBusy) resumeRememberedEpisode();
         }
       }
     }).catch(() => {});
@@ -1351,11 +1363,12 @@
     <h1 title={animeName || undefined}>{animeName || 'Offline Study'}</h1>
   </div>
   <nav aria-label="Offline Study">
-    <button type="button" class="nav-tab" aria-current={activeScreen === 'watch' ? 'page' : undefined} onclick={() => { activeScreen = 'watch'; }}>Watch</button>
+    <button type="button" class="nav-tab" aria-current={activeScreen === 'watch' ? 'page' : undefined} onclick={showWatch}>Watch</button>
     <button type="button" class="nav-tab" aria-current={activeScreen === 'gallery' ? 'page' : undefined} onclick={() => { activeScreen = 'gallery'; }}>Gallery</button>
     <button type="button" class="nav-tab" aria-current={activeScreen === 'pipelines' ? 'page' : undefined} onclick={() => { activeScreen = 'pipelines'; }}>Pipelines</button>
     <a href="#settings" onclick={event => { event.preventDefault(); activeScreen = 'gallery'; void tick().then(() => document.getElementById('settings')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })); }}>Settings</a>
-    <a href="#downloads" onclick={event => { event.preventDefault(); activeScreen = 'gallery'; downloadsOpen = true; }}>Downloads</a>
+    <a href="#downloads" class="nav-tab" aria-current={activeScreen === 'downloads' ? 'page' : undefined}
+      onclick={event => { event.preventDefault(); activeScreen = 'downloads'; downloadsOpen = true; }}>Downloads</a>
   </nav>
 </header>
 
@@ -1581,7 +1594,7 @@
   <form method="dialog"><button>Done</button></form>
 </dialog>
 
-<div class="watch-tools" class:single-pane={activeScreen === 'pipelines'} hidden={activeScreen === 'watch'}>
+<div class="watch-tools" class:single-pane={activeScreen !== 'gallery'} hidden={activeScreen === 'watch'}>
   <section id="library" class="library-tools" aria-labelledby="library-title" hidden={activeScreen !== 'gallery'}>
     <div class="library-header">
       <h2 id="library-title">Gallery</h2>
@@ -1888,7 +1901,7 @@
     </div>
     {#if exportStatus}<p role="status">{exportStatus}</p>{/if}
   </section>
-  <section id="downloads" aria-label="Downloads" hidden={activeScreen !== 'gallery'}>
+  <section id="downloads" aria-label="Downloads" hidden={activeScreen !== 'downloads'}>
     <SeriesDownloads bind:expanded={downloadsOpen} />
   </section>
 </div>
