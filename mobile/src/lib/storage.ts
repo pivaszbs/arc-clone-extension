@@ -1,11 +1,17 @@
 import { Directory, File, Paths } from 'expo-file-system';
 
-import { canonicalEpisodeKey, setLocal } from './replica';
+import type { Series } from './library';
+import { canonicalEpisodeKey, registerSeriesAlias, setLocal } from './replica';
 
 export const DEFAULT_TV_SERVER_URL = 'http://10.131.140.3:46158/cf7f1d1d391d8231/';
 
 export type Progress = { position: number; duration: number; watchedAt: number; finished: boolean };
-export type Settings = { autoSkip: boolean; subtitles: boolean; tvServerUrl: string; /** The tab to reopen on. */ tab?: 'watch' | 'download' | 'pipelines' };
+export type Settings = { autoSkip: boolean; subtitles: boolean; tvServerUrl: string;
+  /** The tab to reopen on. */
+  tab?: 'watch' | 'download' | 'pipelines';
+  /** The library to reopen on: the Mac's or this device's. */
+  source?: 'server' | 'local';
+};
 type State = { progress: Record<string, Progress>; settings: Settings };
 
 const folder = new Directory(Paths.document, '.anime-study');
@@ -86,4 +92,36 @@ export const settings = () => load().settings;
 export function saveSettings(next: Partial<Settings>) {
   load().settings = { ...state.settings, ...next };
   persist();
+}
+
+// ----- The Mac's catalog as last seen -----
+
+const catalogFile = new File(folder, 'catalog.json');
+
+/**
+ * The Mac's library as it was last loaded, so the app opens on covers at once (and offline, where
+ * downloaded episodes still play) instead of an empty screen until the Mac answers.
+ */
+export function cachedCatalog(): Series[] {
+  try {
+    if (!catalogFile.exists) return [];
+    const saved = JSON.parse(catalogFile.textSync()) as Series[];
+    if (!Array.isArray(saved)) return [];
+    const series = saved.filter(item => item && typeof item.folder === 'string' && Array.isArray(item.episodes) && item.episodes.length > 0);
+    for (const item of series) {
+      // Episode keys start with the Mac's series id; progress saved offline still needs its folder name.
+      const key = item.episodes[0]?.key ?? '';
+      const slash = key.indexOf('/');
+      if (slash > 0) registerSeriesAlias(key.slice(0, slash), item.folder);
+    }
+    return series;
+  } catch { return []; }
+}
+
+/** `text` is the catalog already serialised (the caller compares it to spot changes). */
+export function saveCatalog(text: string) {
+  try {
+    if (!folder.exists) folder.create({ intermediates: true });
+    catalogFile.write(text);
+  } catch { /* Best effort: the next launch just waits for the Mac. */ }
 }

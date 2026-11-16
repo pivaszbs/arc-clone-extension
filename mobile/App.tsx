@@ -2,7 +2,7 @@ import * as ScreenOrientation from 'expo-screen-orientation';
 import { StatusBar } from 'expo-status-bar';
 import { SymbolView } from 'expo-symbols';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActionSheetIOS, Alert, AppState, Platform, Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { ActionSheetIOS, ActivityIndicator, Alert, AppState, Platform, Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { DownloadView } from './src/components/DownloadView';
@@ -20,7 +20,7 @@ import { importFiles, importFolder, readLibrary, type Episode, type Series } fro
 import { fetchRemoteCatalog } from './src/lib/server';
 import { findReachableAddress } from './src/lib/server-address';
 import { localEpisodeKeys, onRemoteChange, scheduleSync, setSyncer, syncWith } from './src/lib/replica';
-import { allProgress, applyReplicatedProgress, mergeProgress, progressFor, saveProgress, saveSettings, settings as savedSettings, type Progress } from './src/lib/storage';
+import { allProgress, applyReplicatedProgress, cachedCatalog, mergeProgress, progressFor, saveCatalog, saveProgress, saveSettings, settings as savedSettings, type Progress } from './src/lib/storage';
 import {
   DEFAULT_TV_SERVER_URL,
   normalizeTvServerUrl,
@@ -62,7 +62,9 @@ function Study() {
   });
   // Reopen on the tab you left.
   const setMode = useCallback((next: AppMode) => { setModeState(next); saveSettings({ tab: next }); }, []);
-  const [source, setSource] = useState<LibrarySource>('server');
+  // Reopen on the library you left (the Mac's or this device's).
+  const [source, setSourceState] = useState<LibrarySource>(() => (savedSettings().source === 'local' ? 'local' : 'server'));
+  const setSource = useCallback((next: LibrarySource) => { setSourceState(next); saveSettings({ source: next }); }, []);
   const [serverUrl, setServerUrl] = useState(initialServerUrl);
   const [serverDraft, setServerDraft] = useState(initialServerUrl);
   const [wsState, setWsState] = useState<TvWsState>('disconnected');
@@ -77,7 +79,17 @@ function Study() {
   const [serverError, setServerError] = useState<string | null>(null);
   const [localScan, setLocalScan] = useState<LocalScanState>({ status: 'idle', seriesCount: 0, episodeCount: 0 });
   const [importState, setImportState] = useState<ImportPipelineState>({ status: 'idle' });
-  const [library, setLibrary] = useState<Series[]>([]);
+  // Both libraries are kept, so switching between them is instant and neither shows the other's
+  // series. The Mac's starts from what it sent last time: covers at once, and offline too.
+  const [remoteLibrary, setRemoteLibrary] = useState<Series[]>(cachedCatalog);
+  const [localLibrary, setLocalLibrary] = useState<Series[]>([]);
+  const library = source === 'server' ? remoteLibrary : localLibrary;
+  // Tabs stay mounted once opened, so each is where you left it (the page in Download, the scroll).
+  const [downloadOpened, setDownloadOpened] = useState(mode === 'download');
+  if (mode === 'download' && !downloadOpened) setDownloadOpened(true);
+  const [refreshing, setRefreshing] = useState(false);
+  /** The Mac has answered with its catalog at least once since launch. */
+  const [catalogLoaded, setCatalogLoaded] = useState(false);
   const [folder, setFolder] = useState<string | null>(null);
   const [episodeKey, setEpisodeKey] = useState<string | null>(null);
   const [settings, setSettings] = useState(savedSettings);
@@ -132,7 +144,7 @@ function Study() {
     }
   }, [findLibraryEpisode, refreshProgress]);
 
-  const scanLocal = useCallback((updateLibrary = true) => {
+  const scanLocal = useCallback(() => {
     setLocalScan(prev => ({ ...prev, status: 'scanning', error: undefined }));
     try {
       const localSeries = readLibrary();
@@ -144,10 +156,7 @@ function Study() {
         episodeCount,
         lastScannedAt,
       });
-      if (updateLibrary) {
-        setLibrary(localSeries);
-        setServerError(null);
-      }
+      setLocalLibrary(localSeries);
       tvSyncRef.current?.log('Local Scan', `${localSeries.length} series, ${episodeCount} episodes`);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -164,18 +173,18 @@ function Study() {
     try {
       const { series: remote, progress: remoteProgress, autoplay, tvState: remoteTvState, statusCode } = await fetchRemoteCatalog(url);
       setHttpStatus({ state: 'ok', statusCode });
+      setCatalogLoaded(true);
       setTvAutoplay(autoplay);
       mergeProgress(remoteProgress);
       refreshProgress();
       if (remoteTvState) handleTvState(remoteTvState);
-      if (sourceRef.current === 'server') {
-        // An unchanged catalog keeps the same objects, so nothing downstream (the playing episode's
-        // subtitle and opening/ending work) starts over.
-        const signature = JSON.stringify(remote);
-        if (signature !== librarySignature.current) {
-          librarySignature.current = signature;
-          setLibrary(remote);
-        }
+      // An unchanged catalog keeps the same objects, so nothing downstream (the playing episode's
+      // subtitle and opening/ending work) starts over.
+      const signature = JSON.stringify(remote);
+      if (signature !== librarySignature.current) {
+        librarySignature.current = signature;
+        setRemoteLibrary(remote);
+        saveCatalog(signature);
       }
       setServerError(null);
       tvSyncRef.current?.log('Catalog', `Loaded ${remote.length} series (HTTP ${statusCode})`);
@@ -193,9 +202,7 @@ function Study() {
       }
       const msg = error instanceof Error ? error.message : String(error);
       setHttpStatus({ state: 'error', error: msg });
-      if (sourceRef.current === 'server') {
-        setServerError(msg);
-      }
+      setServerError(msg);
       tvSyncRef.current?.log('Error', `Catalog fetch failed: ${msg}`);
     }
   }, []);
@@ -205,7 +212,22 @@ function Study() {
     if (sourceRef.current === 'server') {
       void loadRemote();
     } else {
-      scanLocal(true);
+      scanLocal();
+    }
+  }, [loadRemote, scanLocal]);
+
+  // Stable, so the Download tab's polling isn't restarted by every render.
+  const reloadRemote = useCallback(() => { void loadRemote(); }, [loadRemote]);
+
+  // Pull down on the covers to reload them.
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    scheduleSync(0);
+    try {
+      if (sourceRef.current === 'server') await loadRemote();
+      else scanLocal();
+    } finally {
+      setRefreshing(false);
     }
   }, [loadRemote, scanLocal]);
 
@@ -229,7 +251,8 @@ function Study() {
         }
         if (changed) refreshProgress();
       } else if (field === 'themes' && sourceRef.current !== 'server') {
-        scanLocal(true);
+        // (Switching to this device's library reads it again anyway.)
+        scanLocal();
       }
     });
     scheduleSync(0);
@@ -286,9 +309,9 @@ function Study() {
     );
     phoneWorkerRef.current = worker;
     // Downloaded episodes show up in Local Files right away.
-    episodeDownloads.onLibraryChanged = () => scanLocal(sourceRef.current === 'local');
+    episodeDownloads.onLibraryChanged = () => scanLocal();
     client.connect();
-    scanLocal(false);
+    scanLocal();
     return () => {
       episodeDownloads.onLibraryChanged = () => {};
       worker.stop();
@@ -364,7 +387,7 @@ function Study() {
       }
       setImportState({ status: 'done', detail: `Imported ${name}` });
       tvSyncRef.current?.log('Import', `Imported ${name}`);
-      scanLocal(sourceRef.current === 'local');
+      scanLocal();
       if (sourceRef.current === 'local') {
         setFolder(name);
         setEpisodeKey(null);
@@ -566,7 +589,22 @@ function Study() {
     </View>
   );
 
-  const empty = source === 'server' ? (
+  const empty = source === 'server' && !serverError && catalogLoaded ? (
+    <View style={styles.empty}>
+      <SymbolView name="film.stack" size={48} tintColor={colors.textTertiary} />
+      <Text style={styles.emptyTitle}>Nothing on the Mac yet</Text>
+      <Text style={styles.emptyText}>Find a series in the Download tab and send it to the Mac; its episodes appear here as they finish.</Text>
+      <Pressable onPress={() => { haptics.select(); setMode('download'); }} style={styles.emptyButton}>
+        <Text style={styles.emptyButtonText}>Open Download</Text>
+      </Pressable>
+    </View>
+  ) : source === 'server' && !serverError && httpStatus.state !== 'error' ? (
+    // The first launch, before the Mac has answered: not an error yet.
+    <View style={styles.empty}>
+      <ActivityIndicator color={colors.textSecondary} />
+      <Text style={styles.emptyText}>Connecting to your Mac…</Text>
+    </View>
+  ) : source === 'server' ? (
     <View style={styles.empty}>
       <SymbolView name="wifi.slash" size={48} tintColor={colors.textTertiary} />
       <Text style={styles.emptyTitle}>No Mac server catalog</Text>
@@ -616,7 +654,7 @@ function Study() {
       }}
       scanProgress={scanProgress}
       localScan={localScan}
-      onRescanLocal={() => scanLocal(source === 'local')}
+      onRescanLocal={() => scanLocal()}
       importState={importState}
       onImportFolder={() => { void runImport(importFolder, 'folder'); }}
       onImportFiles={() => { void runImport(importFiles, 'files'); }}
@@ -670,52 +708,60 @@ function Study() {
           under it shifts as it opens or closes. The top inset is held at its largest, so hiding the
           status bar for the video doesn't move the screen either. */}
       <SafeAreaView style={[styles.root, { paddingTop: stableTop }]} edges={['left', 'right']}>
-        {mode === 'pipelines' ? (
-          <View style={{ flex: 1 }}>
+        {/* Library and Download stay mounted behind the other tabs, so coming back finds the same
+            scroll position, open series and web page. */}
+        <View style={mode === 'watch' ? styles.tabScreen : styles.hidden}>
+          {library.length ? (
+            <View style={{ flex: 1 }}>
+              <SeriesGallery
+                series={library}
+                progress={allProgress()}
+                width={width}
+                header={header}
+                refreshing={refreshing}
+                onRefresh={() => { void refresh(); }}
+                onOpen={(item, from) => { haptics.select(); setSeriesOrigin(from); setFolder(item.folder); setEpisodeKey(null); }}
+                onPlay={(item, next, from) => {
+                  setPlayerOrigin(from);
+                  // One tap from the Continue card: open the series and play, as on its screen.
+                  setFolder(item.folder);
+                  if (tvControlling) {
+                    tvSyncRef.current?.sendTvControl({ action: 'playEpisode', seriesName: item.folder, episode: next.video });
+                    return;
+                  }
+                  setEpisodeKey(next.key);
+                  setPlayerHidden(false);
+                  if (source === 'server') {
+                    void tvSyncRef.current?.pushSync({ playingFolder: item.folder, playingEpisode: next.video });
+                  }
+                }}
+              />
+              {seriesScreen && (
+                // The series opens over the gallery (kept underneath, scroll and all) out of its cover.
+                <View style={StyleSheet.absoluteFill}>
+                  <ZoomFrom ref={seriesZoom} origin={seriesOrigin} backdrop={colors.background} contentStyle={{ backgroundColor: colors.background }}>
+                    {header}{seriesScreen}
+                  </ZoomFrom>
+                </View>
+              )}
+            </View>
+          ) : playing ? (
+            <View style={{ flex: 1, backgroundColor: '#000' }} />
+          ) : (
+            <View style={{ flex: 1 }}>{header}{empty}</View>
+          )}
+        </View>
+        {downloadOpened && (
+          <View style={mode === 'download' ? styles.tabScreen : styles.hidden}>
+            {header}
+            <DownloadView serverUrl={serverUrl} onMacProgress={reloadRemote} />
+          </View>
+        )}
+        {mode === 'pipelines' && (
+          <View style={styles.tabScreen}>
             {header}
             {pipelinesScreen}
           </View>
-        ) : mode === 'download' ? (
-          <View style={{ flex: 1 }}>
-            {header}
-            <DownloadView serverUrl={serverUrl} onMacProgress={() => { void loadRemote(); }} />
-          </View>
-        ) : library.length ? (
-          <View style={{ flex: 1 }}>
-            <SeriesGallery
-              series={library}
-              progress={allProgress()}
-              width={width}
-              header={header}
-              onOpen={(item, from) => { haptics.select(); setSeriesOrigin(from); setFolder(item.folder); setEpisodeKey(null); }}
-              onPlay={(item, next, from) => {
-                setPlayerOrigin(from);
-                // One tap from the Continue card: open the series and play, as on its screen.
-                setFolder(item.folder);
-                if (tvControlling) {
-                  tvSyncRef.current?.sendTvControl({ action: 'playEpisode', seriesName: item.folder, episode: next.video });
-                  return;
-                }
-                setEpisodeKey(next.key);
-                setPlayerHidden(false);
-                if (source === 'server') {
-                  void tvSyncRef.current?.pushSync({ playingFolder: item.folder, playingEpisode: next.video });
-                }
-              }}
-            />
-            {seriesScreen && (
-              // The series opens over the gallery (kept underneath, scroll and all) out of its cover.
-              <View style={StyleSheet.absoluteFill}>
-                <ZoomFrom ref={seriesZoom} origin={seriesOrigin} backdrop={colors.background} contentStyle={{ backgroundColor: colors.background }}>
-                  {header}{seriesScreen}
-                </ZoomFrom>
-              </View>
-            )}
-          </View>
-        ) : playing ? (
-          <View style={{ flex: 1, backgroundColor: '#000' }} />
-        ) : (
-          <View style={{ flex: 1 }}>{header}{empty}</View>
         )}
         <TabBar tabs={tabs} current={mode} onChange={setMode} bottomInset={insets.bottom} />
       </SafeAreaView>
@@ -729,6 +775,7 @@ function Study() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.background },
   pipHost: { position: 'absolute', left: 0, top: 0, width: 1, height: 1, opacity: 0 },
+  tabScreen: { flex: 1 },
   hidden: { display: 'none' },
   split: { flex: 1, flexDirection: 'row' },
   sidebar: { borderRightWidth: StyleSheet.hairlineWidth, borderRightColor: colors.separator },
