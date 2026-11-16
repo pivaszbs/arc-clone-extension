@@ -1,6 +1,6 @@
 export interface DownloadFolder extends FileSystemDirectoryHandle {
   queryPermission(options: { mode: 'read' }): Promise<PermissionState>;
-  requestPermission(options: { mode: 'read' }): Promise<PermissionState>;
+  requestPermission(options: { mode: 'read' | 'readwrite' }): Promise<PermissionState>;
 }
 
 export const directoryPicker = (window as Window & {
@@ -32,6 +32,31 @@ export function rememberFolder(folder: DownloadFolder) {
 
 const isEpisodeFile = (name: string) => /\.(mp4|webm|m4v|ass|ssa|srt|vtt)$/i.test(name);
 export const isEpisodeVideo = (name: string) => /\.(mp4|webm|m4v)$/i.test(name);
+export const episodeStem = (name: string) => name.replace(/\.[^.]+$/, '');
+
+const removedEpisodesKey = (folderName: string) => `arc-offline-removed:${folderName}`;
+
+export function removedEpisodeNames(folderName: string): string[] {
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(removedEpisodesKey(folderName)) || '[]');
+    return Array.isArray(saved) ? saved.filter(name => typeof name === 'string') : [];
+  } catch { return []; }
+}
+
+export function rememberRemovedEpisode(folderName: string, name: string) {
+  const names = new Set(removedEpisodeNames(folderName));
+  names.add(name);
+  localStorage.setItem(removedEpisodesKey(folderName), JSON.stringify([...names]));
+}
+
+/** Check that the named file still matches the snapshot the user saw before confirming. */
+export async function removeLibraryFile(folder: FileSystemDirectoryHandle, file: File, canRemove = () => true) {
+  const handle = await folder.getFileHandle(file.name);
+  const current = await handle.getFile();
+  if (current.size !== file.size || current.lastModified !== file.lastModified || !canRemove()) return false;
+  await folder.removeEntry(file.name);
+  return true;
+}
 
 async function readEpisodeFiles(entries: FileSystemHandle[]) {
   const files: File[] = [];
@@ -67,6 +92,7 @@ export async function readEpisodeFolders(folder: DownloadFolder): Promise<Episod
     }
   }));
   return [root, ...children]
-    .filter((entry): entry is EpisodeFolder => !!entry && entry.files.some(file => isEpisodeVideo(file.name)))
+    .filter((entry): entry is EpisodeFolder => !!entry &&
+      (entry.files.some(file => isEpisodeVideo(file.name)) || removedEpisodeNames(entry.name).length > 0))
     .sort((a, b) => a.key.localeCompare(b.key));
 }

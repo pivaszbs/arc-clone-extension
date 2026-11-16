@@ -204,6 +204,92 @@ Then('only the new episodes are queued in the current series folder', async func
   await expect(this.videoPage.getByRole('heading', { name: 'Episode 1' })).toBeVisible();
 });
 
+Given('a connected series with a watched download and an unwatched download', async function () {
+  const folderName = 'Fixture series - 20001 - Fixture Dub';
+  const media = Array.from(await readFile('src/preview/japanese-qa.mp4'));
+  this.videoPage = await this.context.newPage();
+  await this.videoPage.addInitScript(({ media, folderName, subtitles }) => {
+    const getSeries = async () => {
+      const root = await navigator.storage.getDirectory();
+      const library = await root.getDirectoryHandle('Arc Anime', { create: true });
+      return { library, series: await library.getDirectoryHandle(folderName, { create: true }) };
+    };
+    window.savedDownloads = async () => {
+      const { series } = await getSeries();
+      const names = [];
+      for await (const name of series.keys()) names.push(name);
+      return names.sort();
+    };
+    window.showDirectoryPicker = async () => {
+      const { library, series } = await getSeries();
+      const video = new Uint8Array(media);
+      for (const [name, body] of [
+        ['Episode 001 - 50001.mp4', video], ['Episode 001 - 50001.ass', subtitles],
+        ['Episode 002 - 50002.mp4', video], ['Episode 002 - 50002.ass', subtitles],
+        ['notes.txt', 'Keep these notes']
+      ]) {
+        const handle = await series.getFileHandle(name, { create: true });
+        const writer = await handle.createWritable();
+        await writer.write(body);
+        await writer.close();
+        if (name === 'Episode 001 - 50001.mp4') {
+          const file = await handle.getFile();
+          const key = `arc-offline:${encodeURIComponent(name)}/${file.size}/${file.lastModified}:progress`;
+          localStorage.setItem(key, JSON.stringify({ watchedAt: Date.now(), position: 0, finished: true }));
+        }
+      }
+      return library;
+    };
+  }, { media, folderName, subtitles: ass('保存した字幕です。') });
+  await this.context.route('https://smotret-anime.com/api/series/20001?fields=url', route =>
+    route.fulfill({ json: { data: { url: root } } }));
+  await this.context.route('https://smotret-anime.com/api/translations/50002?fields=url', route =>
+    route.fulfill({ json: { data: { url: `${root}/2-seriya-30002/ozvuchka-50002` } } }));
+  await this.context.route(root, route => route.fulfill({
+    contentType: 'text/html',
+    body: '<h1>Fixture series</h1>' + [1, 2].map(n => `<a href="${root}/${n}-seriya-3000${n}">Episode ${n}</a>`).join('')
+  }));
+  this.cleanupEpisodeChecks = [];
+  await this.context.route(`${root}/*/ozvuchka*`, route => {
+    this.cleanupEpisodeChecks.push(route.request().url());
+    return route.fulfill({ status: 404 });
+  });
+  await this.videoPage.goto(`chrome-extension://${this.animeExtensionId}/offline.html`);
+  await this.videoPage.getByRole('button', { name: 'Gallery' }).click();
+  await this.videoPage.getByRole('button', { name: 'Connect download folder' }).click();
+});
+
+When('I confirm deletion of the watched downloads', async function () {
+  const page = this.videoPage;
+  const start = page.getByRole('button', { name: 'Delete watched downloads' });
+  const confirm = page.getByRole('dialog', { name: 'Delete watched downloads?' });
+  await start.click();
+  await expect(confirm.getByText(/Permanently delete 1 watched episode/)).toBeVisible();
+  await confirm.getByRole('button', { name: 'Cancel' }).click();
+  expect(await page.evaluate(() => window.savedDownloads())).toHaveLength(5);
+  await start.click();
+  await confirm.getByRole('button', { name: 'Delete files' }).click();
+});
+
+Then('only the watched episode and its subtitles are gone', async function () {
+  const page = this.videoPage;
+  await expect(page.getByText(/Deleted 1 watched episode/)).toBeVisible();
+  expect(await page.evaluate(() => window.savedDownloads())).toEqual([
+    'Episode 002 - 50002.ass', 'Episode 002 - 50002.mp4', 'notes.txt'
+  ]);
+  expect(await page.evaluate(() => Object.keys(localStorage).some(key => key.startsWith('arc-offline:Episode%20001') &&
+    JSON.parse(localStorage.getItem(key))?.finished === true))).toBe(true);
+});
+
+Then('Load more does not offer the deleted episode again', async function () {
+  const page = this.videoPage;
+  await page.reload();
+  await page.evaluate(() => { chrome.permissions.request = async () => true; });
+  await page.getByRole('button', { name: 'Load more' }).click();
+  await expect(page.getByText('No new episodes on Smotret Anime.')).toBeVisible();
+  expect(this.cleanupEpisodeChecks).toEqual([]);
+});
+
 When('I open a downloaded series folder', async function () {
   const folder = await mkdtempDisposable(join(tmpdir(), 'arc-series-fixture-'));
   try {
