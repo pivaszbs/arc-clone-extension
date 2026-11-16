@@ -2,7 +2,7 @@
   "expo": {
     "name": "Anime Study",
     "slug": "anime-study",
-    "version": "0.8.2",
+    "version": "0.8.3",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -18,7 +18,13 @@
         ],
         "ITSAppUsesNonExemptEncryption": false,
         "NSAppTransportSecurity": {
-          "NSAllowsLocalNetworking": true
+          "NSAllowsLocalNetworking": true,
+          "NSExceptionDomains": {
+            "ts.net": {
+              "NSIncludesSubdomains": true,
+              "NSExceptionAllowsInsecureHTTPLoads": true
+            }
+          }
         },
         "NSLocalNetworkUsageDescription": "Anime Study connects to your Mac to stream, download and sync episodes, progress and skip timings."
       }
