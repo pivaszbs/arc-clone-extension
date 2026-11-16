@@ -120,7 +120,9 @@ export function TvRemotePanel({ tvState, tvAutoplay, onCommand, onPlayOnPhone }:
         >
           <SymbolView name="forward.end.fill" size={16} tintColor={colors.text} />
         </Pressable>
+      </View>
 
+      <View style={styles.optionsRow}>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={`TV subtitles ${subtitlesOn ? 'on' : 'off'}`}
@@ -282,9 +284,9 @@ const styles = StyleSheet.create({
     paddingTop: 2,
   },
   controlBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     backgroundColor: colors.surfaceRaised,
     alignItems: 'center',
     justifyContent: 'center',
@@ -304,7 +306,7 @@ const styles = StyleSheet.create({
     opacity: 0.85,
   },
   togglePill: {
-    height: 32,
+    height: 44,
     paddingHorizontal: 9,
     borderRadius: radius.pill,
     backgroundColor: colors.surfaceRaised,
@@ -315,6 +317,11 @@ const styles = StyleSheet.create({
     backgroundColor: colors.accentMuted,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: 'rgba(255,130,72,0.45)',
+  },
+  optionsRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: space.s,
   },
   togglePillText: {
     color: colors.textSecondary,

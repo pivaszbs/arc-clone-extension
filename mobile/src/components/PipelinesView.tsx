@@ -119,12 +119,12 @@ export function PipelinesView(props: Props) {
   const jobs = (server?.workers.jobs ?? workerStatus?.jobs ?? []).filter(job => job.status !== 'completed' && job.status !== 'failed');
   const counts = server?.workers.counts ?? workerStatus?.counts;
   const quarantined = server?.workers.quarantinedEpisodes ?? workerStatus?.quarantinedEpisodes ?? [];
-  const localReady = coverageSeries.reduce((sum, s) => sum + s.episodes.filter(ep => !!(ep.frames.op || ep.frames.ed || ep.frames.recap)).length, 0);
+  const localReady = coverageSeries.reduce((sum, s) => sum + s.episodes.filter(ep => !!(ep.frames?.op || ep.frames?.ed || ep.frames?.recap)).length, 0);
   const localTotal = coverageSeries.reduce((sum, s) => sum + s.episodes.length, 0);
   const ready = server?.library.withTimings ?? localReady;
   const total = server?.library.episodes ?? localTotal;
   const perSeries = server?.library.perSeries
-    ?? coverageSeries.map(s => ({ folder: s.folder, title: s.title, episodes: s.episodes.length, withTimings: s.episodes.filter(ep => !!(ep.frames.op || ep.frames.ed || ep.frames.recap)).length }));
+    ?? coverageSeries.map(s => ({ folder: s.folder, title: s.title, episodes: s.episodes.length, withTimings: s.episodes.filter(ep => !!(ep.frames?.op || ep.frames?.ed || ep.frames?.recap)).length }));
   const events = allEvents ? pipelineEvents : pipelineEvents.slice(0, EVENTS_SHOWN);
 
   return (
@@ -266,7 +266,7 @@ export function PipelinesView(props: Props) {
                 {open && local && (
                   <View style={styles.episodes}>
                     {local.episodes.map(ep => {
-                      const parts = [ep.frames.recap ? 'Recap' : '', ep.frames.op ? 'Opening' : '', ep.frames.ed ? 'Ending' : ''].filter(Boolean);
+                      const parts = [ep.frames?.recap ? 'Recap' : '', ep.frames?.op ? 'Opening' : '', ep.frames?.ed ? 'Ending' : ''].filter(Boolean);
                       return (
                         <View key={ep.key} style={styles.episode}>
                           <Text style={type.subhead} numberOfLines={1}>{ep.label}</Text>

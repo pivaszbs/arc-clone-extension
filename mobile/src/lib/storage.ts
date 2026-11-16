@@ -1,6 +1,7 @@
 import { Directory, File, Paths } from 'expo-file-system';
 
-import type { Series } from './library';
+import type { Episode, Series } from './library';
+import { skipRanges } from './theme-sidecar';
 import { canonicalEpisodeKey, registerSeriesAlias, setLocal } from './replica';
 
 export const DEFAULT_TV_SERVER_URL = 'http://10.131.140.3:46158/cf7f1d1d391d8231/';
@@ -105,9 +106,19 @@ const catalogFile = new File(folder, 'catalog.json');
 export function cachedCatalog(): Series[] {
   try {
     if (!catalogFile.exists) return [];
-    const saved = JSON.parse(catalogFile.textSync()) as Series[];
+    const saved = JSON.parse(catalogFile.textSync()) as unknown;
     if (!Array.isArray(saved)) return [];
-    const series = saved.filter(item => item && typeof item.folder === 'string' && Array.isArray(item.episodes) && item.episodes.length > 0);
+    // Keep only what this app wrote: a cache in another shape (the Mac's raw catalog, an older
+    // build) has no keys, URLs or skip ranges, and rendering it would crash the app at launch.
+    const series = (saved as Series[])
+      .filter(item => item && typeof item.folder === 'string' && typeof item.title === 'string' && Array.isArray(item.episodes))
+      .map(item => ({
+        ...item,
+        episodes: item.episodes
+          .filter((ep: Partial<Episode> | null) => !!ep && typeof ep.key === 'string' && typeof ep.videoUri === 'string' && typeof ep.video === 'string')
+          .map(ep => ({ ...ep, frames: skipRanges(ep.frames) })),
+      }))
+      .filter(item => item.episodes.length > 0);
     for (const item of series) {
       // Episode keys start with the Mac's series id; progress saved offline still needs its folder name.
       const key = item.episodes[0]?.key ?? '';
