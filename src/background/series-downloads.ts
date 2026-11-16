@@ -1,4 +1,4 @@
-import { seriesFiles, type SeriesPlan } from '../japanese/series';
+import { seriesFiles, seriesRoot, type SeriesPlan } from '../japanese/series';
 
 const key = 'arc_series_downloads';
 const alarm = 'arc-series-downloads';
@@ -20,13 +20,37 @@ async function save(queue: SeriesQueue) {
   await chrome.storage.local.set({ [key]: queue });
 }
 
-function createQueue(plan: SeriesPlan, selectedPages: string[]): SeriesQueue {
-  const { folder, files } = seriesFiles(plan, selectedPages);
+function createQueue(plan: SeriesPlan, selectedPages: string[], existingFolder?: string): SeriesQueue {
+  const { folder: defaultFolder, files } = seriesFiles(plan, selectedPages);
+  const folder = `Arc Anime/${existingFolder ?? defaultFolder}`;
   return {
     title: plan.title,
-    folder: `Arc Anime/${folder}`,
+    folder,
     paused: false,
-    files: files.map(file => ({ url: file.url, filename: `Arc Anime/${folder}/${file.name}`, state: 'queued' as const }))
+    files: files.map(file => ({ url: file.url, filename: `${folder}/${file.name}`, state: 'queued' as const }))
+  };
+}
+
+function appendEpisodes(queue: SeriesQueue | undefined, next: SeriesQueue) {
+  const sameFolder = queue?.folder === next.folder;
+  if (!sameFolder) {
+    if (queue?.files.some(file => file.state === 'queued' || file.state === 'downloading')) {
+      throw new Error('Another series is downloading. Finish or stop it in Downloads, then try again.');
+    }
+    return next;
+  }
+  const episode = (file: FileJob) => file.filename.split('/').at(-1)?.match(/^Episode (\d+) - /)?.[1];
+  const pendingOrDone = new Set(queue.files
+    .filter(file => file.filename.endsWith('.mp4') && (file.state === 'done' || file.state === 'queued' || file.state === 'downloading'))
+    .map(episode));
+  const added = next.files.filter(file => !pendingOrDone.has(episode(file)));
+  const newEpisodes = new Set(added.map(episode));
+  const existing = queue.files.filter(file => !newEpisodes.has(episode(file)) || (file.state !== 'failed' && file.state !== 'canceled'));
+  const kept = new Set(existing.map(file => file.filename));
+  return {
+    ...queue,
+    paused: queue.paused && existing.some(file => file.state === 'queued' || file.state === 'downloading'),
+    files: [...existing, ...added.filter(file => !kept.has(file.filename))]
   };
 }
 
@@ -112,7 +136,7 @@ chrome.runtime.onStartup.addListener(() => {
   }).catch(() => {});
 });
 
-export function seriesDownloadRequest(message: { type: string; plan?: SeriesPlan; selectedPages?: string[] }, sender: chrome.runtime.MessageSender) {
+export function seriesDownloadRequest(message: { type: string; plan?: SeriesPlan; selectedPages?: string[]; folder?: string }, sender: chrome.runtime.MessageSender) {
   return serialize(async () => {
     if (sender.url !== chrome.runtime.getURL('offline.html') && !sender.url?.startsWith(chrome.runtime.getURL('offline.html') + '?')) {
       throw new Error('Open Offline study to manage series downloads.');
@@ -121,17 +145,27 @@ export function seriesDownloadRequest(message: { type: string; plan?: SeriesPlan
     if (!chrome.downloads) throw new Error('Allow Chrome downloads to start the queue.');
     watchDownloads();
     let queue = await load();
-    if (message.type === 'SERIES_DOWNLOAD_START' || message.type === 'SERIES_DOWNLOAD_APPLY') {
+    const adding = message.type === 'SERIES_DOWNLOAD_ADD';
+    if (adding || message.type === 'SERIES_DOWNLOAD_START' || message.type === 'SERIES_DOWNLOAD_APPLY') {
       const applying = message.type === 'SERIES_DOWNLOAD_APPLY';
-      if (!applying && queue?.files.some(file => file.state === 'queued' || file.state === 'downloading')) {
+      if (!adding && !applying && queue?.files.some(file => file.state === 'queued' || file.state === 'downloading')) {
         throw new Error('Apply your selection to the current queue or stop it first.');
       }
       if (!message.plan) throw new Error('Check a series before downloading.');
       if (!Array.isArray(message.selectedPages) || !message.selectedPages.length) {
         throw new Error('Select at least one episode.');
       }
-      const next = createQueue(message.plan, message.selectedPages);
-      queue = applying && queue ? await applySelection(queue, next) : next;
+      let folder: string | undefined;
+      if (adding) {
+        const id = seriesRoot(message.plan.series).pathname.match(/\d+$/)![0];
+        folder = message.folder;
+        if (typeof folder !== 'string' || /[/\\:*?"<>|\p{Cc}]/u.test(folder) || folder.startsWith('.')
+            || folder.match(/^.+? - (\d+)(?: - .+)?$/)?.[1] !== id) {
+          throw new Error('Choose the downloaded folder for this series.');
+        }
+      }
+      const next = createQueue(message.plan, message.selectedPages, folder);
+      queue = adding ? appendEpisodes(queue, next) : applying && queue ? await applySelection(queue, next) : next;
     }
     if (!queue) return { queue: null };
     if (message.type === 'SERIES_DOWNLOAD_STOP') {

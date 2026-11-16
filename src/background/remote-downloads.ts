@@ -1,5 +1,6 @@
 import { AUTO_FALLBACK, planSeries, resolveSeriesTeam, seriesFiles, type SeriesPlan } from '../japanese/series';
 import { DEFAULT_TV_SERVER_URL } from '../japanese/tv-sync';
+import { loadDubOrder } from '../japanese/dub-order';
 import { seriesQueueStatus, startRequestedSeries } from './series-downloads';
 
 /**
@@ -32,10 +33,10 @@ async function report(base: string, update: Record<string, unknown>): Promise<{ 
   return response.ok ? await response.json() : {};
 }
 
-/** Dubbed editions often miss episodes for the chosen team; fill gaps with the most common one. */
-async function completePlan(plan: SeriesPlan) {
+/** Dubbed editions often miss episodes for the chosen team; fill gaps from the saved order, then the most common one. */
+async function completePlan(plan: SeriesPlan, order: string[]) {
   const gaps = plan.episodes.some(episode => !episode.video && episode.variants?.length);
-  return gaps ? resolveSeriesTeam(plan, AUTO_FALLBACK) : plan;
+  return gaps ? resolveSeriesTeam(plan, [...order, AUTO_FALLBACK]) : plan;
 }
 
 async function claim(base: string, request: RemoteRequest) {
@@ -46,7 +47,8 @@ async function claim(base: string, request: RemoteRequest) {
   }
   await report(base, { id: request.id, state: 'planning', detail: 'Chrome is reading the series' });
   try {
-    const plan = await completePlan(await planSeries(request.url, () => {}));
+    const order = await loadDubOrder();
+    const plan = await completePlan(await planSeries(request.url, () => {}, { priorities: order }), order);
     const pages = plan.episodes.filter(episode => episode.video).map(episode => episode.page);
     if (!pages.length) throw new Error('No downloadable episodes in this edition. Are you signed in to Anime365 in Chrome?');
     const { folder, files } = seriesFiles(plan, pages);

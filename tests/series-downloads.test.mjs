@@ -38,7 +38,7 @@ test('downloads one file at a time and resumes without repeating completed files
   function worker() {
     const world = { chrome, URL };
     vm.runInNewContext(compiled.outputFiles[0].text, world);
-    return (type, plan, selectedPages) => world.series.seriesDownloadRequest({ type: `SERIES_DOWNLOAD_${type}`, plan, selectedPages }, { url: runtime.getURL('offline.html') });
+    return (type, plan, selectedPages, folder) => world.series.seriesDownloadRequest({ type: `SERIES_DOWNLOAD_${type}`, plan, selectedPages, folder }, { url: runtime.getURL('offline.html') });
   }
 
   const first = worker();
@@ -99,6 +99,20 @@ test('downloads one file at a time and resumes without repeating completed files
   assert.equal(updated.files.length, 1);
   assert.match(downloads.at(-1).filename, /Episode 003 - 3002\.mp4$/);
   assert.equal(downloads[1].state, 'complete');
+
+  await assert.rejects(restarted('ADD', full, [secondPage], '../Fixture - 1234'), /Choose the downloaded folder/);
+  await assert.rejects(restarted('ADD', full, [secondPage], 'Other title - 1234'), /Another series is downloading/);
+  const active = downloads.at(-1);
+  const folder = 'Fixture - 1234 - Fixture Dub';
+  const extended = await restarted('ADD', full, [secondPage, thirdPage], folder);
+  assert.deepEqual(Array.from(extended.queue.files, file => file.state), ['downloading', 'queued']);
+  assert.equal(downloads.at(-1), active);
+  const repeated = await restarted('ADD', full, [secondPage, thirdPage], folder);
+  assert.equal(repeated.queue.files.length, 2);
+  active.state = 'complete';
+  changedListeners.at(-1)({ state: { current: 'complete' } });
+  await restarted('STATUS');
+  assert.match(downloads.at(-1).filename, /Episode 002 - 3001\.mp4$/);
 });
 
 test('plans combined fallback dubbing when primary team is missing episodes', async () => {
@@ -172,6 +186,20 @@ test('plans combined fallback dubbing when primary team is missing episodes', as
   const perEp = await resolveEpisodeVariant(structuredClone(combined), combined.episodes[1].page, 'AniDUB');
   assert.equal(perEp.episodes[1].team, 'AniDUB');
   assert.equal(perEp.episodes[1].video.url, `${host}/translations/mp4/4002?height=720`);
+
+  const ordered = await resolveSeriesTeam(structuredClone(plan), ['AniDUB', 'AniLiberty']);
+  assert.equal(ordered.episodes[0].team, 'StudioBand Amediateka');
+  assert.equal(ordered.episodes[1].team, 'AniDUB', 'the secondary dubbing wins over the tertiary one');
+
+  const progress = [];
+  const planned = await planSeries(`${host}${ep1}/ozvuchka-3000`, (checked, total, partial) => progress.push([checked, total, !!partial]), { priorities: ['AniLiberty', 'AniDUB'] });
+  assert.equal(planned.episodes[0].team, 'StudioBand Amediateka');
+  assert.equal(planned.episodes[1].team, 'AniLiberty', 'saved priorities fill gaps in one check');
+  assert.equal(planned.episodes[1].video.url, `${host}/translations/mp4/4001?height=1080`);
+  assert.deepEqual(progress[0], [0, 2, true], 'the episode list shows before pages load');
+
+  const general = await planSeries(`${host}${ep1}/ozvuchka-3000`.replace('ozvuchka-3000', 'ozvuchka'), () => {}, { priorities: ['AniDUB'] });
+  assert.equal(general.episodes[1].team, 'AniDUB', 'a general dub link follows the saved primary');
 
   const cleared = await resolveSeriesTeam(structuredClone(combined), undefined);
   assert.equal(cleared.episodes[0].team, 'StudioBand Amediateka');
