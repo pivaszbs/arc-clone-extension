@@ -430,7 +430,6 @@
     })).filter(batch => batch.videos.length > 0);
   });
   const watchedDownloadCount = $derived(watchedDownloads.reduce((count, batch) => count + batch.videos.length, 0));
-  const savedPosition = $derived(episodes[episodeIndex] ? episodeProgress(episodes[episodeIndex].video)?.position || 0 : 0);
 
   $effect(() => {
     const list = episodeList;
@@ -1260,16 +1259,6 @@
     }
   }
 
-  function switchEpisodeFolder() {
-    const chosen = episodeFolders.find(entry => entry.key === selectedFolder);
-    if (!chosen) return;
-    usePreferredEpisode = false;
-    folderStatus = '';
-    selected = '';
-    setEpisodeFiles(chosen.files);
-    if (videoUrl) selectEpisode(true);
-  }
-
   async function chooseFolder(reconnect = false) {
     if (!directoryPicker || folderBusy) return;
     folderBusy = true;
@@ -1936,25 +1925,12 @@
       <h2 id="library-title">Gallery</h2>
     </div>
 {#if directoryPicker}
-  <div class="episode-bar library">
-    <button disabled={folderBusy} onclick={() => chooseFolder()}>{folder ? 'Change download folder' : 'Connect download folder'}</button>
-    {#if folder && !folderGranted}<button disabled={folderBusy} onclick={() => chooseFolder(true)}>Reconnect {folder.name}</button>{/if}
-    {#if folderGranted && (episodeFolders.length > 1 || (episodeFolders.length && selectedFolder === undefined))}
-      <select aria-label="Series folder" value={selectedFolder ?? null} onchange={event => {
-        selectedFolder = event.currentTarget.value;
-        switchEpisodeFolder();
-      }}>
-        {#if selectedFolder === undefined}<option value={null} disabled>Choose a downloaded series</option>{/if}
-        {#each episodeFolders as entry (entry.key)}{@const name = folderTitle(entry.name)}<option value={entry.key} title={entry.name}>{[name.title, name.credit].filter(Boolean).join(' · ')}</option>{/each}
-      </select>
-    {/if}
-    {#if !videoUrl && episodes.length}
-      <select aria-label="Saved episode" bind:value={selected}>
-        {#each episodes as episode (episode.path)}<option value={episode.path} title={episode.video.name}>{episodeLabel(episode.video.name)}</option>{/each}
-      </select>
-      <button onclick={() => selectEpisode(true)}>{savedPosition ? 'Resume episode' : 'Play saved episode'}</button>
-    {/if}
-  </div>
+  {#if !folderGranted}
+    <div class="episode-bar library">
+      {#if folder}<button disabled={folderBusy} onclick={() => chooseFolder(true)}>Reconnect {folder.name}</button>
+      {:else}<button disabled={folderBusy} onclick={() => chooseFolder()}>Connect download folder</button>{/if}
+    </div>
+  {/if}
   {#if folderGranted && episodeFolders.length}
     {#if continueTarget && !openGroup && !browsedFolder}
       {@const target = continueTarget}
@@ -2055,16 +2031,12 @@
   {#if folderStatus}<p role="status">{folderStatus}</p>
   {:else if !folder}<p>Choose Arc Anime or a series folder inside it.</p>{/if}
 {/if}
-  {#if episodes.length}
-    <button class="export-tv" onclick={exportTvPlaybackData} title="Save the selected series’ skip predictions and watch progress for Anime Study TV">Export TV playback data</button>
-  {/if}
-  <details class="local-files" open={!directoryPicker}>
-    <summary>Open files manually</summary>
+  {#if !directoryPicker}
     <div class="files">
       <div><label for="series-folder">Open a downloaded series folder</label><input id="series-folder" type="file" webkitdirectory onchange={openFolder} /></div>
       <div><label for="episode">Episode video</label><input id="episode" type="file" accept="video/*,.mp4,.webm,.m4v" onchange={openVideo} /></div>
     </div>
-  </details>
+  {/if}
   </section>
   <section id="pipelines" class="library-tools" aria-labelledby="pipelines-title" hidden={activeScreen !== 'pipelines'}>
     <div class="library-header">
@@ -2311,8 +2283,14 @@
         <option value="skip">Skip ending only</option>
       </select>
     </div>
+    {#if directoryPicker && folder}
+      <div class="episode-bar">
+        <button disabled={folderBusy} onclick={() => chooseFolder()}>Change download folder</button>
+      </div>
+    {/if}
     <div class="episode-bar">
       <button onclick={exportPredictions}>Export saved skip predictions</button>
+      {#if episodes.length}<button onclick={exportTvPlaybackData} title="Save the selected series’ skip predictions and watch progress for Anime Study TV">Export TV playback data</button>{/if}
     </div>
     {#if exportStatus}<p role="status">{exportStatus}</p>{/if}
     <div class="episode-bar">
@@ -2634,21 +2612,11 @@
     margin-top: 26px;
   }
   .library-tools { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 15px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
-  .library-tools p, .scan-queue span, .local-files { color: var(--muted); font-size: 13px; }
+  .library-tools p, .scan-queue span { color: var(--muted); font-size: 13px; }
   .library-tools label { display: block; margin-bottom: 5px; }
   .settings-tools .setting-check { display: flex; align-items: center; gap: 8px; margin-bottom: 0; font-size: 14px; cursor: pointer; }
   .settings-tools .setting-select { margin-bottom: 0; font-size: 13px; color: var(--muted); }
-  .export-tv {
-    justify-self: start;
-    font: inherit;
-    font-size: 13px;
-    color: inherit;
-    background: #201f22;
-    border: 1px solid #ffffff26;
-    border-radius: 6px;
-    padding: 5px 9px;
-  }
-  .export-tv:hover, .episode-bar button:hover:not(:disabled) { background: #2a292c; }
+  .episode-bar button:hover:not(:disabled) { background: #2a292c; }
   .files { display: grid; gap: 10px; margin-top: 10px; }
   .files input { max-width: 100%; }
   button, summary { cursor: pointer; }
@@ -2663,7 +2631,7 @@
   @media (pointer: coarse) {
     .offline-controls :global(.study.inline :is(button, select)),
     .episode-controls :is(button, select),
-    .episode-bar :is(button, select), .export-tv, .watch-actions button, dialog button {
+    .episode-bar :is(button, select), .watch-actions button, dialog button {
       min-height: 44px;
       min-width: 44px;
     }
