@@ -48,6 +48,7 @@ await bundle(arc, 'src/video/main.ts', 'ArcVideo', 'video.js');
 await bundle(anime, 'src/background/anime.ts', 'AnimeBackground', 'background.js', { module: true, define: { __ARC_BROWSER_ID__: JSON.stringify(unpackedId(arc)) } });
 await bundle(anime, 'src/japanese/main.ts', 'AnimeStudy', 'japanese.js', { css: true });
 
+await cp(resolve(root, 'src/japanese/dictionary-data.json'), resolve(root, anime, 'japanese-dictionary.json'));
 for (const [outDir, manifest] of [[arc, arcManifest], [anime, animeManifest]]) {
   await cp(resolve(root, outDir === anime ? 'public/anime-icons' : 'public/icons'), resolve(root, outDir, 'icons'), { recursive: true });
   await writeFile(resolve(root, outDir, 'manifest.json'), JSON.stringify({ ...manifest, version }, null, 2) + '\n');

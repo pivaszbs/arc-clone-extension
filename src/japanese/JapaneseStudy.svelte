@@ -4,10 +4,13 @@
   import { requestArc } from './client';
   import { hasJapanese, sourceUrl, type Card, type Cue } from './study';
   import { detectAnimeOpEdIntervals, japaneseCaptions, parseCaptionResponse, subtitleUrl } from './captions';
-  import { choices, defaultQuizSettings, words, type Challenge, type ListeningCue, type QuizSettings } from './quiz';
+  import { choices, defaultQuizSettings, words as segmentWords, type Challenge, type ListeningCue, type QuizSettings } from './quiz';
   import { AutoSubtitles, type PageCaptions } from './auto-subtitles';
   import { PhraseStops, placeStudyVideo, readSkipChapters } from './study-player';
   import { overlapsRecap, type VideoThemes } from './video-themes';
+  import { dictionaryReady, loadDictionary, tokenRomaji, tokenize, type Token } from './dictionary';
+  import { analyseEpisode, coverage, episodeTargets, learnable, wordChoices, wordId, wordStop, wordText, type EpisodeWord, type WordStop } from './episode-words';
+  import { isKnown, isLearning, type WordCard } from './word-cards';
   type SkipPart = keyof VideoThemes;
   type EndingAction = 'auto' | 'next' | 'skip';
   let { loadEpisodeCaptions, inline = false, overlayHidden = false, localCues = [], localBody = '', localSource = '', referenceCues = [], videoThemes = {}, title = '', learning = $bindable(false), studying = $bindable(false), autoSkip = $bindable<Record<SkipPart, boolean>>({ recap: true, op: true, ed: true }), endingAction = $bindable<EndingAction>('auto'), showSubtitles = $bindable(true), playerActions, playerOptions, onResumeAtEnd, onToggleFullscreen, onNextEpisode }: {
@@ -106,7 +109,6 @@
   // The Netflix-style skip prompts run in offline study and once the Arc player has replaced the site's player.
   const skipControls = $derived(inline || (!!loadEpisodeCaptions && combined));
   const showPlayback = $derived(combined || inline);
-  const phraseWords = $derived(captured ? words(captured.text) : []);
   const playbackStatus = $derived(!video ? 'No video found'
     : !playbackAttached ? 'Waiting for the site to provide video'
     : !playbackReady ? 'Waiting for video metadata'
@@ -116,6 +118,33 @@
     : inline || captionLookupDone ? 'No Japanese subtitles found' : 'Looking for Japanese subtitles');
   const cardSource = () => localSource || (window === window.top ? location.href : document.referrer || location.href);
   let quizSettings = $state<QuizSettings>({ ...defaultQuizSettings });
+  type Answer = { options: string[]; chosen: string | null; result: 'correct' | 'incorrect' | null };
+  let words = $state<WordCard[]>([]);
+  let dictionary = $state(dictionaryReady());
+  let dictionaryRequest: Promise<void> | null = null;
+  /** The word the current pause is about: shown with its meaning the first time, asked afterwards. */
+  let wordTask = $state<(WordStop & Answer) | null>(null);
+  let selectedToken = $state<number | null>(null);
+  let showWords = $state(false);
+  let wordReview = $state<({ card: WordCard } & Answer) | null>(null);
+  let lastWordStop = -Infinity;
+  /** Seconds of video between word stops, so learning never turns the episode into a slideshow. */
+  const wordPause = 20;
+  const wordCards = $derived(new Map(words.map(word => [word.id, word])));
+  const wordsInPlay = $derived(quizSettings.wordsInPlay ?? 5);
+  const episode = $derived(dictionary && mode === 'learn' ? analyseEpisode(transcript) : null);
+  const targets = $derived(episode ? episodeTargets(episode, wordCards, wordsInPlay) : { learning: [], fresh: [] });
+  const freshIds = $derived(new Set(targets.fresh.map(word => word.id)));
+  const progress = $derived(episode?.total ? coverage(episode, wordCards) : null);
+  const lineTokens = $derived(captured && dictionary ? tokenize(captured.text) : []);
+  const phraseWords = $derived(captured && !dictionary ? segmentWords(captured.text) : []);
+  const taskToken = $derived(wordTask ? lineTokens[wordTask.index] : undefined);
+  const taskCard = $derived(wordTask ? wordCards.get(wordTask.id) : undefined);
+  const asking = $derived(wordTask?.action === 'quiz' && !wordTask.result);
+  const detailToken = $derived(selectedToken === null ? undefined : lineTokens[selectedToken]);
+  const dueWords = $derived(words.filter(word => !word.known && word.due <= now).sort((a, b) => a.due - b.due));
+  const readingOf = (token: Token) => quizSettings.reading === 'kana' ? token.reading || '' : tokenRomaji(token);
+  const kanaReading = (kana: string) => readingOf({ surface: kana, reading: kana });
   let challenge = $state<Challenge | null>(null);
   let options = $state<string[]>([]);
   let chosen = $state<string | null>(null);
@@ -140,6 +169,14 @@
 
   $effect(() => {
     if (combined && open && video) return placeStudyVideo(video);
+  });
+
+  $effect(() => {
+    if (!captured) { wordTask = null; selectedToken = null; }
+  });
+
+  $effect(() => {
+    if (mode !== 'watch' || captured) void ensureDictionary();
   });
 
   $effect(() => {
@@ -270,7 +307,7 @@
     }
     playbackTime = video?.currentTime || 0;
     const paused = video?.paused ?? true;
-    if (playbackPaused && !paused) lastActivity = now;
+    if (playbackPaused && !paused) { lastActivity = now; showWords = false; }
     playbackPaused = paused;
     if (showSettings && idlePlayback && now - lastActivity >= 4000) showSettings = false;
     playbackMuted = video?.muted ?? false;
@@ -306,9 +343,16 @@
       stopAfter.video.pause();
       stopAfter = null;
     }
-    if (mode === 'learn' && quizSettings.chance > 0 && video && !stopAfter && !captured && !video.seeking && (!video.paused || video.ended)) {
-      const next = phraseStops.observe(timeline, detected, playbackTime, quizSettings.chance);
-      if (next) inspectPhrase(next);
+    if (mode === 'learn' && (quizSettings.chance > 0 || wordsInPlay > 0) && video && !stopAfter && !captured && !video.seeking && (!video.paused || video.ended)) {
+      const next = phraseStops.observe(timeline, detected, playbackTime, 1);
+      if (next) {
+        // Words come first: a line with a word in play teaches or asks it; other lines pause at the chosen rate.
+        const stop = dictionary && wordsInPlay > 0 && Math.abs(playbackTime - lastWordStop) >= wordPause
+          ? wordStop(tokenize(next.text), wordCards, id => timeline.length ? freshIds.has(id) : words.filter(isLearning).length < wordsInPlay)
+          : null;
+        if (stop) beginWord(next, stop);
+        else if (Math.random() < quizSettings.chance) inspectPhrase(next);
+      }
     }
     if (skipControls) {
       if (loadEpisodeCaptions && siteNextEpisode?.page !== location.href) lookupSiteNextEpisode();
@@ -316,7 +360,7 @@
     } else countdown = null;
   }
   async function load() {
-    try { const response = await requestArc({ type: 'JAPANESE_LIST' }); cards = response.cards; quizSettings = response.settings || { ...defaultQuizSettings }; }
+    try { const response = await requestArc({ type: 'JAPANESE_LIST' }); cards = response.cards; words = response.words || []; quizSettings = response.settings || { ...defaultQuizSettings }; }
     catch { status = 'Could not load saved phrases. Reload the extension and this page.'; }
   }
   function seek(time: number) {
@@ -454,10 +498,99 @@
     mode = 'learn';
 
     stopAfter = null;
+    wordTask = null;
+    selectedToken = null;
     captured = { ...cue };
     text = cue.text;
     meaning = cards.find(card => card.text === cue.text)?.meaning || '';
     status = '';
+  }
+
+  function ensureDictionary() {
+    if (dictionary) return Promise.resolve();
+    dictionaryRequest ??= requestArc({ type: 'JAPANESE_DICTIONARY' }).then(response => {
+      if (typeof response?.entries !== 'string') throw new Error('Dictionary unavailable');
+      if (!dictionaryReady()) loadDictionary(response.entries);
+      dictionary = true;
+    }).catch(() => {
+      dictionaryRequest = null;
+      if (mode === 'learn') status = 'Word meanings could not be loaded. Reload the extension and this page.';
+    });
+    return dictionaryRequest;
+  }
+
+  const isVerb = (gloss: string) => gloss.startsWith('to ');
+  function distractors(correct: string) {
+    const pool = [...(episode ? [...episode.words.values()].map(word => word.entry.gloss) : []), ...words.map(word => word.gloss),
+      'friend; companion', 'to eat', 'water', 'to go', 'house; home', 'to see; to look', 'today', 'person', 'to say', 'time; hour', 'to wait', 'big; large'];
+    const alike = pool.filter(gloss => isVerb(gloss) === isVerb(correct));
+    return [...alike, ...pool.filter(gloss => !alike.includes(gloss))].filter((gloss, index, all) => all.indexOf(gloss) === index).slice(0, 40);
+  }
+  /** Wrong answers of the same kind as the right one, so "to …" does not give a verb away. */
+  function answerOptions(correct: string) {
+    const pool = distractors(correct).filter(gloss => gloss !== correct && !gloss.startsWith('indicates'));
+    const alike = pool.filter(gloss => isVerb(gloss) === isVerb(correct));
+    return wordChoices(correct, alike.length >= 3 ? alike : pool);
+  }
+
+  function beginWord(cue: Cue, stop: WordStop) {
+    const token = tokenize(cue.text)[stop.index];
+    const card = wordCards.get(stop.id);
+    if (!token?.entry || (stop.action === 'quiz' && !card)) return;
+    inspectPhrase(cue);
+    lastWordStop = playbackTime;
+    if (stop.action === 'teach') {
+      wordTask = { ...stop, options: [], chosen: null, result: null };
+      selectedToken = stop.index;
+      void saveWord(token, cue);
+    } else wordTask = { ...stop, options: answerOptions(card!.gloss), chosen: null, result: null };
+  }
+
+  async function saveWord(token: Token, cue: Cue, known?: boolean) {
+    if (!token.entry) return;
+    try {
+      const response = await requestArc({ type: 'JAPANESE_WORD_SAVE', word: {
+        id: wordId(token.entry), word: wordText(token.entry), reading: token.entry.reading, gloss: token.entry.gloss,
+        ...(known === undefined ? {} : { known }),
+        example: { text: cue.text, url: cardSource(), title: title || document.title, start: cue.start, end: cue.end }
+      } });
+      words = response.words;
+    } catch (error) { status = error instanceof Error ? error.message : 'Could not save this word.'; }
+  }
+
+  async function gradeWord(id: string, remembered: boolean) {
+    try { words = (await requestArc({ type: 'JAPANESE_WORD_GRADE', id, remembered })).words; now = Date.now(); }
+    catch { status = 'Could not save your answer.'; }
+  }
+
+  function answerWord(answer: string | null) {
+    if (!wordTask || wordTask.result || !taskCard) return;
+    wordTask.chosen = answer;
+    wordTask.result = answer === taskCard.gloss ? 'correct' : 'incorrect';
+    selectedToken = wordTask.index;
+    void gradeWord(wordTask.id, wordTask.result === 'correct');
+  }
+
+  /** Opens a word from the episode list in the first line that uses it, and plays that line. */
+  function studyWord(item: EpisodeWord) {
+    const index = tokenize(item.first.text).findIndex(token => token.entry && wordId(token.entry) === item.id);
+    if (index < 0) return;
+    showWords = false;
+    if (wordCards.has(item.id)) { inspectPhrase(item.first); selectedToken = index; }
+    else beginWord(item.first, { id: item.id, index, action: 'teach' });
+    void replayPhrase();
+  }
+
+  function startWordReview() {
+    const card = dueWords[0];
+    wordReview = card ? { card, options: answerOptions(card.gloss), chosen: null, result: null } : null;
+  }
+
+  function answerWordReview(answer: string | null) {
+    if (!wordReview || wordReview.result) return;
+    wordReview.chosen = answer;
+    wordReview.result = answer === wordReview.card.gloss ? 'correct' : 'incorrect';
+    void gradeWord(wordReview.card.id, wordReview.result === 'correct');
   }
 
   async function resumePhrase() {
@@ -487,8 +620,11 @@
 
     }
     mode = next;
+    wordReview = null;
     phraseStops.reset();
     if (next === 'review') { video?.pause(); void load(); }
+    // Meet the episode's words before pressing play.
+    if (next === 'learn' && (video?.paused ?? true)) showWords = true;
   }
 
   function siteStorage() {
@@ -738,12 +874,12 @@
     if (busy) return;
     challenge = null; quizRequest++; quizLoading = false; phraseStops.reset(); quizError = '';
   }
-  async function setChance(event: Event) {
-    const chance = Number((event.currentTarget as HTMLSelectElement).value);
-    quizSettings = { chance };
+  async function changeSettings(change: Partial<QuizSettings>) {
+    const settings = { ...quizSettings, ...change };
+    quizSettings = settings;
     phraseStops.reset();
-    try { quizSettings = (await requestArc({ type: 'JAPANESE_QUIZ_SETTINGS', settings: { chance } })).settings; }
-    catch { status = 'Could not save quiz frequency.'; }
+    try { quizSettings = (await requestArc({ type: 'JAPANESE_QUIZ_SETTINGS', settings })).settings; }
+    catch { status = 'Could not save this setting.'; }
   }
   function closePanel() {
     if (loadEpisodeCaptions) leftSitePlayer = true;
@@ -901,7 +1037,7 @@
           {#if video}<button onclick={() => { if (video) { video.muted = !video.muted; tick(); } }}>{playbackMuted ? 'Unmute' : 'Mute'}</button>{/if}
           {#if showPlayback && document.pictureInPictureEnabled}<button disabled={!playbackReady} onclick={pictureInPicture}>Picture in picture</button>{/if}
           <label>Speed <select aria-label="Playback speed" disabled={!video} bind:value={selectedSpeed} onchange={speed}><option value="1">Normal</option><option value="0.85">0.85×</option><option value="0.7">0.7×</option></select></label>
-          <button disabled={!!challenge} onclick={() => { switchMode(mode === 'review' ? 'watch' : 'review'); showSettings = false; }}>Review · {due.length}</button>
+          <button disabled={!!challenge} onclick={() => { switchMode(mode === 'review' ? 'watch' : 'review'); showSettings = false; }}>Review · {due.length + dueWords.length}</button>
           <button disabled={!cards.length} onclick={exportCards}>Export phrases</button>
           <details>
             <summary>Subtitles</summary>
@@ -940,15 +1076,54 @@
         {#if quizError}<p class="status" role="alert">{quizError}</p><button disabled={busy} onclick={() => result ? saveQuizResult() : challenge && beginQuiz(challenge)}>Retry</button>{/if}
         {#if result}<button class="primary" disabled={busy || !quizSaved} onclick={continueQuiz}>Next review</button>{:else}<button disabled={busy} onclick={continueQuiz}>Skip without changing progress</button>{/if}
         <p class="hint">Translations may be machine generated. Your answer updates the review schedule automatically.</p>
+      {:else if mode === 'review' && wordReview}
+        <p class="hint">What does this word mean?</p>
+        <div class="caption" lang="ja">{wordReview.card.word}</div>
+        <p class="words">{kanaReading(wordReview.card.reading)}</p>
+        {#if wordReview.card.example}<p class="hint" lang="ja">{wordReview.card.example.text}</p>{/if}
+        <div class="quiz-options">{#each wordReview.options as option}<button disabled={!!wordReview.result} class:correct={!!wordReview.result && option === wordReview.card.gloss} class:wrong={wordReview.result === 'incorrect' && option === wordReview.chosen} onclick={() => answerWordReview(option)}>{option}</button>{/each}</div>
+        {#if wordReview.result}
+          <p role="status">{wordReview.result === 'correct' ? 'Correct.' : 'The highlighted answer is the meaning. This word will come back soon.'}</p>
+          <button class="primary" onclick={startWordReview}>{dueWords.length ? 'Next word' : 'Done'}</button>
+        {:else}<button onclick={() => answerWordReview(null)}>I don’t know yet</button>{/if}
+      {:else if mode === 'review' && dueWords.length}
+        <p class="hint">{dueWords.length} {dueWords.length === 1 ? 'word is' : 'words are'} ready to review.</p>
+        <button class="primary" onclick={startWordReview}>Review words</button>
       {:else if mode === 'review' && review}
         <p class="hint">Answer a translation question. The result schedules your next review automatically.</p><button class="primary" onclick={() => { if (video) video.pause(); void beginQuiz({ cue: review, kind: 'known', unknown: [], meaning: review.meaning, cardId: review.id }); }}>Start next review</button>
         {#if sourceUrl(review.url, review.start)}<a href={sourceUrl(review.url, review.start)} target="_blank" rel="noopener noreferrer">Open source · {clock(review.start)}</a>{/if}
-      {:else if mode === 'review'}<div class="caption">{cards.length ? 'You’re caught up.' : 'Your first phrase starts here.'}</div><p class="hint">{cards.length ? 'Come back when a phrase is due. Remembered phrases return after 1, 2, 4 days and longer.' : 'Capture a phrase while watching, add its meaning, then come here to practise remembering it.'}</p>{/if}
-      {#if mode === 'learn' && !challenge}
+      {:else if mode === 'review'}<div class="caption">{cards.length || words.length ? 'You’re caught up.' : 'Your first word starts here.'}</div><p class="hint">{cards.length || words.length ? 'Come back when something is due. Remembered words and phrases return after 1, 2, 4 days and longer.' : 'Turn on Learn while watching. The words you meet there come back here for practice.'}</p>{/if}
+      {#if mode === 'learn' && !challenge && !captured}
         <div class="learn-bar">
-          <label>Pause to study <select value={String(quizSettings.chance)} onchange={setChance}>
-            <option value="0">Never</option><option value="0.1">Random · 10%</option><option value="0.25">Random · 25%</option><option value="0.5">Random · 50%</option><option value="1">Every phrase</option>
+          <label>Words in play <select aria-label="Words in play" value={String(wordsInPlay)} onchange={event => changeSettings({ wordsInPlay: Number(event.currentTarget.value) })}>
+            <option value="0">Off</option><option value="3">3</option><option value="5">5</option><option value="8">8</option>
           </select></label>
+          <label>Other lines <select aria-label="Pause on other lines" value={String(quizSettings.chance)} onchange={event => changeSettings({ chance: Number(event.currentTarget.value) })}>
+            <option value="0">Don’t pause</option><option value="0.1">Pause on 10%</option><option value="0.25">Pause on 25%</option><option value="0.5">Pause on 50%</option><option value="1">Pause on every line</option>
+          </select></label>
+          <label>Readings <select aria-label="Readings" value={quizSettings.reading ?? 'romaji'} onchange={event => changeSettings({ reading: event.currentTarget.value === 'kana' ? 'kana' : 'romaji' })}>
+            <option value="romaji">Romaji</option><option value="kana">Kana</option>
+          </select></label>
+          {#if episode && wordsInPlay > 0}
+            <details class="episode-words" bind:open={showWords}>
+              <summary>Words · {targets.fresh.length} new · {targets.learning.length} learning{progress ? ` · ${Math.round(progress.share * 100)}% of this episode known` : ''}</summary>
+              {#if showWords}
+                <div class="word-list">
+                  {#each [...targets.learning, ...targets.fresh] as item (item.id)}
+                    <div class="word-row">
+                      <button aria-label={`Hear ${item.word} in the episode`} title="Hear it in the episode" disabled={!video} onclick={() => studyWord(item)}>▶</button>
+                      <span class="word-main"><b lang="ja">{item.word}</b> <span class="reading">{kanaReading(item.entry.reading)}</span></span>
+                      <span class="word-gloss">{item.entry.gloss}</span>
+                      <span class="clock">×{item.count}</span>
+                      <button onclick={() => saveWord({ surface: item.word, entry: item.entry }, item.first, true)}>I know it</button>
+                    </div>
+                  {:else}
+                    <p class="hint">{transcript.length ? 'Nothing new to pick in this episode. Words you are learning will still be asked.' : 'Words appear once the Japanese subtitles load.'}</p>
+                  {/each}
+                </div>
+              {/if}
+            </details>
+          {/if}
           {#if transcript.length}
             <details bind:open={showTranscript}>
               <summary>Transcript</summary>
@@ -967,8 +1142,37 @@
       {/if}
       {#if captured}
         <div class="phrase">
-          <p class="phrase-text" lang="ja">{captured.text}</p>
-          {#if phraseWords.length}<p class="words" lang="ja">{phraseWords.join(' · ')}</p>{/if}
+          {#if lineTokens.length}
+            {#if wordTask}<p class="hint">{wordTask.action === 'teach' ? 'New word. Listen for it in this line.' : asking ? 'You have met this word. What does it mean?' : wordTask.result === 'correct' ? 'Correct.' : 'Not yet. It will come up again soon.'}</p>{/if}
+            <p class="line" lang="ja">{#each lineTokens as token, index}{#if token.entry}<button class="word" class:target={wordTask?.index === index} class:selected={selectedToken === index} aria-pressed={selectedToken === index}
+              disabled={asking && wordTask?.index === index} onclick={() => { selectedToken = selectedToken === index ? null : index; }}><span>{token.surface}</span><span class="reading" lang="en">{readingOf(token)}</span></button>{:else}<span class="plain">{token.surface}</span>{/if}{/each}</p>
+            {#if asking && wordTask && taskToken}
+              <div class="quiz-options">{#each wordTask.options as option}<button onclick={() => answerWord(option)}>{option}</button>{/each}</div>
+              <button onclick={() => answerWord(null)}>I don’t know yet</button>
+            {:else if wordTask?.result && taskCard}
+              <div class="quiz-options">{#each wordTask.options as option}<button disabled class:correct={option === taskCard.gloss} class:wrong={wordTask.result === 'incorrect' && option === wordTask.chosen}>{option}</button>{/each}</div>
+            {/if}
+            {#if detailToken?.entry && !(asking && selectedToken === wordTask?.index)}
+              {@const entry = detailToken.entry}
+              {@const card = wordCards.get(wordId(entry))}
+              <div class="word-detail">
+                <p><b lang="ja">{detailToken.base}</b> <span class="reading">{kanaReading(entry.reading)}</span>
+                  {#if !learnable(detailToken)}<span class="tag">grammar</span>{:else if isKnown(card)}<span class="tag">known</span>{:else if card}<span class="tag">learning</span>{/if}</p>
+                <p>{entry.gloss}</p>
+                {#if learnable(detailToken) && captured}
+                  {@const cue = captured}
+                  <div class="controls">
+                    {#if !card}<button onclick={() => saveWord(detailToken, cue)}>Learn this word</button>{/if}
+                    {#if !isKnown(card)}<button onclick={() => saveWord(detailToken, cue, true)}>I know it</button>
+                    {:else if card?.known}<button onclick={() => saveWord(detailToken, cue, false)}>Learn it again</button>{/if}
+                  </div>
+                {/if}
+              </div>
+            {:else if !wordTask}<p class="hint">Tap a word for its meaning.</p>{/if}
+          {:else}
+            <p class="phrase-text" lang="ja">{captured.text}</p>
+            {#if phraseWords.length}<p class="words" lang="ja">{phraseWords.join(' · ')}</p>{/if}
+          {/if}
           <div class="controls">
             <button disabled={!video} onclick={replayPhrase}>Replay</button>
           {#if !inline}<button disabled={translating} title="Send this phrase to Google Translate" onclick={translate}>{translating ? 'Translating…' : 'Translate'}</button>{/if}
@@ -1049,6 +1253,21 @@
   .quiz-options { display: grid; gap: 4px; margin: 6px 0; }
   .quiz-options .correct { border-color: #8cda9b; }
   .quiz-options .wrong { border-color: #eea1a1; }
+  .line { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 4px 2px; font-size: 20px; line-height: 1.2; }
+  .line .plain { padding: 3px 1px; align-self: flex-start; }
+  .word { display: inline-grid; justify-items: center; gap: 1px; padding: 3px 5px; border-color: transparent; background: #ffffff0d; }
+  .word .reading { font-size: 11px; }
+  .word.target { border-color: #ceb9f7; background: #ceb9f72e; }
+  .word.selected { background: #ffffff26; }
+  .word:disabled { opacity: 1; }
+  .reading, .tag { color: #c2bdce; font-size: 12px; }
+  .tag { border: 1px solid #ffffff24; border-radius: 999px; padding: 0 6px; margin-left: 4px; }
+  .word-detail { border-left: 2px solid #8e78ae; padding-left: 8px; margin: 6px 0; }
+  .episode-words { flex-basis: 100%; }
+  .word-list { display: grid; gap: 4px; max-height: 190px; overflow: auto; margin-top: 4px; }
+  .word-row { display: grid; grid-template-columns: auto minmax(70px, auto) 1fr auto auto; align-items: center; gap: 8px; }
+  .word-main b { font-size: 16px; font-weight: 600; }
+  .word-gloss { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .launcher[hidden] { display: none; }
   .launcher { display: block; margin-left: auto; background: #302b40; }
 </style>

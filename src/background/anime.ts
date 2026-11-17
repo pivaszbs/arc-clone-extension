@@ -107,6 +107,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse(await translateText(String(message.text || ''), 'en', 'ja'));
       return;
     }
+    if (message?.type === 'JAPANESE_DICTIONARY') {
+      // Served on request so the 1.4 MB word list is not parsed in every page the content script enters.
+      sendResponse(await (await fetch(chrome.runtime.getURL('japanese-dictionary.json'))).json());
+      return;
+    }
     if (typeof message?.type === 'string' && message.type.startsWith('JAPANESE_')) {
       sendResponse(await studyRequest(message));
       return;

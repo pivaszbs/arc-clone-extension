@@ -1,6 +1,7 @@
 import { createStudyStore } from '../storage';
 import { subtitleUrl } from '../captions';
 import { safariApi } from './api';
+import dictionary from '../dictionary-data.json';
 const api = safariApi();
 const store = createStudyStore(api.storage.local);
 api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -29,6 +30,7 @@ async function handle(message: { type: string; [key: string]: any }) {
     if (!translatedText) throw new Error('Translation unavailable.');
     return { translatedText };
   }
+  if (message.type === 'JAPANESE_DICTIONARY') return { entries: dictionary.entries };
   if (message.type?.startsWith('JAPANESE_')) return store(message);
   throw new Error('Unsupported extension request.');
 }
