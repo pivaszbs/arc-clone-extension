@@ -81,8 +81,19 @@
     if (partial) plan = structuredClone(partial);
   }
 
+  /** Fills in a series link from elsewhere in the library and checks its episodes. */
+  export function checkLink(link: string) {
+    url = link;
+    expanded = true;
+    void check();
+  }
+
   async function checkSeries(event: SubmitEvent) {
     event.preventDefault();
+    await check();
+  }
+
+  async function check() {
     if (busy) return;
     busy = true;
     plan = undefined;

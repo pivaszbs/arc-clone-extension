@@ -4,6 +4,7 @@
   import LoadMoreEpisodes from './LoadMoreEpisodes.svelte';
   import MacServerCard from './MacServerCard.svelte';
   import SeriesDownloads from './SeriesDownloads.svelte';
+  import BeginnerAnime from './BeginnerAnime.svelte';
   import { detectAnimeOpEdIntervals, parseCaptionResponse } from './captions';
   import { castEpisode, findCastDevices, openSafariAirPlay, stopDirectCast, stopSafariAirPlay, updateSafariAirPlay, type CastDevice, type CastSession } from './direct-cast';
   import type { Cue } from './study';
@@ -73,14 +74,14 @@
   let arcExplainerLoading = $state(false);
   let arcExplainerError = $state('');
   // Routes live in the hash so Back/Forward and reloads keep your place:
-  // #/watch, #/gallery[/<title>[/<folder>]], #/settings, #/pipelines, #/downloads.
-  type Screen = 'watch' | 'gallery' | 'settings' | 'pipelines' | 'downloads';
+  // #/watch, #/gallery[/<title>[/<folder>]], #/beginner, #/settings, #/pipelines, #/downloads.
+  type Screen = 'watch' | 'gallery' | 'beginner' | 'settings' | 'pipelines' | 'downloads';
   const ROOT_FOLDER = '.';
   function parseRoute(hash: string) {
     const [screen, title, folder] = hash.replace(/^#\/?/, '').split('/').map(part => {
       try { return decodeURIComponent(part); } catch { return part; }
     });
-    if (!(['watch', 'gallery', 'settings', 'pipelines', 'downloads'] as string[]).includes(screen)) return undefined;
+    if (!(['watch', 'gallery', 'beginner', 'settings', 'pipelines', 'downloads'] as string[]).includes(screen)) return undefined;
     const gallery = screen === 'gallery';
     return {
       screen: screen as Screen,
@@ -258,6 +259,7 @@
     if (screen === 'downloads') downloadsOpen = true;
   }
   let posterUrls = $state<Record<string, string>>({});
+  let seriesDownloads = $state<ReturnType<typeof SeriesDownloads>>();
   const posterFiles = new Map<string, { file: File; url: string }>();
   const galleryVideos = (entry: EpisodeFolder) => entry.files.filter(file => isEpisodeVideo(file.name))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
@@ -1672,7 +1674,7 @@
     <h1 title={animeName || undefined}>{animeName || 'Offline Study'}</h1>
   </div>
   <nav aria-label="Offline Study">
-    {#each [['watch', 'Watch'], ['gallery', 'Gallery'], ['downloads', 'Downloads'], ['pipelines', 'Pipelines'], ['settings', 'Settings']] as [screen, label] (screen)}
+    {#each [['watch', 'Watch'], ['gallery', 'Gallery'], ['beginner', 'Beginner anime'], ['downloads', 'Downloads'], ['pipelines', 'Pipelines'], ['settings', 'Settings']] as [screen, label] (screen)}
       <button type="button" class="nav-tab" aria-current={activeScreen === screen ? 'page' : undefined} onclick={() => showScreen(screen as Screen)}>{label}</button>
     {/each}
   </nav>
@@ -2302,8 +2304,11 @@
     {:else if !folderGranted}<p>Connect a download folder in <a href="#/gallery">Gallery</a>.</p>
     {:else if !watchedDownloadCount}<p>No watched downloads available to delete.</p>{/if}
   </section>
+  <section id="beginner" class="library-tools" aria-labelledby="beginner-title" hidden={activeScreen !== 'beginner'}>
+    <BeginnerAnime onDownload={link => { showScreen('downloads'); seriesDownloads?.checkLink(link); }} />
+  </section>
   <section id="downloads" aria-label="Downloads" hidden={activeScreen !== 'downloads'}>
-    <SeriesDownloads bind:expanded={downloadsOpen} />
+    <SeriesDownloads bind:this={seriesDownloads} bind:expanded={downloadsOpen} />
   </section>
 </div>
 

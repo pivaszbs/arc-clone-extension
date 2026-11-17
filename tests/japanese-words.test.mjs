@@ -7,7 +7,7 @@ const load = async (entry) => {
   const compiled = await build({ stdin: { contents: entry, resolveDir: 'src/japanese', loader: 'ts' }, bundle: true, write: false, format: 'esm', platform: 'node' });
   return import('data:text/javascript;base64,' + Buffer.from(compiled.outputFiles[0].text).toString('base64'));
 };
-const { loadDictionary, tokenize, romaji, tokenRomaji, analyseEpisode, episodeTargets, coverage, wordStop, wordChoices, wordId, scheduleWord, applyWordMessage, createStudyStore, WORDS_KEY } =
+const { loadDictionary, tokenize, romaji, tokenRomaji, segmentRomaji, spell, analyseEpisode, episodeTargets, coverage, wordStop, wordChoices, wordId, scheduleWord, applyWordMessage, createStudyStore, WORDS_KEY } =
   await load("export * from './dictionary'; export * from './episode-words'; export * from './word-cards'; export * from './storage';");
 loadDictionary(JSON.parse(readFileSync('src/japanese/dictionary-data.json', 'utf8')).entries);
 
@@ -24,6 +24,15 @@ test('brings conjugated words back to their dictionary form', () => {
   assert.deepEqual(bases('早く来て！'), ['早く', '来る']);
 });
 
+test('splits words into kanji groups, each with its own reading', () => {
+  const segments = (text) => tokenize(text).filter((token) => token.entry).map((token) => token.segments.map((part) => part.reading ? `${part.text}:${part.reading}` : part.text).join(' '));
+  assert.deepEqual(segments('泥棒のお母さん'), ['泥:どろ 棒:ぼう', 'の', 'お 母:かあ さん']);
+  assert.deepEqual(segments('食べさせられませんでした'), ['食:た べさせられませんでした']);
+  assert.deepEqual(segments('来ない'), ['来:こ ない']);
+  assert.deepEqual(segments('今日'), ['今日:きょう']);
+  assert.deepEqual(spell('日本語', 'にほんご'), [{ text: '日本', reading: 'にほん' }, { text: '語', reading: 'ご' }]);
+});
+
 test('prefers a split that lets the rest of the line make sense', () => {
   assert.deepEqual(bases('それは何ですか。').slice(0, 3), ['それ', 'は', '何']);
 });
@@ -36,6 +45,9 @@ test('leaves names and unknown text as plain tokens', () => {
 });
 
 test('reads words in romaji for learners without kana', () => {
+  const [school] = tokenize('学校');
+  assert.deepEqual(school.segments, [{ text: '学', reading: 'がっ' }, { text: '校', reading: 'こう' }]);
+  assert.deepEqual(segmentRomaji(school.segments), ['gak', 'kou']);
   assert.deepEqual(['きょう', 'がっこう', 'ちょっと', 'しんぶん', 'きんえん', 'コーヒー', 'まっちゃ', 'じゃあ'].map(romaji),
     ['kyou', 'gakkou', 'chotto', 'shinbun', "kin'en", 'koohii', 'matcha', 'jaa']);
   const [watashi, wa, , desu] = tokenize('私は学生です');
@@ -117,4 +129,25 @@ test('saves, marks and grades words alongside phrases', async () => {
   assert.equal(applyWordMessage([], { type: 'JAPANESE_LIST' }), null);
   const settings = (await store({ type: 'JAPANESE_QUIZ_SETTINGS', settings: { chance: 0, wordsInPlay: 3, reading: 'kana', junk: 1 } })).settings;
   assert.deepEqual(settings, { chance: 0, wordsInPlay: 3, reading: 'kana' });
+});
+
+test('beginner list levels and pace labels', async () => {
+  const { levelOf, describePace } = await load("export * from './beginner-anime';");
+  assert.equal(levelOf(0, 280).key, 'start');
+  assert.equal(levelOf(20, 280).key, 'next');
+  assert.equal(levelOf(39, 280).key, 'later');
+  assert.equal(describePace(90), 'Slow speech');
+  assert.equal(describePace(130), 'Moderate speech');
+  assert.equal(describePace(170), 'Fast speech');
+});
+
+test('bundled beginner list is ordered, linked and keyed by word ids', () => {
+  const list = JSON.parse(readFileSync('src/japanese/beginner-anime.json', 'utf8'));
+  assert.ok(list.series.length >= 10 && list.series.length <= list.ranked);
+  for (const [index, item] of list.series.entries()) {
+    assert.match(item.url, /^https:\/\/smotret-anime\.com\/catalog\/[\w-]+-\d+$/);
+    if (item.firstEpisode) assert.match(item.firstEpisode, /^https:\/\/smotret-anime\.com\/catalog\//);
+    assert.ok(item.topWords.length > 0 && item.topWords.every((id) => /^[^|]+\|[^|]+$/.test(id)));
+    if (index) assert.ok(item.difficulty >= list.series[index - 1].difficulty);
+  }
 });

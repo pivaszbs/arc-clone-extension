@@ -8,7 +8,7 @@
   import { AutoSubtitles, type PageCaptions } from './auto-subtitles';
   import { PhraseStops, placeStudyVideo, readSkipChapters } from './study-player';
   import { overlapsRecap, type VideoThemes } from './video-themes';
-  import { dictionaryReady, loadDictionary, tokenRomaji, tokenize, type Token } from './dictionary';
+  import { dictionaryReady, loadDictionary, segmentRomaji, spell, tokenize, type Segment, type Token } from './dictionary';
   import { analyseEpisode, coverage, episodeTargets, learnable, wordChoices, wordId, wordStop, wordText, type EpisodeWord, type WordStop } from './episode-words';
   import { isKnown, isLearning, type WordCard } from './word-cards';
   type SkipPart = keyof VideoThemes;
@@ -143,8 +143,8 @@
   const asking = $derived(wordTask?.action === 'quiz' && !wordTask.result);
   const detailToken = $derived(selectedToken === null ? undefined : lineTokens[selectedToken]);
   const dueWords = $derived(words.filter(word => !word.known && word.due <= now).sort((a, b) => a.due - b.due));
-  const readingOf = (token: Token) => quizSettings.reading === 'kana' ? token.reading || '' : tokenRomaji(token);
-  const kanaReading = (kana: string) => readingOf({ surface: kana, reading: kana });
+  /** The first two senses are enough on a tile; the rest stays in the tooltip. */
+  const shortGloss = (gloss: string) => gloss.split('; ').slice(0, 2).join('; ');
   let challenge = $state<Challenge | null>(null);
   let options = $state<string[]>([]);
   let chosen = $state<string | null>(null);
@@ -950,6 +950,12 @@
   <span class="clock">{clock(playbackTime)} / {clock(playbackDuration)}</span>
 {/snippet}
 
+<!-- Each kanji group with its own reading underneath: 泥 doro · 棒 bou. Kana mode shows readings only under kanji. -->
+{#snippet spelled(segments: Segment[], particle = false)}
+  {@const romajis = segmentRomaji(segments, particle)}
+  <span class="ruby">{#each segments as part, index}<span class="seg"><span class="seg-text" lang="ja">{part.text}</span><span class="seg-reading" lang={quizSettings.reading === 'kana' ? 'ja' : 'en'}>{quizSettings.reading === 'kana' ? part.reading ?? '\u00a0' : romajis[index]}</span></span>{/each}</span>
+{/snippet}
+
 {#if combined}<div class="backdrop" aria-hidden="true"></div>{/if}
 <div class="study" class:combined class:inline class:waiting={studyPlayer && !combined}>
   {#if open}
@@ -1078,8 +1084,7 @@
         <p class="hint">Translations may be machine generated. Your answer updates the review schedule automatically.</p>
       {:else if mode === 'review' && wordReview}
         <p class="hint">What does this word mean?</p>
-        <div class="caption" lang="ja">{wordReview.card.word}</div>
-        <p class="words">{kanaReading(wordReview.card.reading)}</p>
+        <div class="caption review-word">{@render spelled(spell(wordReview.card.word, wordReview.card.reading))}</div>
         {#if wordReview.card.example}<p class="hint" lang="ja">{wordReview.card.example.text}</p>{/if}
         <div class="quiz-options">{#each wordReview.options as option}<button disabled={!!wordReview.result} class:correct={!!wordReview.result && option === wordReview.card.gloss} class:wrong={wordReview.result === 'incorrect' && option === wordReview.chosen} onclick={() => answerWordReview(option)}>{option}</button>{/each}</div>
         {#if wordReview.result}
@@ -1110,13 +1115,16 @@
               {#if showWords}
                 <div class="word-list">
                   {#each [...targets.learning, ...targets.fresh] as item (item.id)}
-                    <div class="word-row">
-                      <button aria-label={`Hear ${item.word} in the episode`} title="Hear it in the episode" disabled={!video} onclick={() => studyWord(item)}>▶</button>
-                      <span class="word-main"><b lang="ja">{item.word}</b> <span class="reading">{kanaReading(item.entry.reading)}</span></span>
-                      <span class="word-gloss">{item.entry.gloss}</span>
-                      <span class="clock">×{item.count}</span>
-                      <button onclick={() => saveWord({ surface: item.word, entry: item.entry }, item.first, true)}>I know it</button>
-                    </div>
+                    {@const card = wordCards.get(item.id)}
+                    <article class="word-tile" class:learning={!!card}>
+                      <p class="tile-word">{@render spelled(spell(item.word, item.entry.reading))}</p>
+                      <p class="tile-gloss" title={item.entry.gloss}>{shortGloss(item.entry.gloss)}</p>
+                      <p class="tile-meta">{card ? 'Learning' : 'New'} · heard {item.count}×</p>
+                      <div class="tile-actions">
+                        <button aria-label={`Hear ${item.word} in the episode`} title="Hear it in the episode" disabled={!video} onclick={() => studyWord(item)}>▶ Hear</button>
+                        <button title="Drop this word and pick the next one" onclick={() => saveWord({ surface: item.word, entry: item.entry }, item.first, true)}>✓ Know</button>
+                      </div>
+                    </article>
                   {:else}
                     <p class="hint">{transcript.length ? 'Nothing new to pick in this episode. Words you are learning will still be asked.' : 'Words appear once the Japanese subtitles load.'}</p>
                   {/each}
@@ -1145,7 +1153,7 @@
           {#if lineTokens.length}
             {#if wordTask}<p class="hint">{wordTask.action === 'teach' ? 'New word. Listen for it in this line.' : asking ? 'You have met this word. What does it mean?' : wordTask.result === 'correct' ? 'Correct.' : 'Not yet. It will come up again soon.'}</p>{/if}
             <p class="line" lang="ja">{#each lineTokens as token, index}{#if token.entry}<button class="word" class:target={wordTask?.index === index} class:selected={selectedToken === index} aria-pressed={selectedToken === index}
-              disabled={asking && wordTask?.index === index} onclick={() => { selectedToken = selectedToken === index ? null : index; }}><span>{token.surface}</span><span class="reading" lang="en">{readingOf(token)}</span></button>{:else}<span class="plain">{token.surface}</span>{/if}{/each}</p>
+              disabled={asking && wordTask?.index === index} onclick={() => { selectedToken = selectedToken === index ? null : index; }}>{@render spelled(token.segments ?? [{ text: token.surface }], token.entry.pos[0] === 'prt')}</button>{:else}<span class="plain">{token.surface}</span>{/if}{/each}</p>
             {#if asking && wordTask && taskToken}
               <div class="quiz-options">{#each wordTask.options as option}<button onclick={() => answerWord(option)}>{option}</button>{/each}</div>
               <button onclick={() => answerWord(null)}>I don’t know yet</button>
@@ -1156,7 +1164,7 @@
               {@const entry = detailToken.entry}
               {@const card = wordCards.get(wordId(entry))}
               <div class="word-detail">
-                <p><b lang="ja">{detailToken.base}</b> <span class="reading">{kanaReading(entry.reading)}</span>
+                <p><span class="detail-word">{@render spelled(spell(detailToken.base || detailToken.surface, entry.reading))}</span>
                   {#if !learnable(detailToken)}<span class="tag">grammar</span>{:else if isKnown(card)}<span class="tag">known</span>{:else if card}<span class="tag">learning</span>{/if}</p>
                 <p>{entry.gloss}</p>
                 {#if learnable(detailToken) && captured}
@@ -1256,18 +1264,32 @@
   .line { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 4px 2px; font-size: 20px; line-height: 1.2; }
   .line .plain { padding: 3px 1px; align-self: flex-start; }
   .word { display: inline-grid; justify-items: center; gap: 1px; padding: 3px 5px; border-color: transparent; background: #ffffff0d; }
-  .word .reading { font-size: 11px; }
+  .ruby { display: inline-flex; align-items: flex-start; gap: 3px; }
+  .seg { display: inline-grid; justify-items: center; }
+  /* A short bracket above each reading ties it to the kanji it belongs to. */
+  .seg-reading { justify-self: stretch; text-align: center; margin-top: 1px; padding: 1px 1px 0; border-top: 1px solid #ffffff40; color: #cfc8dc; font-size: 11px; line-height: 1.2; white-space: nowrap; }
+  .detail-word { font-size: 18px; font-weight: 600; margin-right: 6px; }
+  .review-word { font-size: 28px; }
+  .review-word .seg-reading { font-size: 14px; }
   .word.target { border-color: #ceb9f7; background: #ceb9f72e; }
   .word.selected { background: #ffffff26; }
   .word:disabled { opacity: 1; }
-  .reading, .tag { color: #c2bdce; font-size: 12px; }
+  .tag { color: #c2bdce; font-size: 12px; }
   .tag { border: 1px solid #ffffff24; border-radius: 999px; padding: 0 6px; margin-left: 4px; }
   .word-detail { border-left: 2px solid #8e78ae; padding-left: 8px; margin: 6px 0; }
   .episode-words { flex-basis: 100%; }
-  .word-list { display: grid; gap: 4px; max-height: 190px; overflow: auto; margin-top: 4px; }
-  .word-row { display: grid; grid-template-columns: auto minmax(70px, auto) 1fr auto auto; align-items: center; gap: 8px; }
-  .word-main b { font-size: 16px; font-weight: 600; }
-  .word-gloss { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .word-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px; max-height: min(42dvh, 320px); overflow: auto; margin-top: 6px; pointer-events: auto; }
+  .word-tile { display: grid; grid-template-rows: auto auto 1fr auto auto; justify-items: center; gap: 2px; padding: 10px 8px 8px; text-align: center;
+    background: rgb(14 14 18 / 82%); border: 1px solid #ffffff1f; border-radius: 12px; -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); }
+  .word-tile.learning { border-color: #ceb9f780; }
+  .word-tile p { margin: 0; }
+  .tile-word { font-size: 26px; font-weight: 600; line-height: 1.15; }
+  .tile-word .seg-reading { font-size: 13px; font-weight: 400; }
+  .tile-gloss { margin-top: 4px !important; font-size: 13px; line-height: 1.3; color: #f7f5fc;
+    display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .tile-meta { color: #a9a3b6; font-size: 11px; }
+  .tile-actions { display: flex; gap: 6px; margin-top: 6px; }
+  .tile-actions button { padding: 3px 9px; font-size: 12px; border-radius: 999px; }
   .launcher[hidden] { display: none; }
   .launcher { display: block; margin-left: auto; background: #302b40; }
 </style>
