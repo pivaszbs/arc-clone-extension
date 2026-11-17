@@ -36,7 +36,7 @@ function makeChunk(type, data) {
   return Buffer.concat([len, combined, crcBuf]);
 }
 
-function generateIconPng(size, anime = false) {
+function drawArcIcon(size) {
   const raw = Buffer.alloc(size * (size * 4 + 1));
   const center = (size - 1) / 2;
   const radius = size * 0.45;
@@ -48,7 +48,6 @@ function generateIconPng(size, anime = false) {
       const idx = rowStart + 1 + x * 4;
       const dx = x - center;
       const dy = y - center;
-      const dist = Math.sqrt(dx * dx + dy * dy);
 
       // Rounded rect / squircle mask
       const nx = Math.abs(dx) / radius;
@@ -80,19 +79,6 @@ function generateIconPng(size, anime = false) {
           b = 255;
         }
 
-        if (anime) {
-          r = Math.round(105 + tx * 45);
-          g = Math.round(31 + (1 - ty) * 35);
-          b = Math.round(79 + (1 - ty) * 29);
-          const playX = dx / size;
-          const playY = Math.abs(dy / size);
-          if (playX >= -0.14 && playX <= 0.22 && playY <= (0.22 - playX) * 0.62) {
-            r = 255;
-            g = 244;
-            b = 231;
-          }
-        }
-
         const alpha = squircle > 0.92 ? Math.max(0, Math.round(((1 - squircle) / 0.08) * 255)) : 255;
         raw[idx] = Math.min(255, Math.max(0, r));
         raw[idx + 1] = Math.min(255, Math.max(0, g));
@@ -107,6 +93,65 @@ function generateIconPng(size, anime = false) {
     }
   }
 
+  return raw;
+}
+
+function insidePolygon(x, y, points) {
+  let inside = false;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const [ax, ay] = points[i];
+    const [bx, by] = points[j];
+    if ((ay > y) !== (by > y) && x < ax + (y - ay) * (bx - ax) / (by - ay)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+// Design coordinates use a 100 × 100 canvas. The open book doubles as a video screen.
+const book = [[20, 29], [36, 27], [50, 33], [64, 27], [80, 29],
+  [80, 69], [64, 67], [50, 74], [36, 67], [20, 69]];
+const play = [[43, 39], [43, 61], [62, 50]];
+const supersampling = 4;
+
+function animeColor(x, y) {
+  const left = Math.max(25 - x, 0, x - 75);
+  const top = Math.max(25 - y, 0, y - 75);
+  if (Math.hypot(left, top) > 22) return null;
+  if (insidePolygon(x, y, play)) return [173, 43, 75];
+  if (insidePolygon(x, y, book)) return [255, 246, 227];
+  const shade = (x + y) / 200;
+  return [218 - 93 * shade, 61 - 35 * shade, 94 - 37 * shade];
+}
+
+function drawAnimeIcon(size) {
+  const stride = size * 4 + 1;
+  const raw = Buffer.alloc(size * stride);
+  const samples = supersampling ** 2;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const rgb = [0, 0, 0];
+      let coverage = 0;
+      for (let sample = 0; sample < samples; sample++) {
+        const sx = x + (sample % supersampling + 0.5) / supersampling;
+        const sy = y + (Math.floor(sample / supersampling) + 0.5) / supersampling;
+        const color = animeColor(sx * 100 / size, sy * 100 / size);
+        if (!color) continue;
+        coverage++;
+        for (let channel = 0; channel < 3; channel++) rgb[channel] += color[channel];
+      }
+      if (!coverage) continue;
+      const offset = y * stride + 1 + x * 4;
+      for (let channel = 0; channel < 3; channel++) {
+        raw[offset + channel] = Math.round(rgb[channel] / coverage);
+      }
+      raw[offset + 3] = Math.round(255 * coverage / samples);
+    }
+  }
+  return raw;
+}
+
+function encodePng(size, raw) {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(size, 0);
@@ -129,7 +174,7 @@ function generateIconPng(size, anime = false) {
 }
 
 for (const size of [16, 48, 128]) {
-  writeFileSync(resolve(iconsDir, `icon${size}.png`), generateIconPng(size));
-  writeFileSync(resolve(animeIconsDir, `icon${size}.png`), generateIconPng(size, true));
+  writeFileSync(resolve(iconsDir, `icon${size}.png`), encodePng(size, drawArcIcon(size)));
+  writeFileSync(resolve(animeIconsDir, `icon${size}.png`), encodePng(size, drawAnimeIcon(size)));
 }
 console.log('Generated Arc and Anime Study icons.');
