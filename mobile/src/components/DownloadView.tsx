@@ -20,6 +20,8 @@ type Props = {
   serverUrl: string;
   /** Called when the Mac finishes more episodes, so the library shows them. */
   onMacProgress: () => void;
+  /** A page to open, e.g. a series picked in the Learn tab's Beginner list (`at` makes repeats count). */
+  openUrl?: { url: string; at: number };
 };
 
 const stateLabel: Record<MacDownload['state'], string> = {
@@ -34,9 +36,17 @@ const stateLabel: Record<MacDownload['state'], string> = {
  * Browse Anime365 and send a series to the Mac. Chrome there downloads it into the library;
  * its episodes then appear under Mac Server, with Download buttons.
  */
-export function DownloadView({ serverUrl, onMacProgress }: Props) {
+export function DownloadView({ serverUrl, onMacProgress, openUrl }: Props) {
   const web = useRef<WebViewHandle>(null);
-  const [address, setAddress] = useState(HOME);
+  // The first page is the requested one when the tab opens for it; later requests navigate the open page.
+  const [firstPage] = useState(() => openUrl?.url ?? HOME);
+  const [address, setAddress] = useState(firstPage);
+  const openedRequest = useRef(openUrl?.at);
+  useEffect(() => {
+    if (!openUrl || openUrl.at === openedRequest.current) return;
+    openedRequest.current = openUrl.at;
+    web.current?.injectJavaScript(`location.href=${JSON.stringify(openUrl.url)};true;`);
+  }, [openUrl]);
   const [pageTitle, setPageTitle] = useState('');
   const [canGoBack, setCanGoBack] = useState(false);
   const [requests, setRequests] = useState<MacDownload[]>([]);
@@ -104,7 +114,7 @@ export function DownloadView({ serverUrl, onMacProgress }: Props) {
       <View style={styles.body}>
         <WebView
           ref={web}
-          source={{ uri: HOME }}
+          source={{ uri: firstPage }}
           style={styles.web}
           allowsBackForwardNavigationGestures
           onNavigationStateChange={nav => { setAddress(nav.url); setPageTitle(nav.title ?? ''); setCanGoBack(nav.canGoBack); }}

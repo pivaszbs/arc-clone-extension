@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { build } from 'esbuild';
 
 const compiled = await build({ entryPoints: ['src/japanese/study.ts'], bundle: true, write: false, format: 'esm', platform: 'node' });
-const { parseSubtitles, schedule, supportedSite, sourceUrl } = await import('data:text/javascript;base64,' + Buffer.from(compiled.outputFiles[0].text).toString('base64'));
+const { parseSubtitles, schedule, supportedSite, sourceUrl, spokenText } = await import('data:text/javascript;base64,' + Buffer.from(compiled.outputFiles[0].text).toString('base64'));
 
 test('loads multiline SRT and VTT timing without treating markup as HTML', () => {
   assert.deepEqual(parseSubtitles('\uFEFF1\r\n00:00:01,250 --> 00:00:03,500\r\n<b>それは</b>\r\n何ですか。\r\n\r\n2\r\n00:00:05,000 --> 00:00:04,000\r\ninvalid'), [{ start: 1.25, end: 3.5, text: 'それは\n何ですか。' }]);
@@ -23,4 +23,11 @@ test('site matching and source links reject misleading domains and script URLs',
   assert.equal(supportedSite('youtube.com.evil.test'), false);
   assert.equal(sourceUrl('javascript:alert(1)', 5), '');
   assert.equal(sourceUrl('https://www.youtube.com/watch?v=abc&t=3', 12.9), 'https://www.youtube.com/watch?v=abc&t=12');
+});
+
+test('drops a leading speaker label and direction marks before studying a line', () => {
+  assert.equal(spokenText('\u200e（こうさぎ）わあ！'), 'わあ！');
+  assert.equal(spokenText('【パン】 おいしい'), 'おいしい');
+  assert.equal(spokenText('（笑）'), '（笑）');
+  assert.equal(spokenText('今日は（たぶん）晴れ'), '今日は（たぶん）晴れ');
 });

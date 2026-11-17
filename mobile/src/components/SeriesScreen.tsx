@@ -28,6 +28,10 @@ type Props = {
   fromMac: boolean;
   /** Shown above the episodes, e.g. the TV remote while the TV plays this series. */
   extra?: React.ReactNode;
+  /** The series before and after this one in the gallery; a horizontal swipe switches to them. */
+  previous?: Series;
+  following?: Series;
+  onSwitch?: (series: Series) => void;
 };
 
 const device = Platform.OS === 'ios' && Platform.isPad ? 'iPad' : 'iPhone';
@@ -78,9 +82,9 @@ function DownloadIcon({ series, episode, fromMac }: { series: Series; episode: E
  * One series, like the TV app: cover, a Continue button and the episodes as a grid. Landscape on a
  * wide screen keeps the cover and buttons in a fixed column beside the episodes.
  * Swipe an episode right to mark it watched, left to download or remove it; swipe in from the left
- * edge to go back.
+ * edge to go back. Swipe anywhere else (or two fingers on a Mac trackpad) to the next or previous series.
  */
-export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, onBack, onPlay, onToggleWatched, fromMac, extra }: Props) {
+export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, onBack, onPlay, onToggleWatched, fromMac, extra, previous, following, onSwitch }: Props) {
   const { height } = useWindowDimensions();
   const downloads = useEpisodeDownloads();
   const next = continueEpisode(series, progress);
@@ -121,9 +125,41 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
       }
     },
   });
+  // Swipe left for the next series, right for the previous one. Episode cards keep their own swipes
+  // (they activate sooner), and a mostly vertical drag stays a scroll.
+  const [flipX] = useState(() => new Animated.Value(0));
+  const flip = usePanGesture({
+    runOnJS: true,
+    enabled: !!onSwitch,
+    activeOffsetX: [-24, 24],
+    failOffsetY: [-16, 16],
+    enableTrackpadTwoFingerGesture: true,
+    onUpdate: event => {
+      const target = event.translationX < 0 ? following : previous;
+      // Rubber band when there is no series that way.
+      flipX.setValue(target ? event.translationX : event.translationX * 0.2);
+    },
+    onDeactivate: event => {
+      const direction = event.translationX < 0 ? 1 : -1;
+      const target = direction === 1 ? following : previous;
+      const far = Math.abs(event.translationX) > width * 0.25;
+      const flick = Math.abs(event.velocityX) > 700 && Math.abs(event.translationX) > 40;
+      if (!target || !onSwitch || !(far || flick)) {
+        Animated.spring(flipX, { toValue: 0, velocity: event.velocityX / 1000, bounciness: 4, useNativeDriver: true }).start();
+        return;
+      }
+      haptics.select();
+      Animated.timing(flipX, { toValue: -direction * width, duration: 160, useNativeDriver: true }).start(() => {
+        onSwitch(target);
+        // The new series slides in from the side the finger came from.
+        flipX.setValue(direction * width * 0.6);
+        Animated.spring(flipX, { toValue: 0, bounciness: 2, speed: 16, useNativeDriver: true }).start();
+      });
+    },
+  });
   const screenStyle = {
     opacity: dragX.interpolate({ inputRange: [0, width], outputRange: [1, 0.6], extrapolate: 'clamp' }),
-    transform: [{ translateX: dragX }],
+    transform: [{ translateX: Animated.add(dragX, flipX) }],
   };
 
   const playLabel = nextSaved && !nextSaved.finished && nextSaved.position >= 1
@@ -260,6 +296,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
 
   return (
     <GestureDetector gesture={edge}>
+      <GestureDetector gesture={flip}>
       <Animated.View style={[styles.root, screenStyle]}>
         {twoPane ? (
           <View style={styles.split}>
@@ -272,6 +309,7 @@ export function SeriesScreen({ series, progress, width, autoSkip, onAutoSkip, on
           </View>
         ) : grid}
       </Animated.View>
+      </GestureDetector>
     </GestureDetector>
   );
 }

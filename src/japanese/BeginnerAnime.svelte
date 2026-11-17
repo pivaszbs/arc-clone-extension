@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { requestArc } from './client';
-  import list from './beginner-anime.json';
+  import list from '../../shared/study/beginner-anime.json';
   import { describePace, levelOf, type BeginnerSeries } from './beginner-anime';
   import { isKnown, type WordCard } from './word-cards';
 

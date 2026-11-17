@@ -8,7 +8,8 @@ import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-
 import { DownloadView } from './src/components/DownloadView';
 import { PipelinesView, type ImportPipelineState, type LocalScanState } from './src/components/PipelinesView';
 import { Player } from './src/components/Player';
-import { SeriesGallery } from './src/components/SeriesGallery';
+import { LearnTab } from './src/components/LearnTab';
+import { SeriesGallery, seriesGroups } from './src/components/SeriesGallery';
 import { SeriesScreen } from './src/components/SeriesScreen';
 import { ZoomFrom, type Rect, type ZoomHandle } from './src/components/ZoomFrom';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
@@ -38,7 +39,7 @@ import { colors, radius, space, type } from './src/theme';
 // Write the cause of any crash to Documents/.anime-study/errors.log.
 installCrashLog();
 
-type AppMode = 'watch' | 'download' | 'pipelines';
+type AppMode = 'watch' | 'learn' | 'download' | 'pipelines';
 type LibrarySource = 'server' | 'local';
 
 export default function App() {
@@ -58,7 +59,7 @@ function Study() {
   const initialServerUrl = normalizeTvServerUrl(savedSettings().tvServerUrl || DEFAULT_TV_SERVER_URL);
   const [mode, setModeState] = useState<AppMode>(() => {
     const saved = savedSettings().tab;
-    return saved === 'download' || saved === 'pipelines' ? saved : 'watch';
+    return saved === 'download' || saved === 'pipelines' || saved === 'learn' ? saved : 'watch';
   });
   // Reopen on the tab you left.
   const setMode = useCallback((next: AppMode) => { setModeState(next); saveSettings({ tab: next }); }, []);
@@ -66,6 +67,8 @@ function Study() {
   const [source, setSourceState] = useState<LibrarySource>(() => (savedSettings().source === 'local' ? 'local' : 'server'));
   const setSource = useCallback((next: LibrarySource) => { setSourceState(next); saveSettings({ source: next }); }, []);
   const [serverUrl, setServerUrl] = useState(initialServerUrl);
+  /** A page the Learn tab asked the Download tab to open (the Beginner list). */
+  const [siteRequest, setSiteRequest] = useState<{ url: string; at: number } | undefined>(undefined);
   const [serverDraft, setServerDraft] = useState(initialServerUrl);
   const [wsState, setWsState] = useState<TvWsState>('disconnected');
   const [httpStatus, setHttpStatus] = useState<TvHttpStatus>({ state: 'idle' });
@@ -334,6 +337,9 @@ function Study() {
 
   // Like the TV app: a wall of covers, then one series, then the episode on the whole screen.
   const series = library.find(item => item.folder === folder);
+  // The gallery's order (seasons kept together), for swiping from one series to the next.
+  const seriesOrder = useMemo(() => seriesGroups(library).flatMap(group => group.entries), [library]);
+  const seriesIndex = series ? seriesOrder.findIndex(item => item.folder === series.folder) : -1;
   const listedEpisode = series?.episodes.find(item => item.key === episodeKey);
   // A downloaded episode plays from this device even while browsing the Mac's library.
   // Keyed by identity, not object: a catalog refresh mustn't hand the player a "new" episode and restart it.
@@ -491,7 +497,7 @@ function Study() {
 
   const online = wsState === 'connected' || httpStatus.state === 'ok';
   const connecting = !online && (wsState === 'connecting' || httpStatus.state === 'checking');
-  const screenTitle = mode === 'pipelines' ? 'Server' : mode === 'download' ? 'Download' : 'Library';
+  const screenTitle = mode === 'pipelines' ? 'Server' : mode === 'download' ? 'Download' : mode === 'learn' ? 'Learn' : 'Library';
 
   const header = (
     <View style={[styles.header, tvControlling && styles.headerCompact]}>
@@ -562,6 +568,11 @@ function Study() {
         episode={episode}
         neighbours={neighbours}
         fullscreen
+        keyboard={fullscreen && mode === 'watch'}
+        learn={!!settings.learn}
+        onToggleLearn={() => updateSettings({ learn: !settings.learn })}
+        wordsInPlay={settings.wordsInPlay}
+        reading={settings.reading}
         autoPlay
         autoSkip={settings.autoSkip}
         subtitlesOn={settings.subtitles}
@@ -691,11 +702,15 @@ function Study() {
       onPlay={selectEpisode}
       onToggleWatched={ep => toggleEpisodeWatched(ep, series)}
       fromMac={source === 'server'}
+      previous={seriesIndex > 0 ? seriesOrder[seriesIndex - 1] : undefined}
+      following={seriesIndex >= 0 ? seriesOrder[seriesIndex + 1] : undefined}
+      onSwitch={item => { setSeriesOrigin(null); setFolder(item.folder); setEpisodeKey(null); }}
     />
   );
 
   const tabs: Tab<AppMode>[] = [
     { key: 'watch', title: 'Library', icon: 'play.rectangle.on.rectangle' },
+    { key: 'learn', title: 'Learn', icon: 'graduationcap' },
     { key: 'download', title: 'Download', icon: 'arrow.down.circle' },
     { key: 'pipelines', title: 'Server', icon: 'server.rack', badge: !online && !connecting },
   ];
@@ -754,7 +769,17 @@ function Study() {
         {downloadOpened && (
           <View style={mode === 'download' ? styles.tabScreen : styles.hidden}>
             {header}
-            <DownloadView serverUrl={serverUrl} onMacProgress={reloadRemote} />
+            <DownloadView serverUrl={serverUrl} onMacProgress={reloadRemote} openUrl={siteRequest} />
+          </View>
+        )}
+        {mode === 'learn' && (
+          <View style={styles.tabScreen}>
+            {header}
+            <LearnTab
+              settings={settings}
+              onSettings={updateSettings}
+              onOpenSite={url => { setSiteRequest({ url, at: Date.now() }); setMode('download'); }}
+            />
           </View>
         )}
         {mode === 'pipelines' && (

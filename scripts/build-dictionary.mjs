@@ -42,6 +42,6 @@ for (const word of source.words) {
   lines.push([spelled.join('|'), reading, pos.join(',') + (usuallyKana ? ',uk' : ''), glosses.join('; ')].join('\t'));
 }
 
-const output = new URL('../src/japanese/dictionary-data.json', import.meta.url);
+const output = new URL('../shared/study/dictionary-data.json', import.meta.url);
 await writeFile(output, JSON.stringify({ version: source.version, date: source.dictDate, entries: lines.join('\n') }));
 console.log(`${lines.length} entries, ${(JSON.stringify(lines.join('\n')).length / 1e6).toFixed(2)} MB`);

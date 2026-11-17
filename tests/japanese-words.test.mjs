@@ -9,7 +9,7 @@ const load = async (entry) => {
 };
 const { loadDictionary, tokenize, romaji, tokenRomaji, segmentRomaji, spell, analyseEpisode, episodeTargets, coverage, wordStop, wordChoices, wordId, scheduleWord, applyWordMessage, createStudyStore, WORDS_KEY } =
   await load("export * from './dictionary'; export * from './episode-words'; export * from './word-cards'; export * from './storage';");
-loadDictionary(JSON.parse(readFileSync('src/japanese/dictionary-data.json', 'utf8')).entries);
+loadDictionary(JSON.parse(readFileSync('shared/study/dictionary-data.json', 'utf8')).entries);
 
 const bases = (text) => tokenize(text).filter((token) => token.entry).map((token) => token.base);
 const cue = (text, start = 0) => ({ start, end: start + 2, text });
@@ -142,7 +142,7 @@ test('beginner list levels and pace labels', async () => {
 });
 
 test('bundled beginner list is ordered, linked and keyed by word ids', () => {
-  const list = JSON.parse(readFileSync('src/japanese/beginner-anime.json', 'utf8'));
+  const list = JSON.parse(readFileSync('shared/study/beginner-anime.json', 'utf8'));
   assert.ok(list.series.length >= 10 && list.series.length <= list.ranked);
   for (const [index, item] of list.series.entries()) {
     assert.match(item.url, /^https:\/\/smotret-anime\.com\/catalog\/[\w-]+-\d+$/);

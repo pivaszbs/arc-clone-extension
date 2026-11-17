@@ -12,6 +12,19 @@ Needs Xcode (not just Command Line Tools), because this is a dev build rather th
     npm run typecheck
     npx expo run:ios       # iPhone simulator
     npm run ios:ipad       # iPad simulator
+    npm run mac            # this Mac, as an iPad app (Apple Silicon); --open reopens the last build
+
+On a hardware keyboard (iPad or Mac) the player takes Space (play/pause), ←/→ (5 s) and Esc (close).
+On the series screen, swipe left or right (two fingers on a Mac trackpad) for the next or previous series.
+
+## Learn
+The extension's word learning, with the same logic (`../shared/study`: dictionary, word picking and scheduling)
+and the same rules. Turn it on with the graduation cap in the player or in the Learn tab. After a line with a word
+in play the episode pauses: a new word is taught (with its line, reading and meaning), a word you have met is asked
+with four meanings to choose from. Tap any word in the paused line for its meaning. The Learn tab reviews words that
+are due, sets how many words are in play and whether readings show in romaji or kana, and lists the Beginner anime
+ranking; picking a series opens it in the Download tab. Words are stored on this device (`Documents/.anime-study/words.json`)
+and are not yet synced with the extension or other devices. Phrase cards and translation are not ported.
 
 ## Episodes
 Copy a downloads folder ("Смотреть аниме <title> онлайн - <id> - <team>") into Files › On My iPhone › Anime Study,

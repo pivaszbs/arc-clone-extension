@@ -28,7 +28,7 @@ export async function installPreviewChrome() {
           for (const listener of messages.listeners.slice(1)) listener(message, {}, () => {});
           return {};
         }
-        if (message.type === 'JAPANESE_DICTIONARY') return { entries: (await import('../japanese/dictionary-data.json')).default.entries };
+        if (message.type === 'JAPANESE_DICTIONARY') return { entries: (await import('../../shared/study/dictionary-data.json')).default.entries };
         if (typeof message.type === 'string' && message.type.startsWith('JAPANESE_')) return (study ??= (await import('../japanese/storage')).createStudyStore(api.storage.local))(message);
         if (message.type === 'TRANSLATE_TEXT') return { translatedText: 'This is a sample translation for the local preview.', detectedSourceLang: 'en' };
         if (message.type === 'SEARCH_OMNIBOX' && message.query === 'offline') throw new Error('Preview connection failure');

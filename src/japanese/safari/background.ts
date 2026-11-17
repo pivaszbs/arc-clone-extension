@@ -1,7 +1,7 @@
 import { createStudyStore } from '../storage';
 import { subtitleUrl } from '../captions';
 import { safariApi } from './api';
-import dictionary from '../dictionary-data.json';
+import dictionary from '../../../shared/study/dictionary-data.json';
 const api = safariApi();
 const store = createStudyStore(api.storage.local);
 api.runtime.onMessage.addListener((message, _sender, sendResponse) => {

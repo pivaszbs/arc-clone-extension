@@ -36,6 +36,7 @@ function app(tab = 'watch', source = 'server') {
     './src/theme': { colors: {}, radius: {}, space: {}, type: {} },
     './src/lib/storage': { settings: () => ({ source, tab }), cachedCatalog: () => catalog, allProgress: () => ({}), saveSettings: noop },
     './src/lib/crash-log': { installCrashLog: noop },
+    './src/components/SeriesGallery': { SeriesGallery: 'SeriesGallery', seriesGroups: list => list.map(item => ({ entries: [item] })) },
     './src/lib/library': { readLibrary: () => catalog },
     './src/lib/episode-downloads': { episodeDownloads: {} },
     './src/lib/worker-node': { PhoneWorkerNode: class {} },

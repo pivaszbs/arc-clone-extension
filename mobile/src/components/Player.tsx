@@ -6,6 +6,7 @@ import { ActivityIndicator, Animated as RNAnimated, Pressable, StyleSheet, Text,
 import { GestureDetector, usePanGesture } from 'react-native-gesture-handler';
 import type { TimeRange } from 'react-native-anime-core';
 
+import { useHardwareKeys } from '../../modules/key-commands/src';
 import { clock, cueAt } from '../lib/format';
 import { haptics } from '../lib/haptics';
 import type { Episode } from '../lib/library';
@@ -13,6 +14,7 @@ import { progressFor, saveProgress } from '../lib/storage';
 import { skipLabels, useEpisodeStudy, type SkipPart } from '../lib/useEpisodeStudy';
 import { colors, radius, space } from '../theme';
 import { Glass, GlassPill, IconButton } from './Glass';
+import { LearnCard, learnSummary, useLearn } from './Learn';
 
 type Props = {
   episode: Episode;
@@ -31,6 +33,13 @@ type Props = {
   onProgress?: () => void;
   /** PiP started or stopped; `stillPlaying` tells a restore (playing) from closing the window (paused). */
   onPictureInPictureChange?: (active: boolean, stillPlaying: boolean) => void;
+  /** Hardware keyboard (iPad keyboard, Mac): Space plays/pauses, ←/→ seek 5 s, Esc closes. Only while the player is on screen. */
+  keyboard?: boolean;
+  /** Learn: stop on lines with words in play (see Learn.tsx). */
+  learn?: boolean;
+  onToggleLearn?: () => void;
+  wordsInPlay?: number;
+  reading?: 'romaji' | 'kana';
 };
 
 const pipSupported = (() => { try { return isPictureInPictureSupported(); } catch { return false; } })();
@@ -50,6 +59,7 @@ function safe<T>(action: () => T, fallback: T): T {
   try { return action(); } catch { return fallback; }
 }
 const SKIP_SECONDS = 10;
+const KEY_SEEK_SECONDS = 5;
 const HIDE_AFTER_MS = 3000;
 const FADE_OUT_MS = 180;
 const SLOW_LOAD_MS = 4000;
@@ -306,6 +316,33 @@ export function Player(props: Props) {
     safe(() => player.play(), undefined);
   }, [player, props]);
 
+  // ----- Learn -----
+
+  const learnControls = useMemo(() => ({
+    pause: () => safe(() => player.pause(), undefined),
+    play: () => safe(() => player.play(), undefined),
+    seekTo,
+  }), [player, seekTo]);
+  const learn = useLearn({
+    enabled: !!props.learn && study.japanese, cues: study.cues, time, playing, title: episode.label,
+    wordsInPlay: props.wordsInPlay ?? 5, controls: learnControls,
+  });
+
+  // Same keys as the extension's study player.
+  useHardwareKeys(key => {
+    if (key === 'escape') { props.onToggleFullscreen(false); return; }
+    if (learn.stop) {
+      // Space carries on once the word has been taught or answered.
+      if (key === 'space' && (learn.stop.action === 'teach' || learn.stop.result)) learn.resume();
+      return;
+    }
+    if (!ready) return;
+    if (key === 'space') {
+      if (!started) { safe(() => player.play(), undefined); return; }
+      togglePlay();
+    } else seekBy(key === 'left' ? -KEY_SEEK_SECONDS : KEY_SEEK_SECONDS, key);
+  }, !!props.keyboard);
+
   // ----- Opening / ending / recap -----
 
   const activeSkip = useMemo(() => {
@@ -439,7 +476,10 @@ export function Player(props: Props) {
         </View>
       )}
 
-      {cue && (
+      {learn.stop && <LearnCard key={`${learn.stop.cue.start}:${learn.stop.index}`} learn={learn} reading={props.reading ?? 'romaji'} wide={width >= 800}
+        bottom={controls ? (fullscreen ? 118 : 96) : 28} />}
+
+      {cue && !learn.stop && (
         <View pointerEvents="none" style={[styles.subtitleWrap, { bottom: controls ? (fullscreen ? 118 : 96) : 28 }]}>
           <Text style={[styles.subtitle, fullscreen && styles.subtitleLarge]}>{cue.text}</Text>
         </View>
@@ -513,6 +553,14 @@ export function Player(props: Props) {
                   name="pip.enter"
                   label="Picture in Picture"
                   onPress={() => { haptics.select(); void videoView.current?.startPictureInPicture().catch(() => {}); poke(); }}
+                />
+              )}
+              {props.onToggleLearn && study.japanese && (
+                <IconButton
+                  name={props.learn ? 'graduationcap.fill' : 'graduationcap'}
+                  label={props.learn ? `Stop learning words. ${learnSummary(learn)}` : 'Learn words while watching'}
+                  tint={props.learn ? colors.accent : colors.text}
+                  onPress={() => { haptics.select(); props.onToggleLearn?.(); poke(); }}
                 />
               )}
               <IconButton

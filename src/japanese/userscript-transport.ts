@@ -1,7 +1,7 @@
 import { schedule, type Card } from './study';
 import { QUIZ_KEY, cleanQuizSettings, defaultQuizSettings, type QuizSettings } from './quiz';
 import { WORDS_KEY, applyWordMessage, type WordCard } from './word-cards';
-import dictionary from './dictionary-data.json';
+import dictionary from '../../shared/study/dictionary-data.json';
 import { subtitleUrl } from './captions';
 
 export type UserscriptApi = {

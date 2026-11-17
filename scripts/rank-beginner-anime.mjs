@@ -16,7 +16,7 @@ const compiled = await build({
   bundle: true, write: false, format: 'esm', platform: 'node'
 });
 const lib = await import('data:text/javascript;base64,' + Buffer.from(compiled.outputFiles[0].text).toString('base64'));
-lib.loadDictionary(JSON.parse(await readFile('src/japanese/dictionary-data.json', 'utf8')).entries);
+lib.loadDictionary(JSON.parse(await readFile('shared/study/dictionary-data.json', 'utf8')).entries);
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function json(path) {
@@ -175,5 +175,5 @@ for (const item of scored) item.difficulty = Math.round(100 * ranks.reduce((sum,
 scored.sort((a, b) => a.difficulty - b.difficulty);
 
 const output = scored.slice(0, LIST_SIZE).map(({ coreShare, unknownShare, ...item }) => ({ ...item, coreShare: Math.round(coreShare * 100), unknownShare: Math.round(unknownShare * 100) }));
-await writeFile('src/japanese/beginner-anime.json', JSON.stringify({ generated: new Date().toISOString().slice(0, 10), sampleEpisodes: EPISODES, ranked: scored.length, series: output }, null, 1) + '\n');
+await writeFile('shared/study/beginner-anime.json', JSON.stringify({ generated: new Date().toISOString().slice(0, 10), sampleEpisodes: EPISODES, ranked: scored.length, series: output }, null, 1) + '\n');
 console.table(scored.map(({ title, difficulty, wordsPerMinute, wordsFor90, coreShare, unknownShare, japaneseEpisodes }) => ({ title, difficulty, wordsPerMinute, wordsFor90, coreShare, unknownShare, japaneseEpisodes })));
