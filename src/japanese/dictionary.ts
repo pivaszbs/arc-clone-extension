@@ -1,7 +1,9 @@
 // Word lookup for the study player: longest-match segmentation over a pruned JMdict table,
 // with enough de-inflection to bring 食べました back to 食べる.
 
-export type Entry = { written: string[]; reading: string; pos: string[]; gloss: string; usuallyKana: boolean };
+export type Entry = { written: string[]; reading: string; pos: string[]; gloss: string; usuallyKana: boolean; splits?: Record<string, string> };
+/** Part of a written word; `reading` is set when the part contains kanji. */
+export type Segment = { text: string; reading?: string };
 export type Token = {
   surface: string;
   entry?: Entry;
@@ -11,6 +13,8 @@ export type Token = {
   reading?: string;
   /** False for short kana matches that may be a different word. */
   confident?: boolean;
+  /** The surface split into kana and kanji groups, each kanji group with its own reading. */
+  segments?: Segment[];
 };
 
 const V1 = 1, V5 = 2, ADJ = 4, VK = 8, VS = 16, TE = 32, TERM = 64, ANY = 127;
@@ -101,7 +105,12 @@ export function loadDictionary(entries: string) {
     if (!reading || !gloss) continue;
     const tags = pos.split(',');
     const usuallyKana = tags.includes('uk');
-    const entry: Entry = { written: written ? written.split('|') : [], reading, pos: tags.filter((tag) => tag !== 'uk'), gloss, usuallyKana };
+    const forms = written ? written.split('|') : [];
+    const entry: Entry = { written: forms.map((form) => form.split('~')[0]), reading, pos: tags.filter((tag) => tag !== 'uk'), gloss, usuallyKana };
+    for (const form of forms) {
+      const [text, split] = form.split('~');
+      if (split) (entry.splits ??= {})[text] = split;
+    }
     for (const key of [...entry.written, reading]) {
       const list = index.get(key);
       if (list) list.push(entry);
@@ -198,7 +207,8 @@ function lookUp(surface: string): Token | undefined {
   // One stray kana is only ever a particle or an interjection.
   if (kana && surface.length === 1 && (inflected || !(isFunctionWord(entry) || entry.pos[0] === 'int'))) return;
   const confident = !kana || surface.length > 2 || entry.usuallyKana || !entry.written.length;
-  return { surface, entry, base, reading: surfaceReading(surface, base, entry), confident };
+  const reading = surfaceReading(surface, base, entry);
+  return { surface, entry, base, reading, confident, segments: segmentsOf(surface, reading, base, entry) };
 }
 
 /** Splits a subtitle line into dictionary words; text with no match is returned as plain tokens. */
@@ -275,6 +285,74 @@ export function romaji(kana: string): string {
 }
 
 /** Reading shown under a token: particles は / へ are pronounced wa / e. */
+const hasKanji = (text: string) => /[\u3400-\u9fff々]/u.test(text);
+
+/** A dictionary form split into kanji groups and kana, e.g. 食べる → 食(た) べる. */
+function baseSegments(written: string, entry: Entry): Segment[] {
+  const split = entry.splits?.[written];
+  if (split) {
+    const chars = [...written];
+    let position = 0;
+    return split.split(',').map((part) => {
+      const [count, reading] = part.split(':');
+      const text = chars.slice(position, position += Number(count)).join('');
+      return reading ? { text, reading } : { text };
+    });
+  }
+  if (!hasKanji(written)) return [{ text: written }];
+  // No recorded split: kana at either end matches the reading, the kanji in between share the rest.
+  const lead = written.match(/^[\u3040-\u30ff]*/u)![0];
+  const tail = written.match(/[\u3040-\u30ff]*$/u)![0];
+  const core = written.slice(lead.length, written.length - tail.length);
+  if (!entry.reading.startsWith(lead) || !entry.reading.endsWith(tail) || entry.reading.length <= lead.length + tail.length) return [{ text: written, reading: entry.reading }];
+  return [...(lead ? [{ text: lead }] : []), { text: core, reading: entry.reading.slice(lead.length, entry.reading.length - tail.length) }, ...(tail ? [{ text: tail }] : [])];
+}
+
+/** Splits a word as it appears in a line; conjugated endings are kana and follow the stem's kanji. */
+export function segmentsOf(surface: string, reading: string, base: string, entry: Entry): Segment[] {
+  if (!hasKanji(surface)) return [{ text: surface }];
+  const parts = baseSegments(entry.written.includes(base) ? base : surface, entry);
+  const kept: Segment[] = [];
+  let used = 0;
+  for (const part of parts) {
+    if (!surface.startsWith(part.text, used)) break;
+    // A kana part of the dictionary form may be the start of a conjugated ending: let the ending take it.
+    if (!part.reading && !hasKanji(surface.slice(used + part.text.length))) break;
+    kept.push(part);
+    used += part.text.length;
+  }
+  const rest = surface.slice(used);
+  if (hasKanji(rest)) return [{ text: surface, reading }];
+  const segments = [...kept, ...(rest ? [{ text: rest }] : [])];
+  // Check the readings add up; when a conjugation changes the stem's sound (来る → 来ない), give the kanji what is left.
+  const spelled = segments.map((part) => part.reading ?? part.text).join('');
+  if (spelled !== reading) {
+    const kanji = segments.filter((part) => part.reading);
+    const kana = segments.filter((part) => !part.reading).map((part) => part.text).join('');
+    if (kanji.length !== 1 || !reading.endsWith(kana) || segments.at(-1)!.reading) return [{ text: surface, reading }];
+    kanji[0].reading = reading.slice(0, reading.length - kana.length);
+  }
+  return segments;
+}
+
+/** Segments for a saved word (dictionary form and reading), using the bundled splits when loaded. */
+export function spell(word: string, reading: string): Segment[] {
+  const entry = index.get(word)?.find((item) => item.reading === reading);
+  if (entry) return segmentsOf(word, reading, word, entry);
+  return hasKanji(word) ? [{ text: word, reading }] : [{ text: word }];
+}
+
+/** Romaji for each segment; a small っ ending one part takes the next part's first consonant: 学校 → gak · kou. */
+export function segmentRomaji(segments: Segment[], particle = false): string[] {
+  if (particle && segments.length === 1 && (segments[0].text === 'は' || segments[0].text === 'へ')) return [segments[0].text === 'は' ? 'wa' : 'e'];
+  const kana = segments.map((part) => part.reading ?? part.text);
+  const plain = kana.map((text) => romaji(text.replace(/[っッ]$/u, '')));
+  return plain.map((text, index) => {
+    const next = plain[index + 1];
+    return /[っッ]$/u.test(kana[index]) && next ? text + (next.startsWith('ch') ? 't' : next[0]) : text;
+  });
+}
+
 export function tokenRomaji(token: Token) {
   if (!token.reading) return '';
   if (token.entry?.pos[0] === 'prt' && token.surface === 'は') return 'wa';

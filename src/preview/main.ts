@@ -18,6 +18,10 @@ if (surface === 'japanese') {
   const { default: JapaneseStudy } = await import('../japanese/JapaneseStudy.svelte');
   const host = document.createElement('div'); document.body.appendChild(host);
   mount(JapaneseStudy, { target: host });
+} else if (surface === 'beginner') {
+  target.style.cssText = '--line:#2f2d2d;--muted:#b6b1ae;--accent:#ff8248;padding:16px;background:#0e0e10;color:#f7f6f3;font:15px/1.5 system-ui,sans-serif;min-height:100vh';
+  const { default: BeginnerAnime } = await import('../japanese/BeginnerAnime.svelte');
+  mount(BeginnerAnime, { target, props: { onDownload: (url: string) => alert(`Download ${url}`) } });
 } else if (surface === 'newtab') {
   const { default: NewTab } = await import('../newtab/NewTab.svelte');
   mount(NewTab, { target });

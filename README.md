@@ -91,7 +91,15 @@ Japanese subtitle discovery runs automatically. It reads native player tracks, i
 
 The same flow runs on YouTube videos with Japanese captions. Word picking needs timed captions; with visible-only YouTube captions, Learn teaches words as they come up instead of by frequency. Names and words outside the dictionary are left as plain text. Splitting is dictionary-based and can mis-split unusual kana runs. Word progress is stored locally beside the saved phrases. The Samsung TV app does not have the word flow yet.
 
-Word data comes from [JMdict](https://www.edrdg.org/jmdict/j_jmdict.html) (Electronic Dictionary Research and Development Group, CC BY-SA 4.0) through [jmdict-simplified](https://github.com/scriptin/jmdict-simplified). `src/japanese/dictionary-data.json` holds the 22,661 common entries; regenerate it with `node scripts/build-dictionary.mjs path/to/jmdict-eng-common-*.json`.
+Words are shown split into kanji groups, each with its own reading underneath (泥 doro · 棒 bou, 食 ta · べる beru). The splits come from [JmdictFurigana](https://github.com/Doublevil/JmdictFurigana) (CC BY-SA 4.0); words without one show a single reading under the kanji.
+
+Word data comes from [JMdict](https://www.edrdg.org/jmdict/j_jmdict.html) (Electronic Dictionary Research and Development Group, CC BY-SA 4.0) through [jmdict-simplified](https://github.com/scriptin/jmdict-simplified). `src/japanese/dictionary-data.json` holds the 22,661 common entries; regenerate it with `node scripts/build-dictionary.mjs path/to/jmdict-eng-common-*.json path/to/JmdictFurigana.json`.
+
+### Beginner anime
+
+The **Beginner anime** tab in the offline library lists the 40 easiest series on smotret-anime that have Japanese subtitles, easiest first. `scripts/rank-beginner-anime.mjs` measures every series with Japanese subtitles on six or more episodes, using the subtitles of its first three episodes: words a minute while someone is talking, how many different words cover 90% of the dialogue, the share of everyday anime vocabulary, and how much text the dictionary cannot read. Openings and endings are left out. Chinese shows with Japanese subtitles and adult genres are excluded. Each entry shows how many of its 50 most frequent words you already know, links to episode 1 with Japanese subtitles, and **Download series** opens the series check in Downloads. Re-rank with `node scripts/rank-beginner-anime.mjs [cache-directory]`; it downloads about 800 subtitle files, one at a time.
+
+### Pausing on other lines
 
 Enable **Pause for listening quizzes** to pause after eligible Japanese lines and choose the translation from four options. Phrases already in your review history are tested when due. Other lines are eligible when the browser's Japanese word segmentation estimates zero to two unfamiliar words; words from successful quiz answers form the vocabulary estimate. Initially, short lines help build that history. This estimate does not perform dictionary lemmatization or measure mastery of every word in a sentence.
 
