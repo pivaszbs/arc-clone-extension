@@ -114,18 +114,19 @@ const book = [[20, 29], [36, 27], [50, 33], [64, 27], [80, 29],
 const play = [[43, 39], [43, 61], [62, 50]];
 const supersampling = 4;
 
-function animeColor(x, y) {
+function animeColor(x, y, fullBleed) {
   const left = Math.max(25 - x, 0, x - 75);
   const top = Math.max(25 - y, 0, y - 75);
-  if (Math.hypot(left, top) > 22) return null;
+  if (!fullBleed && Math.hypot(left, top) > 22) return null;
   if (insidePolygon(x, y, play)) return [173, 43, 75];
   if (insidePolygon(x, y, book)) return [255, 246, 227];
   const shade = (x + y) / 200;
   return [218 - 93 * shade, 61 - 35 * shade, 94 - 37 * shade];
 }
 
-function drawAnimeIcon(size) {
-  const stride = size * 4 + 1;
+function drawAnimeIcon(size, fullBleed = false) {
+  const channels = fullBleed ? 3 : 4;
+  const stride = size * channels + 1;
   const raw = Buffer.alloc(size * stride);
   const samples = supersampling ** 2;
   for (let y = 0; y < size; y++) {
@@ -135,29 +136,29 @@ function drawAnimeIcon(size) {
       for (let sample = 0; sample < samples; sample++) {
         const sx = x + (sample % supersampling + 0.5) / supersampling;
         const sy = y + (Math.floor(sample / supersampling) + 0.5) / supersampling;
-        const color = animeColor(sx * 100 / size, sy * 100 / size);
+        const color = animeColor(sx * 100 / size, sy * 100 / size, fullBleed);
         if (!color) continue;
         coverage++;
         for (let channel = 0; channel < 3; channel++) rgb[channel] += color[channel];
       }
       if (!coverage) continue;
-      const offset = y * stride + 1 + x * 4;
+      const offset = y * stride + 1 + x * channels;
       for (let channel = 0; channel < 3; channel++) {
         raw[offset + channel] = Math.round(rgb[channel] / coverage);
       }
-      raw[offset + 3] = Math.round(255 * coverage / samples);
+      if (!fullBleed) raw[offset + 3] = Math.round(255 * coverage / samples);
     }
   }
   return raw;
 }
 
-function encodePng(size, raw) {
+function encodePng(size, raw, alpha = true) {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(size, 0);
   ihdr.writeUInt32BE(size, 4);
   ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // RGBA
+  ihdr[9] = alpha ? 6 : 2; // RGBA or RGB
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
@@ -177,4 +178,7 @@ for (const size of [16, 48, 128]) {
   writeFileSync(resolve(iconsDir, `icon${size}.png`), encodePng(size, drawArcIcon(size)));
   writeFileSync(resolve(animeIconsDir, `icon${size}.png`), encodePng(size, drawAnimeIcon(size)));
 }
+const mobileSize = 1024;
+writeFileSync(resolve(__dirname, '../mobile/assets/icon.png'),
+  encodePng(mobileSize, drawAnimeIcon(mobileSize, true), false));
 console.log('Generated Arc and Anime Study icons.');
