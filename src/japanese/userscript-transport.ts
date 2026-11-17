@@ -1,5 +1,7 @@
 import { schedule, type Card } from './study';
-import { QUIZ_KEY, defaultQuizSettings, type QuizSettings } from './quiz';
+import { QUIZ_KEY, cleanQuizSettings, defaultQuizSettings, type QuizSettings } from './quiz';
+import { WORDS_KEY, applyWordMessage, type WordCard } from './word-cards';
+import dictionary from './dictionary-data.json';
 import { subtitleUrl } from './captions';
 
 export type UserscriptApi = {
@@ -25,6 +27,7 @@ export function createUserscriptTransport(gm: UserscriptApi) {
         if (response.status !== 200 || response.responseText.length > 5000000) throw new Error('Subtitle source unavailable.');
         return { body: response.responseText };
       }
+      if (message.type === 'JAPANESE_DICTIONARY') return { entries: dictionary.entries };
       if (message.type === 'TRANSLATE_TEXT') {
         const text = String(message.text || '').trim();
         if (!text || text.length > 5000) throw new Error('Choose a phrase shorter than 5,000 characters.');
@@ -39,6 +42,13 @@ export function createUserscriptTransport(gm: UserscriptApi) {
       }
       let settings = await gm.getValue<QuizSettings>(QUIZ_KEY, { ...defaultQuizSettings });
       let cards = await list();
+      let words = await gm.getValue<WordCard[]>(WORDS_KEY, []);
+      const nextWords = applyWordMessage(words, message);
+      if (nextWords) {
+        words = nextWords;
+        await gm.setValue(WORDS_KEY, words);
+        return { cards, settings, words };
+      }
       if (message.type === 'JAPANESE_SAVE') {
         const card = message.card as Card;
         if (!card || typeof card.text !== 'string' || !card.text.trim() || card.text.length > 5000 || typeof card.meaning !== 'string' || !Number.isFinite(card.start) || !Number.isFinite(card.end) || card.start < 0 || card.end <= card.start || !/^https?:\/\//.test(card.url)) throw new Error('Check the phrase and video time.');
@@ -55,12 +65,12 @@ export function createUserscriptTransport(gm: UserscriptApi) {
         await gm.setValue(PREFIX + card.id, updated);
         cards = cards.map((item) => item.id === card.id ? updated : item);
       } else if (message.type === 'JAPANESE_QUIZ_SETTINGS') {
-        const next = message.settings as QuizSettings;
-        if (!next || !Number.isFinite(next.chance) || next.chance < 0 || next.chance > 1) throw new Error('Check your quiz frequency.');
-        settings = { chance: next.chance };
+        const next = cleanQuizSettings(message.settings);
+        if (!next) throw new Error('Check your quiz frequency.');
+        settings = next;
         await gm.setValue(QUIZ_KEY, settings);
       } else if (message.type !== 'JAPANESE_LIST') throw new Error('Unsupported study request.');
-      return { cards, settings };
+      return { cards, settings, words };
     });
     queue = operation;
     return operation;

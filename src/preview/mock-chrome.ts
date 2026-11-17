@@ -19,6 +19,7 @@ export async function installPreviewChrome() {
     { id: 4, windowId: 1, index: 3, title: 'An unusually long tab title that should truncate without displacing any controls', url: 'https://example.com/reading', active: false }
   ];
   let stored: Record<string, unknown> = {};
+  let study: ((message: any) => Promise<unknown>) | undefined;
   const api = {
     runtime: {
       onMessage: messages, onInstalled: event(), onStartup: event(), getURL: (path: string) => `https://example.com/${path}`,
@@ -27,6 +28,8 @@ export async function installPreviewChrome() {
           for (const listener of messages.listeners.slice(1)) listener(message, {}, () => {});
           return {};
         }
+        if (message.type === 'JAPANESE_DICTIONARY') return { entries: (await import('../japanese/dictionary-data.json')).default.entries };
+        if (typeof message.type === 'string' && message.type.startsWith('JAPANESE_')) return (study ??= (await import('../japanese/storage')).createStudyStore(api.storage.local))(message);
         if (message.type === 'TRANSLATE_TEXT') return { translatedText: 'This is a sample translation for the local preview.', detectedSourceLang: 'en' };
         if (message.type === 'SEARCH_OMNIBOX' && message.query === 'offline') throw new Error('Preview connection failure');
         return new Promise((resolve) => messages.listeners[0](message, {}, (result: unknown) => resolve(structuredClone(result))));

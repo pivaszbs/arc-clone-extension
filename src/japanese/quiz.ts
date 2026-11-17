@@ -1,6 +1,22 @@
 import { type Card, type Cue, hasJapanese } from './study';
 
-export type QuizSettings = { chance: number };
+export type QuizSettings = {
+  /** Share of other subtitle lines that pause for study. */
+  chance: number;
+  /** How many new or still-unlearned words Learn keeps in play per episode. */
+  wordsInPlay?: number;
+  /** Readings in romaji until the learner can read kana. */
+  reading?: 'romaji' | 'kana';
+};
+/** Validates settings from a message; returns null when they are malformed. */
+export function cleanQuizSettings(input: unknown): QuizSettings | null {
+  const next = input as QuizSettings | undefined;
+  if (!next || !Number.isFinite(next.chance) || next.chance < 0 || next.chance > 1) return null;
+  const settings: QuizSettings = { chance: next.chance };
+  if (Number.isInteger(next.wordsInPlay) && next.wordsInPlay! >= 0 && next.wordsInPlay! <= 20) settings.wordsInPlay = next.wordsInPlay;
+  if (next.reading === 'romaji' || next.reading === 'kana') settings.reading = next.reading;
+  return settings;
+}
 export const QUIZ_KEY = 'arc_japanese_quiz_v1';
 export const defaultQuizSettings: QuizSettings = { chance: 0.25 };
 export type ListeningCue = Cue & { estimated?: boolean };

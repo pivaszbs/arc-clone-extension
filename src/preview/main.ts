@@ -13,7 +13,7 @@ if (surface === 'japanese') {
   video.setAttribute('aria-label', 'Silent test video with Japanese captions');
   const track = document.createElement('track');
   track.kind = 'subtitles'; track.srclang = 'ja'; track.label = 'Japanese test captions'; track.default = true;
-  track.src = URL.createObjectURL(new Blob(['WEBVTT\n\n00:00:01.000 --> 00:00:05.000\nそれは何ですか。\n\n00:00:06.000 --> 00:00:10.000\nやさしい日本語でお願いします。\n'], { type: 'text/vtt' }));
+  track.src = URL.createObjectURL(new Blob(['WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nそれは何ですか。\n\n00:00:03.500 --> 00:00:05.500\n友達と映画を見ました。\n\n00:00:06.000 --> 00:00:08.000\nやさしい日本語でお願いします。\n\n00:00:08.500 --> 00:00:10.000\n友達は日本語の映画が好きです。\n'], { type: 'text/vtt' }));
   video.appendChild(track); target.querySelector('article')!.appendChild(video);
   const { default: JapaneseStudy } = await import('../japanese/JapaneseStudy.svelte');
   const host = document.createElement('div'); document.body.appendChild(host);
