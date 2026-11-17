@@ -1,11 +1,9 @@
 # AGENTS.md
 
-## Pull requests
+## Branches
 
-- Unfinished work goes on a feature branch (`codex/<feature>`) and gets a **draft** PR: `gh pr create --draft --base main`.
-- Always open PRs as drafts, even when the work looks finished. The user marks them ready for review.
-- Draft PR body: what changed, what is unfinished or untested, how to try it.
-- Don't push unfinished features straight to `main`.
+- Work directly on `main`. Don't create feature branches or worktrees, and don't open PRs.
+- Commit finished, working changes to `main` with a clear message. Run the checks below first.
 
 ## Commits
 
