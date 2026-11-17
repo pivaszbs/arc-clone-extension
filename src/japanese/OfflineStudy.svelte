@@ -13,7 +13,7 @@
   import { forgetFrameChecks, VideoThemeQueue, type ScanStatus } from './video-theme-queue';
   import { DesktopVideoStream } from '../video/desktop-stream';
   import { directoryPicker, episodeStem, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, rememberRemovedEpisode, removeLibraryFile, removedEpisodeNames, type DownloadFolder, type EpisodeFolder } from './offline-library';
-  import { folderSeriesId, folderTitle, groupByTitle } from './gallery';
+  import { folderLabel, folderSeason, folderSeriesId, folderTitle, groupByTitle, nextSeasonFolder } from './gallery';
   import { buildTvPlaybackData, TvSyncClient, writeTvPlaybackToFolder as persistTvPlayback, type EpisodeProgress as Progress, type PipelineEvent, type TvWsState } from './tv-sync';
   import { extractEpisodeNumberFromName, extractSeriesIdFromName, parseSeriesArcMetadata, selectStoryCuesForExplainer, type ArcExplainerData } from './arc-explainer';
 
@@ -71,7 +71,24 @@
   let arcExplainer = $state<ArcExplainerData | null>(null);
   let arcExplainerLoading = $state(false);
   let arcExplainerError = $state('');
-  let activeScreen = $state<'watch' | 'gallery' | 'pipelines' | 'downloads'>(openDownloads ? 'downloads' : 'watch');
+  // Routes live in the hash so Back/Forward and reloads keep your place:
+  // #/watch, #/gallery[/<title>[/<folder>]], #/settings, #/pipelines, #/downloads.
+  type Screen = 'watch' | 'gallery' | 'settings' | 'pipelines' | 'downloads';
+  const ROOT_FOLDER = '.';
+  function parseRoute(hash: string) {
+    const [screen, title, folder] = hash.replace(/^#\/?/, '').split('/').map(part => {
+      try { return decodeURIComponent(part); } catch { return part; }
+    });
+    if (!(['watch', 'gallery', 'settings', 'pipelines', 'downloads'] as string[]).includes(screen)) return undefined;
+    const gallery = screen === 'gallery';
+    return {
+      screen: screen as Screen,
+      title: gallery && title ? title : undefined,
+      folder: gallery && title && folder ? (folder === ROOT_FOLDER ? '' : folder) : undefined,
+    };
+  }
+  const initialRoute = parseRoute(location.hash);
+  let activeScreen = $state<Screen>(initialRoute?.screen ?? (openDownloads ? 'downloads' : 'watch'));
   let tvWsState = $state<TvWsState>('disconnected');
   let tvAutoplay = $state(true);
   let pipelineEvents = $state<PipelineEvent[]>([]);
@@ -206,8 +223,39 @@
     return new Map(episodes.map(episode => [episode.path, episodeProgress(episode.video)]));
   });
   // Gallery: one cover per title; titles downloaded in several translations open one level deeper.
-  let galleryTitle = $state<string>();
-  let galleryFolder = $state<string>();
+  let galleryTitle = $state<string | undefined>(initialRoute?.title);
+  let galleryFolder = $state<string | undefined>(initialRoute?.folder);
+  function routeHash() {
+    const parts: string[] = [activeScreen];
+    if (activeScreen === 'gallery' && galleryTitle) {
+      parts.push(galleryTitle);
+      if (galleryFolder !== undefined) parts.push(galleryFolder || ROOT_FOLDER);
+    }
+    return `#/${parts.map(encodeURIComponent).join('/')}`;
+  }
+  let routed = false;
+  $effect(() => {
+    const hash = routeHash();
+    const first = !routed;
+    routed = true;
+    if (location.hash === hash) return;
+    if (first) history.replaceState(history.state, '', hash);
+    else history.pushState(history.state, '', hash);
+  });
+  function applyRoute() {
+    const route = parseRoute(location.hash);
+    if (!route) return;
+    galleryTitle = route.title;
+    galleryFolder = route.folder;
+    if (route.screen === 'downloads') downloadsOpen = true;
+    if (route.screen === 'watch' && activeScreen !== 'watch') showWatch();
+    else activeScreen = route.screen;
+  }
+  function showScreen(screen: Screen) {
+    if (screen === 'watch') showWatch();
+    else activeScreen = screen;
+    if (screen === 'downloads') downloadsOpen = true;
+  }
   let posterUrls = $state<Record<string, string>>({});
   const posterFiles = new Map<string, { file: File; url: string }>();
   const galleryVideos = (entry: EpisodeFolder) => entry.files.filter(file => isEpisodeVideo(file.name))
@@ -234,17 +282,52 @@
     void progressRevision;
     return new Map(activeScreen === 'gallery' ? episodeFolders.map(entry => [entry.key, folderProgress(entry)]) : []);
   });
-  /** The big card at the top: the series watched last that still has something left. */
+  /**
+   * Where a title continues: the episode after the last one watched, or, once that season
+   * is finished, the first unwatched episode of the next season.
+   */
+  function titleContinue(entries: EpisodeFolder[]) {
+    let recent: EpisodeFolder | undefined;
+    let at = 0;
+    for (const entry of entries) {
+      const watchedAt = galleryProgress.get(entry.key)?.watchedAt || 0;
+      if (watchedAt > at) { recent = entry; at = watchedAt; }
+    }
+    if (!recent) return undefined;
+    const state = galleryProgress.get(recent.key);
+    if (state?.next && !episodeProgress(state.next)?.finished) return { entry: recent, file: state.next, at };
+    const following = nextSeasonFolder(entries, recent);
+    const file = following && galleryProgress.get(following.key)?.videos.find(video => !episodeProgress(video)?.finished);
+    return following && file ? { entry: following, file, at } : undefined;
+  }
+  /** The big card at the top: the title watched last that still has something left. */
   const continueTarget = $derived.by(() => {
     let best: { entry: EpisodeFolder; file: File; at: number } | undefined;
-    for (const entry of episodeFolders) {
-      const state = galleryProgress.get(entry.key);
-      if (!state?.next || !state.watchedAt || (best && state.watchedAt <= best.at)) continue;
-      if (episodeProgress(state.next)?.finished) continue;
-      best = { entry, file: state.next, at: state.watchedAt };
+    for (const group of galleryGroups) {
+      const target = titleContinue(group.entries);
+      if (target && (!best || target.at > best.at)) best = target;
     }
     return best;
   });
+  /** The next season of the series playing now, for Next and Up next after its last episode. */
+  const nextSeason = $derived.by(() => {
+    const current = episodeFolders.find(entry => entry.key === selectedFolder);
+    if (!current) return undefined;
+    const title = folderSeason(current.name).title.toLocaleLowerCase();
+    const following = nextSeasonFolder(episodeFolders.filter(entry => folderSeason(entry.name).title.toLocaleLowerCase() === title), current);
+    const first = following?.files.filter(file => isEpisodeVideo(file.name))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))[0];
+    return following && first ? { entry: following, file: first } : undefined;
+  });
+  function playNextSeason(autoplay = true) {
+    const target = nextSeason;
+    if (!target) return;
+    selectedFolder = target.entry.key;
+    usePreferredEpisode = false;
+    selected = target.file.webkitRelativePath || target.file.name;
+    setEpisodeFiles(target.entry.files);
+    selectEpisode(autoplay);
+  }
   function posterFor(entries: EpisodeFolder[]) {
     for (const entry of entries) if (posterUrls[entry.key]) return posterUrls[entry.key];
   }
@@ -314,9 +397,14 @@
     activeScreen = 'watch';
   }
   /** A title plays the translation you watched last, or its first one. */
+  /** A title continues across its seasons; one never watched starts at its first season. */
   function playGalleryGroup(entries: EpisodeFolder[]) {
-    const recent = [...entries].sort((a, b) => (galleryProgress.get(b.key)?.watchedAt || 0) - (galleryProgress.get(a.key)?.watchedAt || 0))[0];
-    if (recent) playGalleryFolder(recent);
+    const target = titleContinue(entries);
+    if (target) playGalleryFolder(target.entry, target.file);
+    else {
+      const recent = [...entries].sort((a, b) => (galleryProgress.get(b.key)?.watchedAt || 0) - (galleryProgress.get(a.key)?.watchedAt || 0))[0];
+      if (recent) playGalleryFolder(recent);
+    }
   }
   function browseGalleryGroup(group: { key: string; entries: EpisodeFolder[] }) {
     galleryTitle = group.key;
@@ -329,7 +417,7 @@
 
 
   const watchedDownloads = $derived.by(() => {
-    if (!folderGranted || activeScreen !== 'gallery') return [];
+    if (!folderGranted || activeScreen !== 'settings') return [];
     void progressRevision;
     return episodeFolders.map(series => ({
       series,
@@ -1310,7 +1398,10 @@
 
   function stepEpisode(offset: number, autoplay = !!video && !video.paused) {
     const episode = episodes[episodeIndex + offset];
-    if (!episode) return;
+    if (!episode) {
+      if (offset === 1 && episodeIndex === episodes.length - 1) playNextSeason(autoplay);
+      return;
+    }
     usePreferredEpisode = false;
     selected = episode.path;
     void playFile(episode.video, episode.subtitle, autoplay);
@@ -1579,7 +1670,7 @@
 </script>
 
 <svelte:document onfullscreenchange={handleFullscreenChange} />
-<svelte:window onpagehide={() => saveProgress(true)} onpointermove={revealOverlayOnPointerMove} onpointerdown={revealOverlayOnPointerMove} />
+<svelte:window onpopstate={applyRoute} onhashchange={applyRoute} onpagehide={() => saveProgress(true)} onpointermove={revealOverlayOnPointerMove} onpointerdown={revealOverlayOnPointerMove} />
 
 <header class="masthead">
   <div class="app-name">
@@ -1587,12 +1678,9 @@
     <h1 title={animeName || undefined}>{animeName || 'Offline Study'}</h1>
   </div>
   <nav aria-label="Offline Study">
-    <button type="button" class="nav-tab" aria-current={activeScreen === 'watch' ? 'page' : undefined} onclick={showWatch}>Watch</button>
-    <button type="button" class="nav-tab" aria-current={activeScreen === 'gallery' ? 'page' : undefined} onclick={() => { activeScreen = 'gallery'; }}>Gallery</button>
-    <button type="button" class="nav-tab" aria-current={activeScreen === 'pipelines' ? 'page' : undefined} onclick={() => { activeScreen = 'pipelines'; }}>Pipelines</button>
-    <a href="#settings" onclick={event => { event.preventDefault(); activeScreen = 'gallery'; void tick().then(() => document.getElementById('settings')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })); }}>Settings</a>
-    <a href="#downloads" class="nav-tab" aria-current={activeScreen === 'downloads' ? 'page' : undefined}
-      onclick={event => { event.preventDefault(); activeScreen = 'downloads'; downloadsOpen = true; }}>Downloads</a>
+    {#each [['watch', 'Watch'], ['gallery', 'Gallery'], ['downloads', 'Downloads'], ['pipelines', 'Pipelines'], ['settings', 'Settings']] as [screen, label] (screen)}
+      <button type="button" class="nav-tab" aria-current={activeScreen === screen ? 'page' : undefined} onclick={() => showScreen(screen as Screen)}>{label}</button>
+    {/each}
   </nav>
 </header>
 
@@ -1628,7 +1716,7 @@
     {#if fullscreenError}<p role="alert">Fullscreen could not open.</p>{/if}
     {#key videoUrl}
       <div class="offline-controls">
-        <JapaneseStudy bind:this={studyPlayer} inline {overlayHidden} {localCues} {localBody} {localSource} {referenceCues} {videoThemes} title={fileName} bind:learning bind:studying bind:autoSkip bind:endingAction bind:showSubtitles onResumeAtEnd={() => stepEpisode(1, true)} onNextEpisode={episodeIndex >= 0 && episodeIndex < episodes.length - 1 ? () => stepEpisode(1, true) : undefined} onToggleFullscreen={() => toggleFullscreen(true)}>
+        <JapaneseStudy bind:this={studyPlayer} inline {overlayHidden} {localCues} {localBody} {localSource} {referenceCues} {videoThemes} title={fileName} bind:learning bind:studying bind:autoSkip bind:endingAction bind:showSubtitles onResumeAtEnd={() => stepEpisode(1, true)} onNextEpisode={episodeIndex >= 0 && (episodeIndex < episodes.length - 1 || nextSeason) ? () => stepEpisode(1, true) : undefined} onToggleFullscreen={() => toggleFullscreen(true)}>
           {#snippet playerOptions()}
             {#if desktopPipAvailable}
               <button class="theme-scan" disabled={desktopPipStarting || !videoReady} onclick={toggleDesktopPip}>
@@ -1650,7 +1738,7 @@
                     <option value={episode.path} title={episode.video.name}>{episodeLabel(episode.video.name)}</option>
                   {/each}
                 </select>
-                <button aria-label="Next" title="Next episode" disabled={episodeIndex >= episodes.length - 1} onclick={() => stepEpisode(1)}>›</button>
+                <button aria-label="Next" title="Next episode" disabled={episodeIndex >= episodes.length - 1 && !nextSeason} onclick={() => stepEpisode(1)}>›</button>
               {/if}
               <button onclick={() => toggleFullscreen()} aria-label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'} title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}>⛶</button>
               <button onclick={hideOverlay} title="Hide controls and subtitles until you move the pointer">Hide</button>
@@ -1672,6 +1760,10 @@
       {#if episodeIndex >= 0 && episodes[episodeIndex + 1]}
         <button class="next-episode" onclick={() => stepEpisode(1, true)}>
           <span>Up next</span> {episodeLabel(episodes[episodeIndex + 1].video.name)} <span aria-hidden="true">›</span>
+        </button>
+      {:else if episodeIndex >= 0 && episodeIndex === episodes.length - 1 && nextSeason}
+        <button class="next-episode" onclick={() => playNextSeason()}>
+          <span>Up next</span> {folderLabel(nextSeason.entry.name, true)} · {episodeLabel(nextSeason.file.name)} <span aria-hidden="true">›</span>
         </button>
       {/if}
     </div>
@@ -1737,7 +1829,7 @@
   <section class="empty-player">
     <h2>Watch from your library</h2>
     <p>Open a downloaded series or an episode to start watching.</p>
-    <a href="#library" onclick={() => { activeScreen = 'gallery'; }}>Open library</a>
+    <a href="#/gallery">Open library</a>
   </section>
 {/if}
   </div>
@@ -1833,8 +1925,8 @@
   <form method="dialog"><button>Done</button></form>
 </dialog>
 
-<div class="watch-tools" class:single-pane={activeScreen !== 'gallery'} hidden={activeScreen === 'watch'}>
-  <section id="library" class="library-tools" aria-labelledby="library-title" hidden={activeScreen !== 'gallery'}>
+<div class="watch-tools" hidden={activeScreen === 'watch'}>
+  <section id="library" class="library-tools gallery-screen" aria-labelledby="library-title" hidden={activeScreen !== 'gallery'}>
     <div class="library-header">
       <h2 id="library-title">Gallery</h2>
     </div>
@@ -1878,6 +1970,7 @@
     {/if}
     {#if openGroup}
       {@const multi = openGroup.entries.length > 1}
+      {@const seasons = openGroup.seasons > 1}
       <nav class="gallery-heading" aria-label="Gallery level">
         <button type="button" class="gallery-back" onclick={galleryUp}>‹ Back</button>
         <button type="button" class="gallery-crumb" onclick={() => { galleryTitle = undefined; galleryFolder = undefined; }}>All series</button>
@@ -1885,7 +1978,7 @@
         {#if browsedFolder && multi}
           <button type="button" class="gallery-crumb" onclick={() => { galleryFolder = undefined; }}>{openGroup.title}</button>
           <span aria-hidden="true">›</span>
-          <h3>{folderTitle(browsedFolder.name).credit || 'Original'}</h3>
+          <h3>{folderLabel(browsedFolder.name, seasons)}</h3>
         {:else}
           <h3>{openGroup.title}{browsedFolder && folderTitle(browsedFolder.name).credit ? ` · ${folderTitle(browsedFolder.name).credit}` : ''}</h3>
         {/if}
@@ -1912,21 +2005,21 @@
     <ul class="cover-grid" aria-label={openGroup ? `${openGroup.title} translations` : 'Series'}>
       {#if openGroup}
         {#each openGroup.entries as entry (entry.key)}
-          {@const name = folderTitle(entry.name)}
+          {@const label = folderLabel(entry.name, openGroup.seasons > 1)}
           {@const state = galleryProgress.get(entry.key)}
           {@const poster = posterUrls[entry.key] || posterFor(openGroup.entries)}
           {@const total = state?.videos.length || 0}
           <li class="cover-item">
-            <button type="button" class="cover-card" aria-current={entry.key === selectedFolder ? 'true' : undefined} title={`Play ${name.credit || name.title}`} onclick={() => playGalleryFolder(entry)}>
-              {#if poster}<img class="cover-poster" src={poster} alt="" loading="lazy" />{:else}<span class="cover-poster cover-placeholder">{name.credit || name.title}</span>{/if}
+            <button type="button" class="cover-card" aria-current={entry.key === selectedFolder ? 'true' : undefined} title={`Play ${label}`} onclick={() => playGalleryFolder(entry)}>
+              {#if poster}<img class="cover-poster" src={poster} alt="" loading="lazy" />{:else}<span class="cover-poster cover-placeholder">{label}</span>{/if}
               <span class="cover-play" aria-hidden="true">▶</span>
               {#if state?.watched && total}<span class="cover-bar"><span style:width="{state.watched / total * 100}%"></span></span>{/if}
               <span class="cover-meta">
-                <strong>{name.credit || 'Original'}</strong>
+                <strong>{label}</strong>
                 <small>{total} {total === 1 ? 'episode' : 'episodes'}{state?.next ? ` · Next: ${episodeLabel(state.next.name)}` : ''}</small>
               </span>
             </button>
-            <button type="button" class="cover-more" aria-label={`${name.credit || 'Original'} episodes`} onclick={() => { galleryFolder = entry.key; }}>Episodes ›</button>
+            <button type="button" class="cover-more" aria-label={`${label} episodes`} onclick={() => { galleryFolder = entry.key; }}>Episodes ›</button>
           </li>
         {/each}
       {:else}
@@ -1947,7 +2040,7 @@
                 <small>{total} {total === 1 ? 'episode' : 'episodes'}{recent.state?.next ? ` · Next: ${episodeLabel(recent.state.next.name)}` : ''}</small>
               </span>
             </button>
-            <button type="button" class="cover-more" aria-label={single ? `${group.title} episodes` : `${group.title} translations`} onclick={() => browseGalleryGroup(group)}>{single ? 'Episodes ›' : `${group.entries.length} translations ›`}</button>
+            <button type="button" class="cover-more" aria-label={single ? `${group.title} episodes` : group.seasons > 1 ? `${group.title} seasons` : `${group.title} translations`} onclick={() => browseGalleryGroup(group)}>{single ? 'Episodes ›' : group.seasons > 1 ? `${group.seasons} seasons ›` : `${group.entries.length} translations ›`}</button>
           </li>
         {/each}
       {/if}
@@ -2195,7 +2288,7 @@
   </div>
 {/if}
   </section>
-  <section id="settings" class="library-tools settings-tools" aria-labelledby="settings-title" hidden={activeScreen !== 'gallery'}>
+  <section id="settings" class="library-tools settings-tools" aria-labelledby="settings-title" hidden={activeScreen !== 'settings'}>
     <h2 id="settings-title">Settings</h2>
     <label class="setting-check">
       <input type="checkbox" checked={autoSkip.op && autoSkip.ed && autoSkip.recap} onchange={event => updateAutoSkip(event.currentTarget.checked)} />
@@ -2223,7 +2316,7 @@
       </button>
     </div>
     {#if cleanupStatus}<p role="status">{cleanupStatus}</p>
-    {:else if !folderGranted}<p>Connect a download folder in Gallery.</p>
+    {:else if !folderGranted}<p>Connect a download folder in <a href="#/gallery">Gallery</a>.</p>
     {:else if !watchedDownloadCount}<p>No watched downloads available to delete.</p>{/if}
   </section>
   <section id="downloads" aria-label="Downloads" hidden={activeScreen !== 'downloads'}>
@@ -2530,7 +2623,7 @@
   .empty-player p { color: var(--muted); }
   .watch-tools {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
     align-items: start;
     gap: 18px;
     margin-top: 26px;
@@ -2595,10 +2688,10 @@
   .continue-card {
     position: relative;
     display: flex;
-    gap: 18px;
+    gap: clamp(16px, 2.4vw, 32px);
     width: 100%;
     margin: 12px 0 4px;
-    padding: 14px;
+    padding: clamp(14px, 2vw, 26px);
     border: 1px solid var(--line, rgba(255, 255, 255, 0.14));
     border-radius: 14px;
     overflow: hidden;
@@ -2619,10 +2712,10 @@
     filter: blur(28px) brightness(0.45);
     z-index: -1;
   }
-  .continue-poster { width: clamp(84px, 18%, 150px); aspect-ratio: 3 / 4; object-fit: cover; border-radius: 9px; flex: none; }
+  .continue-poster { width: clamp(84px, 16%, 200px); aspect-ratio: 3 / 4; object-fit: cover; border-radius: 9px; flex: none; }
   .continue-text { display: flex; flex-direction: column; justify-content: center; gap: 6px; min-width: 0; }
   .continue-kicker { color: var(--accent, #ff8248); font-size: 11.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
-  .continue-title { font-size: clamp(17px, 2.4vw, 26px); line-height: 1.2; font-weight: 800; }
+  .continue-title { font-size: clamp(18px, 2.8vw, 36px); line-height: 1.2; font-weight: 800; }
   .continue-episode { color: var(--muted, #b6b1ae); font-size: 13.5px; font-weight: 600; }
   .continue-play {
     align-self: flex-start;
@@ -2643,8 +2736,8 @@
     margin: 6px 0 4px;
     padding: 0;
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(clamp(140px, 13vw, 200px), 1fr));
+    gap: clamp(12px, 1.4vw, 20px);
   }
   .cover-card {
     position: relative;
@@ -2890,7 +2983,9 @@
   .job-actions { display: flex; gap: 6px; }
   .job-actions button { padding: 2px 8px; font-size: 11px; }
   [hidden] { display: none !important; }
-  .watch-tools.single-pane { grid-template-columns: minmax(0, 1fr); }
+  .gallery-screen { padding: 0; background: none; border: 0; }
+  .gallery-screen h2 { font-size: clamp(22px, 2.6vw, 30px); letter-spacing: -0.02em; }
+  .settings-tools { max-width: 720px; width: 100%; justify-self: center; gap: 14px; padding: 22px 24px; }
   .arc-explainer { display: block; }
   .arc-explainer summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   .arc-explainer-meta { font-size: 12px; opacity: 0.72; }

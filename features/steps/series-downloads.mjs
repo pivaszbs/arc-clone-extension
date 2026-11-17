@@ -31,7 +31,7 @@ Given('a catalog with two downloadable episodes and one without Japanese subtitl
 });
 
 When('I check the series for offline viewing', async function () {
-  await this.videoPage.getByRole('link', { name: 'Downloads', exact: true }).click();
+  await this.videoPage.getByRole('button', { name: 'Downloads', exact: true }).click();
   await this.videoPage.getByRole('button', { name: 'Check episodes' }).click();
 });
 
@@ -78,7 +78,7 @@ Given('a catalog where the current dub is available for three episodes', async f
   const opened = this.context.waitForEvent('page');
   await this.videoPage.getByRole('button', { name: 'Offline', exact: true }).click();
   this.videoPage = await opened;
-  await expect(this.videoPage.getByRole('link', { name: 'Downloads', exact: true })).toHaveAttribute('aria-current', 'page');
+  await expect(this.videoPage.getByRole('button', { name: 'Downloads', exact: true })).toHaveAttribute('aria-current', 'page');
   await expect(this.videoPage.getByLabel('Anime365 series or episode link')).toHaveValue(selected);
   await expect(this.videoPage.locator('video')).toHaveCount(0);
 });
@@ -100,7 +100,7 @@ Then('adding a fallback makes episode four available', async function () {
   await expect(page.getByRole('checkbox', { name: 'Episode 4 · 1080p · Other dub' })).toBeEnabled();
   await expect(page.getByRole('checkbox', { name: 'Episode 3 · 1080p · Fixture Dub' })).toBeChecked();
   await page.reload();
-  await page.getByRole('link', { name: 'Downloads', exact: true }).click();
+  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
   await page.getByRole('button', { name: 'Check episodes' }).click();
   await expect(page.getByRole('checkbox', { name: 'Episode 4 · 1080p · Other dub' })).toBeEnabled();
 });
@@ -265,7 +265,7 @@ Given('a connected library with watched and unwatched downloads in two series', 
 
 When('I confirm deletion of all watched downloads in Settings', async function () {
   const page = this.videoPage;
-  await page.getByRole('link', { name: 'Settings' }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const start = page.getByRole('region', { name: 'Settings' }).getByRole('button', { name: 'Delete all watched downloads' });
   const confirm = page.getByRole('dialog', { name: 'Delete all watched downloads?' });
   await start.click();
@@ -295,6 +295,8 @@ Then('Load more does not offer the deleted episode again', async function () {
   const page = this.videoPage;
   await page.reload();
   await page.evaluate(() => { chrome.permissions.request = async () => true; });
+  // Reloading keeps the Settings route; Load more lives on the Watch screen.
+  await page.getByRole('button', { name: 'Watch', exact: true }).click();
   await page.getByRole('button', { name: 'Load more' }).click();
   await expect(page.getByText('No new episodes on Smotret Anime.')).toBeVisible();
   expect(this.cleanupEpisodeChecks).toEqual([]);
