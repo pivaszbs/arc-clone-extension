@@ -207,12 +207,14 @@
   });
   // Gallery: one cover per title; titles downloaded in several translations open one level deeper.
   let galleryTitle = $state<string>();
+  let galleryFolder = $state<string>();
   let posterUrls = $state<Record<string, string>>({});
   const posterFiles = new Map<string, { file: File; url: string }>();
   const galleryVideos = (entry: EpisodeFolder) => entry.files.filter(file => isEpisodeVideo(file.name))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
   const galleryGroups = $derived(activeScreen === 'gallery' ? groupByTitle(episodeFolders) : []);
   const openGroup = $derived(galleryGroups.find(group => group.key === galleryTitle));
+  const browsedFolder = $derived(galleryFolder === undefined ? undefined : episodeFolders.find(entry => entry.key === galleryFolder));
   /** Where you are in a folder: the episode to continue with and how much is finished. */
   function folderProgress(entry: EpisodeFolder) {
     const videos = galleryVideos(entry);
@@ -301,16 +303,30 @@
     const ss = String(s % 60).padStart(2, '0');
     return h ? `${h}:${mm.padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
   }
-  function openGalleryFolder(entry: EpisodeFolder, play = false) {
+  /** One click plays: the given episode, or where you left off in that folder. */
+  function playGalleryFolder(entry: EpisodeFolder, file?: File) {
     selectedFolder = entry.key;
-    switchEpisodeFolder();
-    if (play) selectEpisode(true);
+    usePreferredEpisode = false;
+    folderStatus = '';
+    selected = file ? file.webkitRelativePath || file.name : '';
+    setEpisodeFiles(entry.files);
+    selectEpisode(true);
     activeScreen = 'watch';
   }
-  function openGalleryGroup(group: { key: string; entries: EpisodeFolder[] }) {
-    if (group.entries.length === 1) openGalleryFolder(group.entries[0]);
-    else galleryTitle = group.key;
+  /** A title plays the translation you watched last, or its first one. */
+  function playGalleryGroup(entries: EpisodeFolder[]) {
+    const recent = [...entries].sort((a, b) => (galleryProgress.get(b.key)?.watchedAt || 0) - (galleryProgress.get(a.key)?.watchedAt || 0))[0];
+    if (recent) playGalleryFolder(recent);
   }
+  function browseGalleryGroup(group: { key: string; entries: EpisodeFolder[] }) {
+    galleryTitle = group.key;
+    galleryFolder = group.entries.length === 1 ? group.entries[0].key : undefined;
+  }
+  function galleryUp() {
+    if (browsedFolder && openGroup && openGroup.entries.length > 1) galleryFolder = undefined;
+    else { galleryFolder = undefined; galleryTitle = undefined; }
+  }
+
 
   const watchedDownloads = $derived.by(() => {
     if (!folderGranted || activeScreen !== 'gallery') return [];
@@ -1843,13 +1859,13 @@
     {/if}
   </div>
   {#if folderGranted && episodeFolders.length}
-    {#if continueTarget && !openGroup}
+    {#if continueTarget && !openGroup && !browsedFolder}
       {@const target = continueTarget}
       {@const name = folderTitle(target.entry.name)}
       {@const saved = episodeProgress(target.file)}
       {@const resume = !!saved && !saved.finished && saved.position >= 1}
       {@const poster = posterUrls[target.entry.key]}
-      <button type="button" class="continue-card" title={target.entry.name} onclick={() => openGalleryFolder(target.entry, true)}>
+      <button type="button" class="continue-card" title={target.entry.name} onclick={() => playGalleryFolder(target.entry)}>
         {#if poster}<img class="continue-backdrop" src={poster} alt="" />{/if}
         {#if poster}<img class="continue-poster" src={poster} alt="" />{/if}
         <span class="continue-text">
@@ -1861,13 +1877,38 @@
       </button>
     {/if}
     {#if openGroup}
-      <div class="gallery-heading">
-        <button type="button" class="gallery-back" onclick={() => { galleryTitle = undefined; }}>‹ All series</button>
-        <h3>{openGroup.title}</h3>
-      </div>
+      {@const multi = openGroup.entries.length > 1}
+      <nav class="gallery-heading" aria-label="Gallery level">
+        <button type="button" class="gallery-back" onclick={galleryUp}>‹ Back</button>
+        <button type="button" class="gallery-crumb" onclick={() => { galleryTitle = undefined; galleryFolder = undefined; }}>All series</button>
+        <span aria-hidden="true">›</span>
+        {#if browsedFolder && multi}
+          <button type="button" class="gallery-crumb" onclick={() => { galleryFolder = undefined; }}>{openGroup.title}</button>
+          <span aria-hidden="true">›</span>
+          <h3>{folderTitle(browsedFolder.name).credit || 'Original'}</h3>
+        {:else}
+          <h3>{openGroup.title}{browsedFolder && folderTitle(browsedFolder.name).credit ? ` · ${folderTitle(browsedFolder.name).credit}` : ''}</h3>
+        {/if}
+      </nav>
     {:else if continueTarget}
       <h3 class="gallery-section">All series</h3>
     {/if}
+    {#if browsedFolder}
+      {@const state = galleryProgress.get(browsedFolder.key)}
+      {@const entry = browsedFolder}
+      <ul class="episode-tiles" aria-label="Episodes">
+        {#each state?.videos || [] as file (fileIdentity(file))}
+          {@const saved = episodeProgress(file)}
+          {@const current = entry.key === selectedFolder && (file.webkitRelativePath || file.name) === selected}
+          <li>
+            <button type="button" class="episode-tile" aria-current={current ? 'true' : undefined} data-state={saved?.finished ? 'watched' : saved && saved.position >= 1 ? 'resume' : 'new'} title={file.name} onclick={() => playGalleryFolder(entry, file)}>
+              <strong>▶ {episodeLabel(file.name)}</strong>
+              <small>{saved?.finished ? 'Watched' : saved && saved.position >= 1 ? `Resume at ${clock(saved.position)}` : 'Not started'}</small>
+            </button>
+          </li>
+        {/each}
+      </ul>
+    {:else}
     <ul class="cover-grid" aria-label={openGroup ? `${openGroup.title} translations` : 'Series'}>
       {#if openGroup}
         {#each openGroup.entries as entry (entry.key)}
@@ -1875,15 +1916,17 @@
           {@const state = galleryProgress.get(entry.key)}
           {@const poster = posterUrls[entry.key] || posterFor(openGroup.entries)}
           {@const total = state?.videos.length || 0}
-          <li>
-            <button type="button" class="cover-card" aria-current={entry.key === selectedFolder ? 'true' : undefined} title={entry.name} onclick={() => openGalleryFolder(entry)}>
+          <li class="cover-item">
+            <button type="button" class="cover-card" aria-current={entry.key === selectedFolder ? 'true' : undefined} title={`Play ${name.credit || name.title}`} onclick={() => playGalleryFolder(entry)}>
               {#if poster}<img class="cover-poster" src={poster} alt="" loading="lazy" />{:else}<span class="cover-poster cover-placeholder">{name.credit || name.title}</span>{/if}
+              <span class="cover-play" aria-hidden="true">▶</span>
               {#if state?.watched && total}<span class="cover-bar"><span style:width="{state.watched / total * 100}%"></span></span>{/if}
               <span class="cover-meta">
                 <strong>{name.credit || 'Original'}</strong>
-                <small>{total} {total === 1 ? 'episode' : 'episodes'}{state?.latest ? ` · ${episodeLabel(state.latest.name)}` : ''}</small>
+                <small>{total} {total === 1 ? 'episode' : 'episodes'}{state?.next ? ` · Next: ${episodeLabel(state.next.name)}` : ''}</small>
               </span>
             </button>
+            <button type="button" class="cover-more" aria-label={`${name.credit || 'Original'} episodes`} onclick={() => { galleryFolder = entry.key; }}>Episodes ›</button>
           </li>
         {/each}
       {:else}
@@ -1894,20 +1937,22 @@
           {@const recent = group.entries.map((entry, i) => ({ entry, state: states[i] })).sort((a, b) => (b.state?.watchedAt || 0) - (a.state?.watchedAt || 0))[0]}
           {@const poster = posterFor([recent.entry, ...group.entries])}
           {@const single = group.entries.length === 1}
-          <li>
-            <button type="button" class="cover-card" aria-current={group.entries.some(entry => entry.key === selectedFolder) ? 'true' : undefined} title={single ? group.entries[0].name : group.title} onclick={() => openGalleryGroup(group)}>
+          <li class="cover-item">
+            <button type="button" class="cover-card" aria-current={group.entries.some(entry => entry.key === selectedFolder) ? 'true' : undefined} title={`Play ${group.title}`} onclick={() => playGalleryGroup(group.entries)}>
               {#if poster}<img class="cover-poster" src={poster} alt="" loading="lazy" />{:else}<span class="cover-poster cover-placeholder">{group.title}</span>{/if}
-              {#if !single}<span class="cover-badge">{group.entries.length} translations</span>{/if}
+              <span class="cover-play" aria-hidden="true">▶</span>
               {#if watched && total}<span class="cover-bar"><span style:width="{Math.min(100, watched / total * 100)}%"></span></span>{/if}
               <span class="cover-meta">
                 <strong>{group.title}</strong>
-                <small>{total} {total === 1 ? 'episode' : 'episodes'}{recent.state?.latest ? ` · ${episodeLabel(recent.state.latest.name)}` : ''}</small>
+                <small>{total} {total === 1 ? 'episode' : 'episodes'}{recent.state?.next ? ` · Next: ${episodeLabel(recent.state.next.name)}` : ''}</small>
               </span>
             </button>
+            <button type="button" class="cover-more" aria-label={single ? `${group.title} episodes` : `${group.title} translations`} onclick={() => browseGalleryGroup(group)}>{single ? 'Episodes ›' : `${group.entries.length} translations ›`}</button>
           </li>
         {/each}
       {/if}
     </ul>
+    {/if}
   {/if}
   {#if folderStatus}<p role="status">{folderStatus}</p>
   {:else if !folder}<p>Choose Arc Anime or a series folder inside it.</p>{/if}
@@ -2632,16 +2677,73 @@
     text-align: center;
     overflow: hidden;
   }
-  .cover-badge {
+  .cover-item { position: relative; }
+  .cover-more {
     position: absolute;
     top: 8px;
     right: 8px;
-    padding: 3px 8px;
+    padding: 4px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
     border-radius: 999px;
-    background: rgba(0, 0, 0, 0.72);
-    font-size: 11px;
+    background: rgba(0, 0, 0, 0.74);
+    color: #fff;
+    font: inherit;
+    font-size: 11.5px;
     font-weight: 700;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
   }
+  .cover-more:hover { border-color: var(--accent, #ff8248); color: var(--accent, #ff8248); }
+  .cover-play {
+    position: absolute;
+    left: 50%;
+    top: 37%;
+    display: grid;
+    place-items: center;
+    width: 48px;
+    height: 48px;
+    margin: -24px 0 0 -24px;
+    border-radius: 50%;
+    background: var(--accent, #ff8248);
+    color: #111;
+    font-size: 18px;
+    opacity: 0;
+    transform: scale(0.85);
+    transition: opacity 0.12s ease, transform 0.12s ease;
+    pointer-events: none;
+  }
+  .cover-card:hover .cover-play, .cover-card:focus-visible .cover-play { opacity: 1; transform: none; }
+  .gallery-crumb { background: none; border: 0; padding: 0; color: var(--muted, #b6b1ae); font: inherit; font-size: 14px; cursor: pointer; }
+  .gallery-crumb:hover { color: inherit; text-decoration: underline; }
+  .episode-tiles {
+    list-style: none;
+    margin: 6px 0 4px;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 8px;
+  }
+  .episode-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--line, rgba(255, 255, 255, 0.14));
+    border-left: 3px solid transparent;
+    border-radius: 9px;
+    background: var(--surface, #171719);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .episode-tile:hover { border-color: rgba(255, 255, 255, 0.3); }
+  .episode-tile[data-state='resume'] { border-left-color: var(--accent, #ff8248); }
+  .episode-tile[data-state='watched'] { opacity: 0.62; }
+  .episode-tile[aria-current='true'] { border-color: var(--accent, #ff8248); }
+  .episode-tile strong { font-size: 13px; }
+  .episode-tile small { font-size: 11.5px; color: var(--muted, #b6b1ae); }
   .cover-bar { display: block; height: 3px; background: rgba(255, 255, 255, 0.12); }
   .cover-bar > span { display: block; height: 100%; background: var(--accent, #ff8248); }
   .cover-meta { display: flex; flex-direction: column; gap: 3px; padding: 9px 10px 10px; }
