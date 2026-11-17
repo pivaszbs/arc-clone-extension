@@ -13,6 +13,7 @@
   import { forgetFrameChecks, VideoThemeQueue, type ScanStatus } from './video-theme-queue';
   import { DesktopVideoStream } from '../video/desktop-stream';
   import { directoryPicker, episodeStem, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, rememberRemovedEpisode, removeLibraryFile, removedEpisodeNames, type DownloadFolder, type EpisodeFolder } from './offline-library';
+  import { folderSeriesId, folderTitle, groupByTitle } from './gallery';
   import { buildTvPlaybackData, TvSyncClient, writeTvPlaybackToFolder as persistTvPlayback, type EpisodeProgress as Progress, type PipelineEvent, type TvWsState } from './tv-sync';
   import { extractEpisodeNumberFromName, extractSeriesIdFromName, parseSeriesArcMetadata, selectStoryCuesForExplainer, type ArcExplainerData } from './arc-explainer';
 
@@ -170,16 +171,6 @@
   let safariAirPlayId = $state('');
   let progressRevision = $state(0);
   let downloadsOpen = $state(openDownloads || !!preferredParams);
-  // Download folders are named "Смотреть аниме <title> онлайн - <id> - <translation>".
-  function folderTitle(name: string) {
-    const plain = name.replace(/^Смотреть аниме\s+/i, '');
-    const parts = plain.match(/^(.*?) - \d+(?: - (.+))?$/);
-    // Without an id, drop a trailing translation credit such as "- NDA Studio Дубляж".
-    const credit = parts ? parts[2] || '' : plain.match(/\s+-\s+([^-]*(?:дубляж|озвучка|субтитр|войсовер|dub|sub)[^-]*)$/i)?.[1] || '';
-    const title = (parts ? parts[1] : credit ? plain.slice(0, plain.lastIndexOf(credit)).replace(/\s+-\s*$/, '') : plain)
-      .replace(/\s+онлайн$/i, '').trim();
-    return { title, credit: credit.trim() };
-  }
   const seriesFolderName = $derived(episodeFolders.find(entry => entry.key === selectedFolder)?.name
     || episodes[0]?.video.webkitRelativePath.split('/').at(-2)
     || '');
@@ -214,6 +205,113 @@
     void progressRevision;
     return new Map(episodes.map(episode => [episode.path, episodeProgress(episode.video)]));
   });
+  // Gallery: one cover per title; titles downloaded in several translations open one level deeper.
+  let galleryTitle = $state<string>();
+  let posterUrls = $state<Record<string, string>>({});
+  const posterFiles = new Map<string, { file: File; url: string }>();
+  const galleryVideos = (entry: EpisodeFolder) => entry.files.filter(file => isEpisodeVideo(file.name))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const galleryGroups = $derived(activeScreen === 'gallery' ? groupByTitle(episodeFolders) : []);
+  const openGroup = $derived(galleryGroups.find(group => group.key === galleryTitle));
+  /** Where you are in a folder: the episode to continue with and how much is finished. */
+  function folderProgress(entry: EpisodeFolder) {
+    const videos = galleryVideos(entry);
+    let latest = -1;
+    let at = 0;
+    let watched = 0;
+    videos.forEach((file, index) => {
+      const saved = episodeProgress(file);
+      if (saved?.finished) watched++;
+      if (saved && saved.watchedAt > at) { at = saved.watchedAt; latest = index; }
+    });
+    const last = videos[latest];
+    const next = last && episodeProgress(last)?.finished ? videos[latest + 1] : last;
+    return { videos, watched, latest: last, next, watchedAt: at };
+  }
+  const galleryProgress = $derived.by(() => {
+    void progressRevision;
+    return new Map(activeScreen === 'gallery' ? episodeFolders.map(entry => [entry.key, folderProgress(entry)]) : []);
+  });
+  /** The big card at the top: the series watched last that still has something left. */
+  const continueTarget = $derived.by(() => {
+    let best: { entry: EpisodeFolder; file: File; at: number } | undefined;
+    for (const entry of episodeFolders) {
+      const state = galleryProgress.get(entry.key);
+      if (!state?.next || !state.watchedAt || (best && state.watchedAt <= best.at)) continue;
+      if (episodeProgress(state.next)?.finished) continue;
+      best = { entry, file: state.next, at: state.watchedAt };
+    }
+    return best;
+  });
+  function posterFor(entries: EpisodeFolder[]) {
+    for (const entry of entries) if (posterUrls[entry.key]) return posterUrls[entry.key];
+  }
+  $effect(() => {
+    if (activeScreen !== 'gallery') return;
+    const next: Record<string, string> = {};
+    const missing: EpisodeFolder[] = [];
+    for (const entry of episodeFolders) {
+      if (entry.poster) {
+        const known = posterFiles.get(entry.key);
+        if (known?.file === entry.poster) next[entry.key] = known.url;
+        else {
+          if (known) URL.revokeObjectURL(known.url);
+          const url = URL.createObjectURL(entry.poster);
+          posterFiles.set(entry.key, { file: entry.poster, url });
+          next[entry.key] = url;
+        }
+      } else if (folderSeriesId(entry.name)) missing.push(entry);
+    }
+    posterUrls = next;
+    let cancelled = false;
+    // Folders the Mac has not cached a poster.jpg for yet: ask the catalog for the cover.
+    void (async () => {
+      for (const entry of missing) {
+        const url = await catalogPoster(folderSeriesId(entry.name)!);
+        if (cancelled) return;
+        if (url) posterUrls = { ...posterUrls, [entry.key]: url };
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+  async function catalogPoster(seriesId: string) {
+    const cacheKey = `arc-series-meta:${seriesId}`;
+    const read = (payload: unknown) => {
+      const data = (payload as { data?: { posterUrl?: unknown; posterUrlSmall?: unknown } } | null)?.data;
+      const url = data?.posterUrl || data?.posterUrlSmall;
+      return typeof url === 'string' && url.startsWith('https://') ? url : undefined;
+    };
+    try {
+      const cached = read(JSON.parse(localStorage.getItem(cacheKey) || 'null'));
+      if (cached) return cached;
+    } catch { /* ignore */ }
+    try {
+      const res = await fetch(`https://smotret-anime.com/api/series/${seriesId}`);
+      if (!res.ok) return;
+      const payload = await res.json();
+      try { localStorage.setItem(cacheKey, JSON.stringify(payload)); } catch { /* ignore */ }
+      return read(payload);
+    } catch { /* Offline: the card shows its title instead. */ }
+  }
+  onDestroy(() => { for (const { url } of posterFiles.values()) URL.revokeObjectURL(url); });
+  function clock(seconds: number) {
+    const s = Math.floor(seconds);
+    const h = Math.floor(s / 3600);
+    const mm = String(Math.floor(s / 60) % 60);
+    const ss = String(s % 60).padStart(2, '0');
+    return h ? `${h}:${mm.padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
+  }
+  function openGalleryFolder(entry: EpisodeFolder, play = false) {
+    selectedFolder = entry.key;
+    switchEpisodeFolder();
+    if (play) selectEpisode(true);
+    activeScreen = 'watch';
+  }
+  function openGalleryGroup(group: { key: string; entries: EpisodeFolder[] }) {
+    if (group.entries.length === 1) openGalleryFolder(group.entries[0]);
+    else galleryTitle = group.key;
+  }
+
   const watchedDownloads = $derived.by(() => {
     if (!folderGranted || activeScreen !== 'gallery') return [];
     void progressRevision;
@@ -1744,23 +1842,72 @@
       <button onclick={() => selectEpisode(true)}>{savedPosition ? 'Resume episode' : 'Play saved episode'}</button>
     {/if}
   </div>
-  {#if folderGranted && episodeFolders.length > 1}
-    <div class="folder-cards" role="list" aria-label="Series folders">
-      {#each episodeFolders as entry (entry.key)}
-        {@const name = folderTitle(entry.name)}
-        {@const videoCount = entry.files.filter(f => isEpisodeVideo(f.name)).length}
-        <button
-          type="button"
-          class="folder-card"
-          aria-current={entry.key === selectedFolder ? 'true' : undefined}
-          title={entry.name}
-          onclick={() => { selectedFolder = entry.key; switchEpisodeFolder(); activeScreen = 'watch'; }}
-        >
-          <strong>{name.title || entry.name}</strong>
-          <small>{videoCount} {videoCount === 1 ? 'episode' : 'episodes'}{name.credit ? ` · ${name.credit}` : ''}</small>
-        </button>
-      {/each}
-    </div>
+  {#if folderGranted && episodeFolders.length}
+    {#if continueTarget && !openGroup}
+      {@const target = continueTarget}
+      {@const name = folderTitle(target.entry.name)}
+      {@const saved = episodeProgress(target.file)}
+      {@const resume = !!saved && !saved.finished && saved.position >= 1}
+      {@const poster = posterUrls[target.entry.key]}
+      <button type="button" class="continue-card" title={target.entry.name} onclick={() => openGalleryFolder(target.entry, true)}>
+        {#if poster}<img class="continue-backdrop" src={poster} alt="" />{/if}
+        {#if poster}<img class="continue-poster" src={poster} alt="" />{/if}
+        <span class="continue-text">
+          <span class="continue-kicker">Continue watching</span>
+          <strong class="continue-title">{name.title || target.entry.name}</strong>
+          <span class="continue-episode">{episodeLabel(target.file.name)}{resume ? ` · ${clock(saved.position)}` : ''}{name.credit ? ` · ${name.credit}` : ''}</span>
+          <span class="continue-play">▶ {resume ? 'Resume' : 'Play'}</span>
+        </span>
+      </button>
+    {/if}
+    {#if openGroup}
+      <div class="gallery-heading">
+        <button type="button" class="gallery-back" onclick={() => { galleryTitle = undefined; }}>‹ All series</button>
+        <h3>{openGroup.title}</h3>
+      </div>
+    {:else if continueTarget}
+      <h3 class="gallery-section">All series</h3>
+    {/if}
+    <ul class="cover-grid" aria-label={openGroup ? `${openGroup.title} translations` : 'Series'}>
+      {#if openGroup}
+        {#each openGroup.entries as entry (entry.key)}
+          {@const name = folderTitle(entry.name)}
+          {@const state = galleryProgress.get(entry.key)}
+          {@const poster = posterUrls[entry.key] || posterFor(openGroup.entries)}
+          {@const total = state?.videos.length || 0}
+          <li>
+            <button type="button" class="cover-card" aria-current={entry.key === selectedFolder ? 'true' : undefined} title={entry.name} onclick={() => openGalleryFolder(entry)}>
+              {#if poster}<img class="cover-poster" src={poster} alt="" loading="lazy" />{:else}<span class="cover-poster cover-placeholder">{name.credit || name.title}</span>{/if}
+              {#if state?.watched && total}<span class="cover-bar"><span style:width="{state.watched / total * 100}%"></span></span>{/if}
+              <span class="cover-meta">
+                <strong>{name.credit || 'Original'}</strong>
+                <small>{total} {total === 1 ? 'episode' : 'episodes'}{state?.latest ? ` · ${episodeLabel(state.latest.name)}` : ''}</small>
+              </span>
+            </button>
+          </li>
+        {/each}
+      {:else}
+        {#each galleryGroups as group (group.key)}
+          {@const states = group.entries.map(entry => galleryProgress.get(entry.key))}
+          {@const total = states.reduce((sum, state) => sum + (state?.videos.length || 0), 0)}
+          {@const watched = states.reduce((sum, state) => sum + (state?.watched || 0), 0)}
+          {@const recent = group.entries.map((entry, i) => ({ entry, state: states[i] })).sort((a, b) => (b.state?.watchedAt || 0) - (a.state?.watchedAt || 0))[0]}
+          {@const poster = posterFor([recent.entry, ...group.entries])}
+          {@const single = group.entries.length === 1}
+          <li>
+            <button type="button" class="cover-card" aria-current={group.entries.some(entry => entry.key === selectedFolder) ? 'true' : undefined} title={single ? group.entries[0].name : group.title} onclick={() => openGalleryGroup(group)}>
+              {#if poster}<img class="cover-poster" src={poster} alt="" loading="lazy" />{:else}<span class="cover-poster cover-placeholder">{group.title}</span>{/if}
+              {#if !single}<span class="cover-badge">{group.entries.length} translations</span>{/if}
+              {#if watched && total}<span class="cover-bar"><span style:width="{Math.min(100, watched / total * 100)}%"></span></span>{/if}
+              <span class="cover-meta">
+                <strong>{group.title}</strong>
+                <small>{total} {total === 1 ? 'episode' : 'episodes'}{recent.state?.latest ? ` · ${episodeLabel(recent.state.latest.name)}` : ''}</small>
+              </span>
+            </button>
+          </li>
+        {/each}
+      {/if}
+    </ul>
   {/if}
   {#if folderStatus}<p role="status">{folderStatus}</p>
   {:else if !folder}<p>Choose Arc Anime or a series folder inside it.</p>{/if}
@@ -2400,30 +2547,106 @@
     .big-play { width: 64px; height: 64px; margin: -32px 0 0 -32px; font-size: 24px; }
     .episode-controls { margin-inline-start: 0; }
   }
-  .folder-cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-    gap: 8px;
-    margin: 10px 0 4px;
-  }
-  .folder-card {
-    text-align: left;
-    padding: 10px 12px;
-    border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    background: rgba(255, 255, 255, 0.04);
+  .continue-card {
+    position: relative;
+    display: flex;
+    gap: 18px;
+    width: 100%;
+    margin: 12px 0 4px;
+    padding: 14px;
+    border: 1px solid var(--line, rgba(255, 255, 255, 0.14));
+    border-radius: 14px;
+    overflow: hidden;
+    background: var(--surface, #171719);
     color: inherit;
+    font: inherit;
+    text-align: left;
     cursor: pointer;
+    isolation: isolate;
+  }
+  .continue-card:hover { border-color: var(--accent, #ff8248); }
+  .continue-backdrop {
+    position: absolute;
+    inset: -20px;
+    width: calc(100% + 40px);
+    height: calc(100% + 40px);
+    object-fit: cover;
+    filter: blur(28px) brightness(0.45);
+    z-index: -1;
+  }
+  .continue-poster { width: clamp(84px, 18%, 150px); aspect-ratio: 3 / 4; object-fit: cover; border-radius: 9px; flex: none; }
+  .continue-text { display: flex; flex-direction: column; justify-content: center; gap: 6px; min-width: 0; }
+  .continue-kicker { color: var(--accent, #ff8248); font-size: 11.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+  .continue-title { font-size: clamp(17px, 2.4vw, 26px); line-height: 1.2; font-weight: 800; }
+  .continue-episode { color: var(--muted, #b6b1ae); font-size: 13.5px; font-weight: 600; }
+  .continue-play {
+    align-self: flex-start;
+    margin-top: 6px;
+    padding: 8px 18px;
+    border-radius: 999px;
+    background: var(--accent, #ff8248);
+    color: #111;
+    font-weight: 700;
+    font-size: 14px;
+  }
+  .gallery-section, .gallery-heading h3 { margin: 14px 0 8px; font-size: 16px; }
+  .gallery-heading { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .gallery-heading h3 { margin: 0; }
+  .gallery-back { margin: 12px 0; }
+  .cover-grid {
+    list-style: none;
+    margin: 6px 0 4px;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 12px;
+  }
+  .cover-card {
+    position: relative;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    border: 1px solid var(--line, rgba(255, 255, 255, 0.14));
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--surface, #171719);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: transform 0.12s ease, border-color 0.12s ease;
   }
-  .folder-card strong { font-size: 13px; line-height: 1.3; }
-  .folder-card small { font-size: 11.5px; opacity: 0.72; }
-  .folder-card[aria-current='true'] {
-    border-color: #ff6a2b;
-    background: rgba(255, 106, 43, 0.14);
+  .cover-card:hover { transform: translateY(-2px); border-color: rgba(255, 255, 255, 0.3); }
+  .cover-card[aria-current='true'] { border-color: var(--accent, #ff8248); }
+  .cover-poster { display: block; width: 100%; aspect-ratio: 3 / 4; object-fit: cover; background: rgba(255, 255, 255, 0.06); }
+  .cover-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+    color: var(--muted, #b6b1ae);
+    font-weight: 700;
+    font-size: 14px;
+    text-align: center;
+    overflow: hidden;
   }
+  .cover-badge {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.72);
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .cover-bar { display: block; height: 3px; background: rgba(255, 255, 255, 0.12); }
+  .cover-bar > span { display: block; height: 100%; background: var(--accent, #ff8248); }
+  .cover-meta { display: flex; flex-direction: column; gap: 3px; padding: 9px 10px 10px; }
+  .cover-meta strong { font-size: 13px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .cover-meta small { font-size: 11.5px; color: var(--muted, #b6b1ae); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .nav-tab {
     background: transparent;
     border: 1px solid transparent;

@@ -71,7 +71,13 @@ async function readEpisodeFiles(entries: FileSystemHandle[]) {
   return files;
 }
 
-export type EpisodeFolder = { key: string; name: string; files: File[] };
+export type EpisodeFolder = { key: string; name: string; files: File[]; poster?: File };
+
+/** The cover the Mac's TV server caches as poster.jpg in each series folder. */
+async function readPoster(folder: FileSystemDirectoryHandle) {
+  try { return await (await folder.getFileHandle('poster.jpg')).getFile(); }
+  catch { return undefined; }
+}
 
 async function listEntries(folder: FileSystemDirectoryHandle) {
   const entries: FileSystemHandle[] = [];
@@ -85,7 +91,8 @@ export async function readEpisodeFolders(folder: DownloadFolder): Promise<Episod
   const children = await Promise.all(entries.filter(entry => entry.kind === 'directory').map(async entry => {
     const child = entry as FileSystemDirectoryHandle;
     try {
-      return { key: child.name, name: child.name, files: await readEpisodeFiles(await listEntries(child)) };
+      const [files, poster] = await Promise.all([listEntries(child).then(readEpisodeFiles), readPoster(child)]);
+      return { key: child.name, name: child.name, files, poster: poster?.size ? poster : undefined };
     } catch (error) {
       if (error instanceof DOMException && error.name === 'NotFoundError') return null;
       throw error;
