@@ -1,3 +1,4 @@
+import type { CatalogEntry } from '../../../shared/gallery/seasons';
 import { getRegister } from './replica';
 import { skipRanges } from './theme-sidecar';
 import { Directory, File, Paths } from 'expo-file-system';
@@ -19,6 +20,8 @@ export type Series = {
   credit: string;
   /** Cover image (the Mac's poster, or poster.jpg in the folder), if there is one. */
   poster?: string;
+  /** Full title, franchise and air date from the Mac's anime database lookup; groups seasons. */
+  catalog?: CatalogEntry;
   episodes: Episode[];
 };
 

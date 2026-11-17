@@ -8,6 +8,9 @@ import {
   cleanTitle,
   episodeTitle,
   privateLibraryAddress,
+  tvNextSeason,
+  tvSeasonLabel,
+  tvTitleGroups,
   type Part,
   type Progress,
   type TvEpisode as Episode,
@@ -61,6 +64,8 @@ let base = '';
 let catalog: Library[] = [];
 let seriesIndex = 0;
 let showingTitles = false;
+/** The title group open on the titles screen (its seasons and translations), if any. */
+let openTitle: string | undefined;
 let library: Library | undefined;
 let index = -1;
 let ready = false;
@@ -151,8 +156,13 @@ function handleBackAction(): boolean {
     closeEpisode();
     return true;
   }
-  if (!showingTitles && catalog.length > 1 && connectForm.hidden) {
+  if (showingTitles && openTitle) {
+    openTitle = undefined;
     renderTitles();
+    return true;
+  }
+  if (!showingTitles && catalog.length > 1 && connectForm.hidden) {
+    showTitles();
     return true;
   }
   if (!connectForm.hidden && library) {
@@ -184,7 +194,7 @@ function handleMenuAction() {
       hideControls();
     }
   } else if (catalog.length > 1 && !showingTitles) {
-    renderTitles();
+    showTitles();
   } else {
     renderLibrary();
   }
@@ -265,6 +275,7 @@ function handleTvControl(msg: TvSyncMessage) {
     }
   } else if (action === 'next') {
     if (library && index + 1 < library.episodes.length) void openEpisode(index + 1, false, true);
+    else playNextSeason(false, true);
   } else if (action === 'prev') {
     if (library && index > 0) void openEpisode(index - 1, false, true);
   } else if (action === 'skip') {
@@ -346,41 +357,94 @@ function selectSeries(i: number) {
   renderLibrary();
 }
 
+function titleCard(entries: number[], name: string, info: string, poster: string | null | undefined, onPick: () => void) {
+  const row = document.createElement('li');
+  const button = document.createElement('button');
+  button.className = 'title-card';
+  button.dataset.series = entries.join(',');
+  if (poster) {
+    const img = document.createElement('img');
+    img.className = 'title-poster';
+    img.src = base + poster;
+    img.alt = '';
+    img.addEventListener('error', () => img.remove());
+    button.append(img);
+  }
+  const meta = document.createElement('div');
+  meta.className = 'title-meta';
+  const label = document.createElement('span');
+  label.className = 'title-name';
+  label.textContent = name;
+  const small = document.createElement('small');
+  small.textContent = info;
+  meta.append(label, small);
+  button.append(meta);
+  button.addEventListener('click', onPick);
+  row.append(button);
+  list.append(row);
+}
+
+function latestEpisodeText(entry: Library) {
+  const latest = entry.episodes.reduce((best, ep, idx) =>
+    (getProgress(ep, entry)?.watchedAt || 0) > (best < 0 ? 0 : getProgress(entry.episodes[best], entry)?.watchedAt || 0) ? idx : best, -1);
+  return latest >= 0 ? ` · ${episodeTitle(entry.episodes[latest].name)}` : '';
+}
+
+/** All titles, one card per series; a series with several seasons or translations opens a level deeper. */
 function renderTitles() {
   list.textContent = '';
   list.classList.add('titles-grid');
   showingTitles = true;
   allTitlesBtn.hidden = true;
-  element('title').textContent = 'Anime Study';
-  catalog.forEach((entry, i) => {
-    const row = document.createElement('li');
-    const button = document.createElement('button');
-    button.className = 'title-card';
-    if (entry.poster) {
-      const img = document.createElement('img');
-      img.className = 'title-poster';
-      img.src = base + entry.poster;
-      img.alt = '';
-      img.addEventListener('error', () => img.remove());
-      button.append(img);
+  const groups = tvTitleGroups(catalog);
+  const open = groups.find(group => group.key === openTitle && group.entries.length > 1);
+  if (!open) openTitle = undefined;
+  if (open) {
+    element('title').textContent = open.title;
+    allTitlesBtn.hidden = false;
+    for (const i of open.entries) {
+      const entry = catalog[i];
+      const episodes = `${entry.episodes.length} episodes${latestEpisodeText(entry)}`;
+      titleCard([i], tvSeasonLabel(catalog, i, open.seasons > 1, open.title), episodes, entry.poster, () => selectSeries(i));
     }
-    const meta = document.createElement('div');
-    meta.className = 'title-meta';
-    const name = document.createElement('span');
-    name.className = 'title-name';
-    name.textContent = cleanTitle(entry.title);
-    const info = document.createElement('small');
-    const latest = entry.episodes.reduce((best, ep, idx) =>
-      (getProgress(ep, entry)?.watchedAt || 0) > (best < 0 ? 0 : getProgress(entry.episodes[best], entry)?.watchedAt || 0) ? idx : best, -1);
-    const resumeText = latest >= 0 ? ` · ${episodeTitle(entry.episodes[latest].name)}` : '';
-    info.textContent = `${entry.episodes.length} episodes${resumeText}`;
-    meta.append(name, info);
-    button.append(meta);
-    button.addEventListener('click', () => selectSeries(i));
-    row.append(button);
-    list.append(row);
-  });
-  list.querySelectorAll('button')[seriesIndex]?.focus();
+  } else {
+    element('title').textContent = 'Anime Study';
+    for (const group of groups) {
+      const first = catalog[group.entries[0]];
+      const total = group.entries.reduce((sum, i) => sum + catalog[i].episodes.length, 0);
+      const poster = group.entries.map(i => catalog[i].poster).find(Boolean);
+      const info = group.entries.length === 1 ? `${total} episodes${latestEpisodeText(first)}`
+        : group.seasons > 1 ? `${group.seasons} seasons · ${total} episodes` : `${group.entries.length} translations · ${total} episodes`;
+      titleCard(group.entries, group.title, info, poster, () => {
+        if (group.entries.length === 1) selectSeries(group.entries[0]);
+        else { openTitle = group.key; renderTitles(); }
+      });
+    }
+  }
+  const cards = Array.from(list.querySelectorAll<HTMLButtonElement>('button.title-card'));
+  (cards.find(card => card.dataset.series?.split(',').includes(String(seriesIndex))) || cards[0])?.focus();
+}
+
+/** Back from a series: to its seasons when it has several, otherwise to all titles. */
+function showTitles() {
+  const group = tvTitleGroups(catalog).find(item => item.entries.includes(seriesIndex));
+  openTitle = group && group.entries.length > 1 ? group.key : undefined;
+  renderTitles();
+}
+
+/** After the last episode of a season, the next season (same translation when there) carries on. */
+function nextSeasonIndex() {
+  return library && index + 1 >= library.episodes.length ? tvNextSeason(catalog, seriesIndex) : undefined;
+}
+
+function playNextSeason(previousFinished: boolean, autoplay: boolean) {
+  const nextSeries = nextSeasonIndex();
+  if (nextSeries === undefined) return false;
+  selectSeries(nextSeries);
+  const episodes = catalog[nextSeries].episodes;
+  const first = Math.max(0, episodes.findIndex(ep => !getProgress(ep, catalog[nextSeries])?.finished));
+  void openEpisode(first, previousFinished, autoplay);
+  return true;
 }
 
 function renderLibrary() {
@@ -775,10 +839,12 @@ function skipPart(auto: boolean) {
   diagnostics.log(`${labels[part]} (${auto ? 'auto' : 'manual'}) → ${format(range.end)}`);
   dismissed.add(part);
   const ending = library.endingAction || 'auto';
-  if (auto && part === 'ed' && index + 1 < library.episodes.length &&
+  const hasNext = index + 1 < library.episodes.length || nextSeasonIndex() !== undefined;
+  if (auto && part === 'ed' && hasNext &&
     (ending === 'next' || ending === 'auto' && video.duration - range.end <= 20)) {
     saveProgress(true);
-    void openEpisode(index + 1, true);
+    if (index + 1 < library.episodes.length) void openEpisode(index + 1, true);
+    else playNextSeason(true, serverAutoplay);
   } else seek(range.end);
 }
 
@@ -835,7 +901,7 @@ async function openEpisode(position: number, previousFinished = false, autoplay 
   element('clock').textContent = '';
   libraryScreen.hidden = true;
   player.hidden = false;
-  next.disabled = index + 1 >= (library?.episodes.length || 0);
+  next.disabled = index + 1 >= (library?.episodes.length || 0) && nextSeasonIndex() === undefined;
   element('series-badge').textContent = library ? cleanTitle(library.title) : '';
   element('episode-title').textContent = episodeTitle(episode.name);
   renderSegmentMarkers();
@@ -907,7 +973,7 @@ video.addEventListener('pause', () => { play.textContent = 'Play'; if (ready && 
 video.addEventListener('ended', () => {
   saveProgress(true);
   if (serverAutoplay && library && index + 1 < library.episodes.length) void openEpisode(index + 1, true, true);
-  else sendTvState(true);
+  else if (!(serverAutoplay && playNextSeason(true, true))) sendTvState(true);
 });
 window.addEventListener('pagehide', () => {
   if (!player.hidden && !video.ended) saveProgress();
@@ -946,7 +1012,10 @@ skipDelayBtn.addEventListener('click', () => {
   syncToServer({ autoSkipDelay: skipDelaySeconds() });
   renderSkipSettings();
 });
-next.addEventListener('click', () => void openEpisode(index + 1));
+next.addEventListener('click', () => {
+  if (library && index + 1 < library.episodes.length) void openEpisode(index + 1);
+  else playNextSeason(false, serverAutoplay);
+});
 skip.addEventListener('click', () => skipPart(false));
 keep.addEventListener('click', () => { if (activeSkip) dismissed.add(activeSkip.part); play.focus(); updatePlayback(); });
 learn.addEventListener('click', () => {
@@ -977,7 +1046,10 @@ continueStudy.addEventListener('click', () => {
   void startPlayback();
 });
 connectForm.addEventListener('submit', event => { event.preventDefault(); void connect(address.value); });
-allTitlesBtn.addEventListener('click', () => { renderTitles(); });
+allTitlesBtn.addEventListener('click', () => {
+  if (showingTitles) openTitle = undefined;
+  if (showingTitles) renderTitles(); else showTitles();
+});
 change.addEventListener('click', () => { connectForm.hidden = false; address.focus(); });
 player.addEventListener('pointermove', showControls);
 

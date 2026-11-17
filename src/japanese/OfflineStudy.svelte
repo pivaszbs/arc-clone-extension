@@ -13,7 +13,8 @@
   import { forgetFrameChecks, VideoThemeQueue, type ScanStatus } from './video-theme-queue';
   import { DesktopVideoStream } from '../video/desktop-stream';
   import { directoryPicker, episodeStem, isEpisodeVideo, readEpisodeFolders, rememberFolder, rememberedFolder, rememberRemovedEpisode, removeLibraryFile, removedEpisodeNames, type DownloadFolder, type EpisodeFolder } from './offline-library';
-  import { folderLabel, folderSeason, folderSeriesId, folderTitle, groupByTitle, nextSeasonFolder } from './gallery';
+  import { folderLabel, folderSeriesId, folderTitle, groupByTitle, nextSeasonFolder, sameSeries, type SeriesCatalog } from './gallery';
+  import { lookupSeries, smotretPoster, smotretSeries, type CatalogCache } from '../../shared/gallery/series-catalog';
   import { buildTvPlaybackData, TvSyncClient, writeTvPlaybackToFolder as persistTvPlayback, type EpisodeProgress as Progress, type PipelineEvent, type TvWsState } from './tv-sync';
   import { extractEpisodeNumberFromName, extractSeriesIdFromName, parseSeriesArcMetadata, selectStoryCuesForExplainer, type ArcExplainerData } from './arc-explainer';
 
@@ -260,7 +261,7 @@
   const posterFiles = new Map<string, { file: File; url: string }>();
   const galleryVideos = (entry: EpisodeFolder) => entry.files.filter(file => isEpisodeVideo(file.name))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-  const galleryGroups = $derived(activeScreen === 'gallery' ? groupByTitle(episodeFolders) : []);
+  const galleryGroups = $derived(activeScreen === 'gallery' ? groupByTitle(episodeFolders, seriesCatalog) : []);
   const openGroup = $derived(galleryGroups.find(group => group.key === galleryTitle));
   const browsedFolder = $derived(galleryFolder === undefined ? undefined : episodeFolders.find(entry => entry.key === galleryFolder));
   /** Where you are in a folder: the episode to continue with and how much is finished. */
@@ -296,7 +297,7 @@
     if (!recent) return undefined;
     const state = galleryProgress.get(recent.key);
     if (state?.next && !episodeProgress(state.next)?.finished) return { entry: recent, file: state.next, at };
-    const following = nextSeasonFolder(entries, recent);
+    const following = nextSeasonFolder(entries, recent, seriesCatalog);
     const file = following && galleryProgress.get(following.key)?.videos.find(video => !episodeProgress(video)?.finished);
     return following && file ? { entry: following, file, at } : undefined;
   }
@@ -313,8 +314,7 @@
   const nextSeason = $derived.by(() => {
     const current = episodeFolders.find(entry => entry.key === selectedFolder);
     if (!current) return undefined;
-    const title = folderSeason(current.name).title.toLocaleLowerCase();
-    const following = nextSeasonFolder(episodeFolders.filter(entry => folderSeason(entry.name).title.toLocaleLowerCase() === title), current);
+    const following = nextSeasonFolder(sameSeries(episodeFolders, current, seriesCatalog), current, seriesCatalog);
     const first = following?.files.filter(file => isEpisodeVideo(file.name))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))[0];
     return following && first ? { entry: following, file: first } : undefined;
@@ -352,32 +352,37 @@
     // Folders the Mac has not cached a poster.jpg for yet: ask the catalog for the cover.
     void (async () => {
       for (const entry of missing) {
-        const url = await catalogPoster(folderSeriesId(entry.name)!);
+        let url: string | undefined;
+        try { url = smotretPoster(await smotretSeries(folderSeriesId(entry.name)!, catalogCache)); } catch { /* Offline: title card. */ }
         if (cancelled) return;
         if (url) posterUrls = { ...posterUrls, [entry.key]: url };
       }
     })();
     return () => { cancelled = true; };
   });
-  async function catalogPoster(seriesId: string) {
-    const cacheKey = `arc-series-meta:${seriesId}`;
-    const read = (payload: unknown) => {
-      const data = (payload as { data?: { posterUrl?: unknown; posterUrlSmall?: unknown } } | null)?.data;
-      const url = data?.posterUrl || data?.posterUrlSmall;
-      return typeof url === 'string' && url.startsWith('https://') ? url : undefined;
-    };
-    try {
-      const cached = read(JSON.parse(localStorage.getItem(cacheKey) || 'null'));
-      if (cached) return cached;
-    } catch { /* ignore */ }
-    try {
-      const res = await fetch(`https://smotret-anime.com/api/series/${seriesId}`);
-      if (!res.ok) return;
-      const payload = await res.json();
-      try { localStorage.setItem(cacheKey, JSON.stringify(payload)); } catch { /* ignore */ }
-      return read(payload);
-    } catch { /* Offline: the card shows its title instead. */ }
-  }
+  /** Anime database answers, kept in localStorage (the series payload is shared with the Arc explainer). */
+  const catalogCache: CatalogCache = {
+    get(key) { try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; } },
+    set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* Storage full: ask again next time. */ } },
+  };
+  // Full titles (folder names are cut at 60 characters), franchises and air dates by folder name,
+  // so every season of a series groups and orders correctly.
+  let seriesCatalog = $state<SeriesCatalog>({});
+  $effect(() => {
+    const folders = episodeFolders.filter(entry => folderSeriesId(entry.name) && !seriesCatalog[entry.name]?.franchise);
+    if (!folders.length) return;
+    let cancelled = false;
+    void (async () => {
+      const found: SeriesCatalog = {};
+      for (const entry of folders) {
+        const known = await lookupSeries(folderSeriesId(entry.name)!, catalogCache);
+        if (cancelled) return;
+        if (known && (known.title !== seriesCatalog[entry.name]?.title || known.franchise)) found[entry.name] = known;
+      }
+      if (Object.keys(found).length) seriesCatalog = { ...seriesCatalog, ...found };
+    })();
+    return () => { cancelled = true; };
+  });
   onDestroy(() => { for (const { url } of posterFiles.values()) URL.revokeObjectURL(url); });
   function clock(seconds: number) {
     const s = Math.floor(seconds);
@@ -1763,7 +1768,7 @@
         </button>
       {:else if episodeIndex >= 0 && episodeIndex === episodes.length - 1 && nextSeason}
         <button class="next-episode" onclick={() => playNextSeason()}>
-          <span>Up next</span> {folderLabel(nextSeason.entry.name, true)} · {episodeLabel(nextSeason.file.name)} <span aria-hidden="true">›</span>
+          <span>Up next</span> {folderLabel(nextSeason.entry.name, true, seriesCatalog)} · {episodeLabel(nextSeason.file.name)} <span aria-hidden="true">›</span>
         </button>
       {/if}
     </div>
@@ -1962,7 +1967,7 @@
         {#if poster}<img class="continue-poster" src={poster} alt="" />{/if}
         <span class="continue-text">
           <span class="continue-kicker">Continue watching</span>
-          <strong class="continue-title">{name.title || target.entry.name}</strong>
+          <strong class="continue-title">{seriesCatalog[target.entry.name]?.title || name.title || target.entry.name}</strong>
           <span class="continue-episode">{episodeLabel(target.file.name)}{resume ? ` · ${clock(saved.position)}` : ''}{name.credit ? ` · ${name.credit}` : ''}</span>
           <span class="continue-play">▶ {resume ? 'Resume' : 'Play'}</span>
         </span>
@@ -1978,7 +1983,7 @@
         {#if browsedFolder && multi}
           <button type="button" class="gallery-crumb" onclick={() => { galleryFolder = undefined; }}>{openGroup.title}</button>
           <span aria-hidden="true">›</span>
-          <h3>{folderLabel(browsedFolder.name, seasons)}</h3>
+          <h3>{folderLabel(browsedFolder.name, seasons, seriesCatalog, openGroup.title)}</h3>
         {:else}
           <h3>{openGroup.title}{browsedFolder && folderTitle(browsedFolder.name).credit ? ` · ${folderTitle(browsedFolder.name).credit}` : ''}</h3>
         {/if}
@@ -2005,7 +2010,7 @@
     <ul class="cover-grid" aria-label={openGroup ? `${openGroup.title} translations` : 'Series'}>
       {#if openGroup}
         {#each openGroup.entries as entry (entry.key)}
-          {@const label = folderLabel(entry.name, openGroup.seasons > 1)}
+          {@const label = folderLabel(entry.name, openGroup.seasons > 1, seriesCatalog, openGroup.title)}
           {@const state = galleryProgress.get(entry.key)}
           {@const poster = posterUrls[entry.key] || posterFor(openGroup.entries)}
           {@const total = state?.videos.length || 0}

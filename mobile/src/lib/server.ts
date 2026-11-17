@@ -16,6 +16,8 @@ type CatalogResponse = {
     id: string;
     title: string;
     poster?: string | null;
+    /** Full title, franchise and air date from the anime databases (series_catalog.py). */
+    catalog?: { title?: string; franchise?: string; aired?: number } | null;
     episodes: {
       name: string;
       video: string;
@@ -86,6 +88,7 @@ export async function fetchRemoteCatalog(baseUrl: string): Promise<{
         title: title || item.title,
         credit,
         poster: item.poster ? `${url}${item.poster}` : undefined,
+        catalog: item.catalog ?? undefined,
         episodes,
       };
     });

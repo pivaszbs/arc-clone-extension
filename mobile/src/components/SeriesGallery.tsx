@@ -1,6 +1,8 @@
 import { SymbolView } from 'expo-symbols';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { FlatList, Image, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
+
+import { groupSeasons, nextSeasonOf, seasonLabel, type TitleGroup, type TitleInfo } from '../../../shared/gallery/seasons';
 
 import { clock } from '../lib/format';
 import { haptics } from '../lib/haptics';
@@ -44,15 +46,43 @@ export function continueEpisode(series: Series, progress: Record<string, Progres
   return progress[last.key]?.finished ? series.episodes[latest + 1] ?? last : last;
 }
 
-/** The series watched most recently that still has something left to watch. */
-function lastWatched(series: Series[], progress: Record<string, Progress>) {
+/** What a series is for season grouping: the Mac's catalog lookup when there is one, else its name. */
+export function seriesInfo(series: Series): TitleInfo {
+  return {
+    title: series.catalog?.title || series.title,
+    credit: series.credit,
+    franchise: series.catalog?.franchise,
+    aired: series.catalog?.aired,
+  };
+}
+
+/** Every series under its title: seasons and translations together, in season order. */
+export function seriesGroups(series: Series[]) {
+  return groupSeasons(series, seriesInfo);
+}
+
+/**
+ * The series watched most recently that still has something left to watch; once a season is
+ * finished, the next season of the same title (same translation when it is there).
+ */
+function lastWatched(groups: TitleGroup<Series>[], progress: Record<string, Progress>) {
   let best: { series: Series; episode: Episode; at: number } | null = null;
-  for (const item of series) {
-    const { lastWatchedAt } = seriesProgress(item, progress);
-    if (!lastWatchedAt || (best && lastWatchedAt <= best.at)) continue;
-    const episode = continueEpisode(item, progress);
-    if (!episode || progress[episode.key]?.finished) continue;
-    best = { series: item, episode, at: lastWatchedAt };
+  for (const group of groups) {
+    let recent: Series | undefined;
+    let at = 0;
+    for (const item of group.entries) {
+      const { lastWatchedAt } = seriesProgress(item, progress);
+      if (lastWatchedAt > at) { recent = item; at = lastWatchedAt; }
+    }
+    if (!recent || (best && at <= best.at)) continue;
+    const episode = continueEpisode(recent, progress);
+    if (episode && !progress[episode.key]?.finished) {
+      best = { series: recent, episode, at };
+      continue;
+    }
+    const following = nextSeasonOf(group.entries, recent, seriesInfo);
+    const first = following?.episodes.find(item => !progress[item.key]?.finished);
+    if (following && first) best = { series: following, episode: first, at };
   }
   return best;
 }
@@ -92,26 +122,47 @@ function ContinueCard({ series, episode, progress, width, onPlay }: {
   );
 }
 
-function Poster({ series }: { series: Series }) {
+function Poster({ uri, title }: { uri?: string; title: string }) {
   const [failed, setFailed] = useState(false);
-  if (series.poster && !failed) {
-    return <Image source={{ uri: series.poster }} style={styles.poster} resizeMode="cover" onError={() => setFailed(true)} />;
+  if (uri && !failed) {
+    return <Image source={{ uri }} style={styles.poster} resizeMode="cover" onError={() => setFailed(true)} />;
   }
   return (
     <View style={[styles.poster, styles.placeholder]}>
-      <Text style={styles.placeholderText} numberOfLines={4}>{series.title}</Text>
+      <Text style={styles.placeholderText} numberOfLines={4}>{title}</Text>
     </View>
   );
 }
 
-/** The library as a wall of covers, like the TV app. */
+type Card =
+  | { kind: 'series'; key: string; series: Series; title: string }
+  | { kind: 'group'; key: string; group: TitleGroup<Series> };
+
+/** The library as a wall of covers, like the TV app; a title with several seasons opens a level deeper. */
 export function SeriesGallery({ series, progress, width, onOpen, onPlay, header, refreshing = false, onRefresh }: Props) {
   const columns = Math.max(2, Math.min(6, Math.floor(width / 190)));
-  const recent = lastWatched(series, progress);
+  const groups = useMemo(() => seriesGroups(series), [series]);
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const open = groups.find(group => group.key === openKey && group.entries.length > 1);
+  const recent = open ? null : lastWatched(groups, progress);
+  const cards: Card[] = open
+    ? open.entries.map(item => ({ kind: 'series', key: item.folder || '_root', series: item, title: seasonLabel(seriesInfo(item), open.seasons > 1, open.title) }))
+    : groups.map(group => group.entries.length === 1
+      ? { kind: 'series', key: group.entries[0].folder || '_root', series: group.entries[0], title: group.title }
+      : { kind: 'group', key: `group:${group.key}`, group });
+  const cardWidth = (width - space.l * 2 - space.m * (columns - 1)) / columns;
   const listHeader = (
     <View>
       {header}
-      {recent && (
+      {open ? (
+        <View style={styles.heroWrap}>
+          <Pressable accessibilityRole="button" onPress={() => { haptics.tap(); setOpenKey(null); }} style={({ pressed }) => [styles.back, pressed && styles.pressed]}>
+            <SymbolView name="chevron.left" size={15} tintColor={colors.accent} />
+            <Text style={styles.backText}>All series</Text>
+          </Pressable>
+          <Text style={styles.groupTitle} numberOfLines={2}>{open.title}</Text>
+        </View>
+      ) : recent && (
         <View style={styles.heroWrap}>
           <ContinueCard series={recent.series} episode={recent.episode} progress={progress} width={width - space.l * 2} onPlay={from => onPlay(recent.series, recent.episode, from)} />
           <Text style={styles.sectionTitle}>All series</Text>
@@ -121,10 +172,10 @@ export function SeriesGallery({ series, progress, width, onOpen, onPlay, header,
   );
   return (
     <FlatList
-      key={columns}
-      data={series}
+      key={`${columns}:${open?.key ?? ''}`}
+      data={cards}
       numColumns={columns}
-      keyExtractor={item => item.folder || '_root'}
+      keyExtractor={item => item.key}
       ListHeaderComponent={listHeader}
       // The header brings its own side padding; cancel the list's so both line up with the covers.
       ListHeaderComponentStyle={styles.header}
@@ -132,17 +183,42 @@ export function SeriesGallery({ series, progress, width, onOpen, onPlay, header,
       columnWrapperStyle={styles.row}
       refreshControl={onRefresh ? <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.textSecondary} /> : undefined}
       renderItem={({ item }) => {
-        const { latest, watched } = seriesProgress(item, progress);
-        const total = item.episodes.length;
-        const where = latest >= 0 ? ` · ${item.episodes[latest].label}` : '';
+        if (item.kind === 'group') {
+          const { group } = item;
+          const total = group.entries.reduce((sum, entry) => sum + entry.episodes.length, 0);
+          const watched = group.entries.reduce((sum, entry) => sum + seriesProgress(entry, progress).watched, 0);
+          const poster = group.entries.find(entry => entry.poster)?.poster;
+          const kinds = group.seasons > 1 ? `${group.seasons} seasons` : `${group.entries.length} translations`;
+          return (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`${group.title}, ${kinds}`}
+              onPress={() => { haptics.select(); setOpenKey(group.key); }}
+              style={({ pressed }) => [styles.card, { width: cardWidth }, pressed && styles.pressed]}
+            >
+              <Poster uri={poster} title={group.title} />
+              <View style={styles.badge}><Text style={styles.badgeText}>{kinds}</Text></View>
+              {watched > 0 && (
+                <View style={styles.bar}><View style={[styles.barFill, { width: `${(watched / total) * 100}%` }]} /></View>
+              )}
+              <View style={styles.meta}>
+                <Text style={styles.title} numberOfLines={2}>{group.title}</Text>
+                <Text style={styles.info} numberOfLines={1}>{total} episode{total === 1 ? '' : 's'}</Text>
+              </View>
+            </Pressable>
+          );
+        }
+        const { latest, watched } = seriesProgress(item.series, progress);
+        const total = item.series.episodes.length;
+        const where = latest >= 0 ? ` · ${item.series.episodes[latest].label}` : '';
         return (
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={item.title}
-            onPress={event => { void rectOf(event.currentTarget).then(from => onOpen(item, from)); }}
-            style={({ pressed }) => [styles.card, { width: (width - space.l * 2 - space.m * (columns - 1)) / columns }, pressed && styles.pressed]}
+            onPress={event => { void rectOf(event.currentTarget).then(from => onOpen(item.series, from)); }}
+            style={({ pressed }) => [styles.card, { width: cardWidth }, pressed && styles.pressed]}
           >
-            <Poster series={item} />
+            <Poster uri={item.series.poster} title={item.title} />
             {watched > 0 && (
               <View style={styles.bar}><View style={[styles.barFill, { width: `${(watched / total) * 100}%` }]} /></View>
             )}
@@ -185,4 +261,9 @@ const styles = StyleSheet.create({
   heroButton: { flexDirection: 'row', alignItems: 'center', gap: space.s, alignSelf: 'flex-start', backgroundColor: colors.accent, borderRadius: radius.pill, paddingHorizontal: 24, paddingVertical: 12, marginTop: space.s },
   heroButtonText: { color: colors.background, fontSize: 17, fontWeight: '700' },
   sectionTitle: { color: colors.text, fontSize: 20, fontWeight: '700' },
+  back: { flexDirection: 'row', alignItems: 'center', gap: 4, alignSelf: 'flex-start', paddingVertical: space.xs },
+  backText: { color: colors.accent, fontSize: 17, fontWeight: '600' },
+  groupTitle: { color: colors.text, fontSize: 28, fontWeight: '800', letterSpacing: -0.3 },
+  badge: { position: 'absolute', top: space.s, right: space.s, backgroundColor: 'rgba(0,0,0,0.72)', borderRadius: radius.pill, paddingHorizontal: 10, paddingVertical: 4 },
+  badgeText: { color: colors.text, fontSize: 12, fontWeight: '700' },
 });

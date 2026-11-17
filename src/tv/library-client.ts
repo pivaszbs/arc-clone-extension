@@ -1,4 +1,5 @@
 import type { VideoThemes } from '../japanese/video-themes';
+import { folderTitle, groupSeasons, nextSeasonOf, seasonLabel, type CatalogEntry, type TitleInfo } from '../../shared/gallery/seasons.ts';
 
 export type Part = keyof VideoThemes;
 export type Progress = { position: number; duration?: number; watchedAt: number; finished: boolean };
@@ -10,6 +11,8 @@ export type TvLibrary = {
   autoSkip?: Partial<Record<Part, boolean>>;
   autoSkipDelay?: number;
   endingAction?: string;
+  /** Full title, franchise and air date from the anime databases (Mac server, series_catalog.py). */
+  catalog?: CatalogEntry | null;
   episodes: TvEpisode[];
 };
 
@@ -101,4 +104,26 @@ export function applyTvSyncEvent(
     }
   }
   return { targetIdx, targetLib, themesUpdated, skipUpdated };
+}
+
+/** What a series is for season grouping; `title` is the download folder name. */
+export function tvTitleInfo(entry: TvLibrary): TitleInfo {
+  const { title, credit } = folderTitle(entry.title);
+  return { title: entry.catalog?.title || title || entry.title, credit, franchise: entry.catalog?.franchise, aired: entry.catalog?.aired };
+}
+
+/** One card per series (all its seasons and translations), holding indexes into the catalog. */
+export function tvTitleGroups(catalog: TvLibrary[]) {
+  return groupSeasons(catalog.map((_, i) => i), i => tvTitleInfo(catalog[i]));
+}
+
+/** How a series is named inside its title group. */
+export function tvSeasonLabel(catalog: TvLibrary[], i: number, withSeason: boolean, seriesTitle: string) {
+  return seasonLabel(tvTitleInfo(catalog[i]), withSeason, seriesTitle);
+}
+
+/** The catalog index of the next season after series `i` (same translation when there), if any. */
+export function tvNextSeason(catalog: TvLibrary[], i: number) {
+  const group = tvTitleGroups(catalog).find(item => item.entries.includes(i));
+  return group ? nextSeasonOf(group.entries, i, j => tvTitleInfo(catalog[j])) : undefined;
 }

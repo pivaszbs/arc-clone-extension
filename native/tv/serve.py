@@ -45,6 +45,7 @@ def tailscale_self():
     return None, None
 from native.tv.queue_store import QueueStore
 from native.tv.replica import Replica
+from native.tv.series_catalog import SeriesCatalog
 
 PROJECT = Path(__file__).resolve().parents[2] / "outputs" / "samsung-tv" / "AnimeStudy"
 ASSETS = {"": ("index.html", "text/html; charset=utf-8"), "tv.css": ("tv.css", "text/css; charset=utf-8"),
@@ -435,6 +436,8 @@ class TVServer(ThreadingHTTPServer):
         self.store.log_event("coordinator_start", data={"resumedJobs": len(self.worker_jobs)})
         # Master-master library state shared with phones (replica.py).
         self.replica = Replica(queue_db or default_queue_path(folder))
+        # Full titles, franchises and air dates for season grouping (series_catalog.py).
+        self.series_catalog = SeriesCatalog(Path(queue_db or default_queue_path(folder)).with_suffix(".series.json"))
         super().__init__(address, TVHandler)
         self._bootstrap_replica()
 
@@ -926,6 +929,9 @@ class TVServer(ThreadingHTTPServer):
                 "saved": ep_saved
             })
         poster = f"{index}/poster" if (folder / "poster.jpg").is_file() or SERIES_ID_RE.search(folder.name) else None
+        series_id = SERIES_ID_RE.search(folder.name)
+        catalog = getattr(self, "series_catalog", None)
+        info = catalog.info(series_id.group(1)) if catalog and series_id else {}
         return {
             "id": hashlib.sha256(str(folder).encode()).hexdigest()[:16],
             "folder": folder.name,
@@ -934,6 +940,8 @@ class TVServer(ThreadingHTTPServer):
             "autoSkip": saved.get("autoSkip", {}),
             "autoSkipDelay": saved.get("autoSkipDelay"),
             "endingAction": saved.get("endingAction", "auto"),
+            # {title, franchise, aired} from the anime databases, once looked up; groups seasons.
+            "catalog": info or None,
             "episodes": result_episodes
         }
 
