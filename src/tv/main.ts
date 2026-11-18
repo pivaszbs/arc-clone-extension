@@ -3,6 +3,7 @@ import { hasJapanese, type Cue } from '../japanese/study';
 import { PhraseStops } from '../japanese/study-player';
 import type { VideoThemes } from '../japanese/video-themes';
 import { tvDiagnostics } from './diagnostics';
+import { createStremioBrowser, type StreamPick } from './stremio';
 import {
   applyTvSyncEvent,
   cleanTitle,
@@ -52,6 +53,7 @@ const skipDelayBtn = element<HTMLButtonElement>('skip-delay-btn');
 const play = element<HTMLButtonElement>('play');
 const allTitlesBtn = element<HTMLButtonElement>('all-titles');
 const change = element('change');
+const moviesBtn = element<HTMLButtonElement>('movies');
 const next = element<HTMLButtonElement>('next');
 const progressBar = element<HTMLProgressElement>('progress');
 const frequencies = [{ label: 'Off', chance: 0 }, { label: 'Occasionally', chance: 0.15 }, { label: 'Often', chance: 0.4 }, { label: 'Every phrase', chance: 1 }];
@@ -95,6 +97,50 @@ let pendingAutoplay = true;
 let loadId = 0;
 let lastSave = 0;
 let lastTvStateSent = 0;
+/** While a Movies & TV stream plays, the anime selection to return to (the player holds a one-video library). */
+let streamReturn: { library: Library | undefined; seriesIndex: number; showingTitles: boolean } | undefined;
+let streamTitle = '';
+const stremio = createStremioBrowser({
+  list,
+  heading: element('title'),
+  status: libraryStatus,
+  form: element<HTMLFormElement>('stremio-search'),
+  typeButton: element<HTMLButtonElement>('stremio-type'),
+  query: element<HTMLInputElement>('stremio-query'),
+  base: () => base,
+  progress: id => {
+    try { return (JSON.parse(stored(`tv:stremio:${id}:video`) || 'null') as Progress | null) ?? undefined; } catch { return undefined; }
+  },
+  play: playStream,
+  log: line => diagnostics.log(line)
+});
+
+function episodeLabel(episode: Episode) {
+  return streamReturn ? streamTitle : episodeTitle(episode.name);
+}
+
+/** Play a torrent picked in Movies & TV in the regular player, as a library of one video. */
+function playStream(pick: StreamPick) {
+  if (!streamReturn) streamReturn = { library, seriesIndex, showingTitles };
+  streamTitle = pick.label;
+  library = { id: `stremio:${pick.id}`, title: pick.title, episodes: [{ name: 'video', video: pick.path, subtitles: null }] };
+  void openEpisode(0, false, true);
+}
+
+function enterMovies() {
+  allTitlesBtn.hidden = change.hidden = true;
+  connectForm.hidden = true;
+  moviesBtn.textContent = '← Anime';
+  stremio.open();
+}
+
+function leaveMovies() {
+  stremio.close();
+  moviesBtn.textContent = 'Movies & TV';
+  change.hidden = false;
+  if (catalog.length > 1) showTitles();
+  else if (library) selectSeries(seriesIndex);
+}
 
 function sendTvState(force = false) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -106,11 +152,11 @@ function sendTvState(force = false) {
     ? {
         type: 'tv_state',
         active: true,
-        series: seriesIndex,
+        ...(streamReturn ? {} : { series: seriesIndex }),
         seriesName: library.title,
         seriesLabel: cleanTitle(library.title),
         episode: ep.name,
-        episodeLabel: episodeTitle(ep.name),
+        episodeLabel: episodeLabel(ep),
         paused: video.paused,
         position: Number.isFinite(video.currentTime) ? video.currentTime : 0,
         duration: Number.isFinite(video.duration) ? video.duration : 0,
@@ -156,6 +202,10 @@ function handleBackAction(): boolean {
     closeEpisode();
     return true;
   }
+  if (stremio.active) {
+    if (!stremio.back()) leaveMovies();
+    return true;
+  }
   if (showingTitles && openTitle) {
     openTitle = undefined;
     renderTitles();
@@ -193,6 +243,8 @@ function handleMenuAction() {
     } else {
       hideControls();
     }
+  } else if (stremio.active) {
+    stremio.show();
   } else if (catalog.length > 1 && !showingTitles) {
     showTitles();
   } else {
@@ -204,6 +256,8 @@ function handleTvControl(msg: TvSyncMessage) {
   const action = msg.action;
   if (!action) return;
   if (action === 'playEpisode') {
+    if (streamReturn) closeEpisode();
+    if (stremio.active) leaveMovies();
     const targetSeries = typeof msg.series === 'number'
       ? msg.series
       : typeof msg.seriesName === 'string'
@@ -322,7 +376,7 @@ function getProgress(episode: Episode, lib = library): Progress | undefined {
 }
 
 function syncToServer(payload: Record<string, unknown>) {
-  if (!base) return;
+  if (!base || streamReturn) return; // Movies & TV progress stays on the TV
   void fetch(`${base}sync`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -394,6 +448,7 @@ function latestEpisodeText(entry: Library) {
 function renderTitles() {
   list.textContent = '';
   list.classList.add('titles-grid');
+  list.classList.remove('streams-grid');
   showingTitles = true;
   allTitlesBtn.hidden = true;
   const groups = tvTitleGroups(catalog);
@@ -434,6 +489,7 @@ function showTitles() {
 
 /** After the last episode of a season, the next season (same translation when there) carries on. */
 function nextSeasonIndex() {
+  if (streamReturn) return undefined;
   return library && index + 1 >= library.episodes.length ? tvNextSeason(catalog, seriesIndex) : undefined;
 }
 
@@ -453,7 +509,7 @@ function renderLibrary() {
     return;
   }
   list.textContent = '';
-  list.classList.remove('titles-grid');
+  list.classList.remove('titles-grid', 'streams-grid');
   if (!library) return;
   allTitlesBtn.hidden = catalog.length <= 1;
   const episodes = library.episodes;
@@ -503,9 +559,9 @@ function openWebSocket(url: string) {
         if (matchesSeries && typeof msg.done === 'number' && typeof msg.total === 'number' && msg.total > 0) {
           if (msg.done < msg.total) {
             scanWasActive = true;
-            if (player.hidden) libraryStatus.textContent = `Scanning intros on Mac: ${msg.done}/${msg.total}`;
+            if (player.hidden && !stremio.active) libraryStatus.textContent = `Scanning intros on Mac: ${msg.done}/${msg.total}`;
           } else {
-            if (player.hidden) libraryStatus.textContent = '';
+            if (player.hidden && !stremio.active) libraryStatus.textContent = '';
             if (scanWasActive && !player.hidden) flashOsd('Intro scan complete');
             scanWasActive = false;
           }
@@ -536,7 +592,7 @@ function openWebSocket(url: string) {
           flashOsd('Skip timings updated');
         }
         if (applied.skipUpdated) renderSkipSettings();
-      } else if (player.hidden && library && !showingTitles) {
+      } else if (player.hidden && library && !showingTitles && !stremio.active) {
         renderLibrary();
       }
     } catch { /* Ignore malformed WebSocket frames. */ }
@@ -571,6 +627,7 @@ async function connect(input: string) {
     openWebSocket(url);
     connectForm.hidden = true;
     change.hidden = false;
+    moviesBtn.hidden = false;
     libraryStatus.textContent = '';
     let bestSeries = -1;
     let bestEpisode = -1;
@@ -762,7 +819,7 @@ function status(text: string) {
 async function startPlayback() {
   try { await video.play(); } catch (error) {
     diagnostics.log(error instanceof DOMException ? `Play rejected: ${error.name}` : 'Play rejected');
-    if (video.error) status('This file could not be played. Try an H.264/AAC MP4.');
+    if (video.error) status(playbackError());
     else showControls();
   }
 }
@@ -903,11 +960,12 @@ async function openEpisode(position: number, previousFinished = false, autoplay 
   player.hidden = false;
   next.disabled = index + 1 >= (library?.episodes.length || 0) && nextSeasonIndex() === undefined;
   element('series-badge').textContent = library ? cleanTitle(library.title) : '';
-  element('episode-title').textContent = episodeTitle(episode.name);
+  element('episode-title').textContent = episodeLabel(episode);
+  learn.hidden = skipMenuBtn.hidden = Boolean(streamReturn);
   renderSegmentMarkers();
   renderSkipSettings();
   hideControls();
-  status('Loading episode…');
+  status(streamReturn ? 'Connecting to peers… a torrent can take up to a minute to start.' : 'Loading episode…');
   syncLearning();
   play.focus();
   sendTvState(true);
@@ -942,7 +1000,11 @@ function closeEpisode() {
   video.load();
   player.hidden = true;
   libraryScreen.hidden = false;
-  renderLibrary();
+  if (streamReturn) {
+    ({ library, seriesIndex, showingTitles } = streamReturn);
+    streamReturn = undefined;
+    stremio.show();
+  } else renderLibrary();
   sendTvState(true);
 }
 
@@ -964,7 +1026,12 @@ video.addEventListener('loadedmetadata', () => {
   else syncPauseCircle();
   sendTvState(true);
 });
-video.addEventListener('error', () => status('This file could not be played. Try an H.264/AAC MP4.'));
+function playbackError() {
+  return streamReturn
+    ? 'This stream could not be played. Go back to Episodes and pick another one; 1080p x264 files play best. Is the Stremio app running on the Mac?'
+    : 'This file could not be played. Try an H.264/AAC MP4.';
+}
+video.addEventListener('error', () => status(playbackError()));
 video.addEventListener('timeupdate', updatePlayback);
 video.addEventListener('seeking', () => { stops.reset(); lastTime = video.currentTime; skipElapsed = 0; });
 video.addEventListener('seeked', () => { updatePlayback(); sendTvState(true); });
@@ -1051,6 +1118,7 @@ allTitlesBtn.addEventListener('click', () => {
   if (showingTitles) renderTitles(); else showTitles();
 });
 change.addEventListener('click', () => { connectForm.hidden = false; address.focus(); });
+moviesBtn.addEventListener('click', () => { if (stremio.active) leaveMovies(); else enterMovies(); });
 player.addEventListener('pointermove', showControls);
 
 function moveFocus(key: number) {

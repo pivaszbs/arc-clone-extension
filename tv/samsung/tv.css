@@ -5,6 +5,8 @@ main { max-width: 1720px; margin: auto; padding: 5vh 6vw; }
 header { display: flex; align-items: center; border-bottom: 1px solid #2b2930; padding-bottom: 2vh; }
 header img { width: 2.2em; height: 2.2em; margin-right: 0.8em; border-radius: 0.3em; }
 #library-diagnostics { margin-left: auto; }
+#stremio-search { display: flex; gap: 0.5em; align-items: center; padding: 2vh 0 0; }
+#stremio-search input { width: auto; flex: 1; max-width: 24em; margin: 0; }
 h1 { font-size: 1.6em; margin: 0; font-weight: 700; letter-spacing: -0.02em; }
 form { padding: 4vh 0 1vh; }
 label { display: block; margin-bottom: 0.65em; color: #cbc5c1; }
@@ -25,6 +27,9 @@ ol button.title-card:focus small { color: #ffad88; }
 .title-meta { padding: 0.65em 0.8em; width: 100%; }
 .title-name { display: block; font-weight: 600; line-height: 1.25; }
 ol small { display: block; margin-top: 0.25em; color: #d8b6a9; font-size: 0.8em; }
+ol > li { min-width: 0; }
+ol small { overflow-wrap: anywhere; }
+ol.streams-grid { grid-template-columns: repeat(2, 1fr); }
 ol button:focus small { color: #2a140c; }
 
 #player, video { position: fixed; inset: 0; top: 0; left: 0; width: 100%; height: 100%; background: #000; }

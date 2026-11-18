@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http: ws:; img-src 'self' http:; media-src 'self' http:; object-src 'none'; base-uri 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http: ws:; img-src 'self' http: https:; media-src 'self' http:; object-src 'none'; base-uri 'none'">
   <title>Anime Study</title>
   <link rel="stylesheet" href="tv.css">
   <script defer src="tv.js"></script>
@@ -21,7 +21,13 @@
     <div class="library-bar">
       <button id="all-titles" hidden>← All titles</button>
       <button id="change" hidden>Change library</button>
+      <button id="movies" hidden>Movies &amp; TV</button>
     </div>
+    <form id="stremio-search" hidden>
+      <button type="button" id="stremio-type">Movies</button>
+      <input id="stremio-query" type="search" placeholder="Search movies and series" autocomplete="off" aria-label="Search movies and series">
+      <button>Search</button>
+    </form>
     <ol id="episodes" aria-label="Episodes"></ol>
   </main>
   <section id="player" hidden aria-label="Episode player">

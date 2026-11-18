@@ -151,3 +151,15 @@ Either extension can run independently. On macOS, run `npm run install:desktop-p
 Run `npm run mac:up` on the Mac. It starts the library server and the OP/ED worker. The URL token comes from `ANIME_STUDY_TOKEN` or `~/Library/Application Support/AnimeStudy/token`, and it is never stored in the repo. The server answers on the home network and, when Tailscale is running, on the Mac's Tailscale name. Only this Mac, private networks and Tailscale devices (100.64.0.0/10) are accepted. `catalog.json` lists every address. The phone remembers them and switches automatically when one stops answering. The TV uses the home network address because Tizen cannot run Tailscale.
 
 Progress, skip timings and auto-skip choices sync master-master through `shared/sync/replica-core.ts`, mirroring `native/tv/replica.py`. The phone keeps that state in a file and Chrome keeps it in `localStorage`. Changes are saved locally first and sent when the Mac answers. The newest change wins. On the phone or iPad, a series from the Mac has Download buttons (per episode, or all at once) that copy episodes to the device over the home network, so they play from Local Files without the Mac. Its Download tab sends an Anime365 series to the Mac, where Chrome downloads it into the library.
+
+### Movies & TV on the Samsung TV (Stremio + Torrentio)
+
+The TV app's **Movies & TV** button plays films and series that aren't anime, using Stremio's open add-on protocol. The Mac server (`native/tv/stremio.py`) relays all of it, so the TV never contacts these services directly and the token and private-network checks still apply:
+
+- **Cinemeta**, Stremio's catalog, provides search, popular titles, posters and episode lists.
+- **Torrentio** lists torrents for the chosen movie or episode. 1080p comes first, then 720p, then 4K, each sorted by seeders. Formats a Samsung TV usually can't play (DTS, TrueHD, AV1, Dolby Vision without HDR10, cam rips) are listed last and marked *may not play on TV*.
+- The **Stremio app's streaming server** on the Mac (`127.0.0.1:11470`) downloads the torrent and streams it. The Mac server forwards the video, with seeking, at `stremio/play/<hash>/<file>`.
+
+Set up: install and open the [Stremio desktop app](https://www.stremio.com/downloads) on the Mac and leave it running (it starts the streaming server), then run `npm run mac:up` as usual. To use your own Torrentio settings (providers, quality filter, a debrid service), set `ANIME_STUDY_TORRENTIO` to the configured address from torrentio.strem.fun/configure, without `/manifest.json`.
+
+On the TV, Movies & TV starts with popular titles. **Movies / Series** switches the type. Type a name and choose **Search**. Series open to seasons, then episodes, then the list of streams. A torrent can take up to a minute to start. If a stream fails, go back and pick another; 1080p x264 files start fastest. Resume positions are kept on the TV only; Learn, subtitles, auto-skip and Next episode aren't available for these streams yet. Torrents download from, and upload to, other peers from the Mac's internet connection, so only play what you're allowed to.

@@ -14,7 +14,8 @@ import shutil
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.error import URLError
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 from native.cast.airplay import lan_address
@@ -46,6 +47,7 @@ def tailscale_self():
 from native.tv.queue_store import QueueStore
 from native.tv.replica import Replica
 from native.tv.series_catalog import SeriesCatalog
+from native.tv.stremio import Stremio
 
 PROJECT = Path(__file__).resolve().parents[2] / "outputs" / "samsung-tv" / "AnimeStudy"
 ASSETS = {"": ("index.html", "text/html; charset=utf-8"), "tv.css": ("tv.css", "text/css; charset=utf-8"),
@@ -60,6 +62,7 @@ def default_queue_path(folder):
     return QUEUE_DIR / f"queue-{digest}.sqlite3"
 MEDIA_PATH = re.compile(r"(?:(\d+)/)?(\d+)/(video|subtitles)")
 POSTER_PATH = re.compile(r"(\d+)/poster")
+STREMIO_PLAY = re.compile(r"stremio/play/([a-f0-9]{40})/(-1|\d{1,5})")
 WS_SEND_TIMEOUT_SECONDS = 5
 SERIES_ID_RE = re.compile(r"\s-\s(\d+)(?:\s-\s|$)")
 
@@ -141,6 +144,8 @@ class TVHandler(BaseHTTPRequestHandler):
             label = ASSETS[resource][0]
         elif resource in ("library.json", "catalog.json", "status.json", "sync", "worker/status", "worker/claim", "worker/progress", "worker/complete", "worker/retry", "replica/sync") or (resource and MEDIA_PATH.fullmatch(resource)):
             label = resource
+        elif resource and resource.startswith("stremio/"):
+            label = "stremio/play" if resource.startswith("stremio/play/") else resource.split("?", 1)[0]
         else:
             label = "unknown resource"
         method = self.command if self.command in ("GET", "HEAD", "POST") else "unsupported method"
@@ -315,6 +320,8 @@ class TVHandler(BaseHTTPRequestHandler):
         if not path.startswith(prefix):
             return self.send_error(404)
         resource = path[len(prefix):]
+        if resource.startswith("stremio/"):
+            return self.serve_stremio(resource)
         try:
             if resource in ("library.json", "catalog.json", "status.json"):
                 payload = (self.server.library(0) if resource == "library.json"
@@ -347,6 +354,57 @@ class TVHandler(BaseHTTPRequestHandler):
             self.send_error(404)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def serve_stremio(self, resource):
+        """Movies and TV: Cinemeta titles, Torrentio streams, and video from the Stremio server."""
+        query = {key: values[0] for key, values in parse_qs(urlsplit(self.path).query).items()}
+        stremio = self.server.stremio
+        if play := STREMIO_PLAY.fullmatch(resource):
+            return self.relay_stream(play.group(1), int(play.group(2)))
+        try:
+            if resource == "stremio/status.json":
+                payload = stremio.status()
+            elif resource == "stremio/search.json":
+                payload = stremio.search(query.get("type", "movie"), query.get("q", ""))
+            elif resource == "stremio/meta.json":
+                payload = stremio.meta(query.get("type", ""), query.get("id", ""))
+            elif resource == "stremio/streams.json":
+                payload = stremio.streams(query.get("type", ""), query.get("id", ""))
+            else:
+                return self.send_error(404)
+        except ValueError:
+            return self._send_json({"error": "Unsupported title."}, code=400)
+        except (URLError, OSError):
+            return self._send_json({"error": "The catalog or Torrentio did not answer. Try again."}, code=502)
+        self._send_json(payload)
+
+    def relay_stream(self, info_hash, file_idx):
+        try:
+            upstream = self.server.stremio.open_stream(info_hash, file_idx, self.command, self.headers.get("Range"))
+        except (URLError, OSError):
+            return self._send_json({"error": "Start the Stremio app on the Mac to play torrents."}, code=503)
+        except ValueError:
+            return self.send_error(404)
+        with upstream:
+            headers = {key: upstream.headers[key] for key in ("Content-Range", "Accept-Ranges") if upstream.headers.get(key)}
+            length = upstream.headers.get("Content-Length")
+            content_type = upstream.headers.get("Content-Type") or "video/mp4"
+            self.send_response(upstream.status)
+            self.send_header("Content-Type", content_type)
+            if length:
+                self.send_header("Content-Length", length)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != "GET":
+                return
+            try:
+                while chunk := upstream.read(256 * 1024):
+                    self.wfile.write(chunk)
+            except OSError:
+                pass  # the TV closed the connection (seeking) or the torrent stalled
 
     def send_file(self, file, content_type):
         with file.open("rb") as source:
@@ -437,6 +495,7 @@ class TVServer(ThreadingHTTPServer):
         # Master-master library state shared with phones (replica.py).
         self.replica = Replica(queue_db or default_queue_path(folder))
         # Full titles, franchises and air dates for season grouping (series_catalog.py).
+        self.stremio = Stremio()
         self.series_catalog = SeriesCatalog(Path(queue_db or default_queue_path(folder)).with_suffix(".series.json"))
         super().__init__(address, TVHandler)
         self._bootstrap_replica()
