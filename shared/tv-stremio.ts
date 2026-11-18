@@ -14,7 +14,72 @@ export type StreamOption = {
   seeders: number | null;
   size: string | null;
   risky: boolean;
+  /** Torrentio's release group: the next episode from the same group plays the same way. */
+  bingeGroup?: string | null;
 };
+
+/** What the Mac remembers about a watched movie or episode (native/tv/movie_history.py). */
+export type HistoryEntry = {
+  id: string;
+  showId: string;
+  type: StremioType;
+  title: string;
+  label: string;
+  poster: string | null;
+  path: string;
+  bingeGroup: string | null;
+  position: number;
+  duration: number | null;
+  finished: boolean;
+  watchedAt: number;
+};
+
+/** A Movies & TV job saving a stream into the Mac library (native/tv/movie_library.py). */
+export type SaveJob = {
+  id: string;
+  type: StremioType;
+  itemId: string;
+  name: string;
+  year?: string;
+  season?: number;
+  episode?: number;
+  episodeName?: string;
+  quality?: string;
+  state: 'queued' | 'downloading' | 'converting' | 'done' | 'failed';
+  fraction?: number;
+  error?: string | null;
+  folder?: string;
+};
+
+export function nextPath(id: string, group?: string | null) {
+  return `stremio/next.json?id=${encodeURIComponent(id)}${group ? `&group=${encodeURIComponent(group)}` : ''}`;
+}
+
+function clock(seconds: number) {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}` : `${m}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** How a Continue watching entry reads: "S01E03 · 12:30 left", "Next episode", "Resume at 1:02:10". */
+export function continueLabel(entry: HistoryEntry) {
+  const code = entry.type === 'series' ? entry.label.split(' · ')[0] : '';
+  const where = entry.finished ? 'Next episode'
+    : entry.duration && entry.duration - entry.position > 60 ? `${clock(entry.duration - entry.position)} left`
+      : `Resume at ${clock(entry.position)}`;
+  return [code, where].filter(Boolean).join(' · ');
+}
+
+/** What a stream save is doing, for a progress line. */
+export function saveJobLabel(job: SaveJob) {
+  const name = job.type === 'series' && job.season !== undefined && job.episode !== undefined
+    ? `${job.name} · ${episodeCode({ season: job.season, episode: job.episode })}` : job.name;
+  const state = job.state === 'downloading' ? `Downloading ${Math.round((job.fraction || 0) * 100)}%`
+    : job.state === 'converting' ? 'Converting for the phone and TV'
+      : job.state === 'done' ? 'Saved in the library' : job.state === 'failed' ? (job.error || 'Failed') : 'Waiting';
+  return { name, state };
+}
 
 /** Server-relative address of a search (empty query: popular titles). */
 export function searchPath(type: StremioType, query: string) {

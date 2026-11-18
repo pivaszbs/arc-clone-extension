@@ -1,6 +1,7 @@
 /** The Movies & TV screens of the Samsung app: search, seasons, episodes and torrent streams. */
 import type { Progress } from './library-client';
 import {
+  continueLabel,
   episodeCode,
   metaPath,
   playPath,
@@ -9,6 +10,7 @@ import {
   seasonsOf,
   streamLabel,
   streamsPath,
+  type HistoryEntry,
   type SeriesMeta,
   type StreamOption,
   type StremioEpisode,
@@ -16,7 +18,7 @@ import {
   type TitleCard
 } from '../../shared/tv-stremio';
 
-export type StreamPick = { id: string; title: string; label: string; path: string };
+export type StreamPick = { id: string; title: string; label: string; path: string; poster?: string | null; bingeGroup?: string | null };
 
 type View =
   | { kind: 'home' }
@@ -34,6 +36,8 @@ type Options = {
   base: () => string;
   progress: (id: string) => Progress | undefined;
   play: (pick: StreamPick) => void;
+  /** Continue a series whose last watched episode is finished: find and play the next one. */
+  playNext: (entry: HistoryEntry) => void;
   log: (line: string) => void;
 };
 
@@ -145,6 +149,19 @@ export function createStremioBrowser(options: Options) {
         }
       }
       if (!results.length) status.textContent = 'Nothing found. Try another name, or switch between Movies and Series.';
+      // Continue watching comes first on the start screen (not on search results).
+      if (!query.value.trim()) {
+        try {
+          const history = await load<{ continue?: HistoryEntry[] }>('stremio/history.json');
+          if (id !== request) return;
+          for (const entry of (history.continue || []).slice(0, 8)) {
+            button(entry.title, `Continue · ${continueLabel(entry)}`, () => {
+              if (entry.finished && entry.type === 'series') options.playNext(entry);
+              else options.play({ id: entry.id, title: entry.title, label: entry.label, path: entry.path, poster: entry.poster, bingeGroup: entry.bingeGroup });
+            }, entry.poster);
+          }
+        } catch { /* Popular titles still show without history. */ }
+      }
       for (const card of results) {
         button(card.name, [card.year, resumeText(card.id)].filter(Boolean).join(' · '), () => openTitle(card), card.poster);
       }
@@ -201,7 +218,9 @@ export function createStremioBrowser(options: Options) {
     const progressId = view.episode?.id || view.card.id;
     for (const stream of view.streams) {
       const text = streamLabel(stream);
-      button(text.main, text.info, () => options.play({ id: progressId, title: view.card.name, label, path: playPath(stream) }));
+      button(text.main, text.info, () => options.play({
+        id: progressId, title: view.card.name, label, path: playPath(stream), poster: view.card.poster, bingeGroup: stream.bingeGroup
+      }));
     }
     focusList();
   }

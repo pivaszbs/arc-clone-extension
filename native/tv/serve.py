@@ -49,6 +49,8 @@ from native.tv.replica import Replica
 from native.tv.series_catalog import SeriesCatalog
 from native.tv.stremio import Stremio
 from native.tv.samsung_remote import SamsungRemote
+from native.tv.movie_history import MovieHistory
+from native.tv.movie_library import MovieLibrary, sidecar_info
 
 PROJECT = Path(__file__).resolve().parents[2] / "outputs" / "samsung-tv" / "AnimeStudy"
 ASSETS = {"": ("index.html", "text/html; charset=utf-8"), "tv.css": ("tv.css", "text/css; charset=utf-8"),
@@ -308,6 +310,27 @@ class TVHandler(BaseHTTPRequestHandler):
                 if body is None:
                     return self.send_error(400)
                 self._send_json(self.server.update_download(body))
+            elif resource == "stremio/progress":
+                body = self._read_json_body(8192)
+                if body is None:
+                    return self.send_error(400)
+                self._send_json({"entry": self.server.movie_history.record(body)})
+            elif resource == "stremio/save":
+                body = self._read_json_body(8192)
+                if body is None:
+                    return self.send_error(400)
+                self._send_json({"job": self.server.movie_library.add(body)})
+            elif resource == "stremio/save-season":
+                body = self._read_json_body(4096)
+                if body is None:
+                    return self.send_error(400)
+                self._send_json({"episodes": self.server.save_season(body)})
+            elif resource in ("stremio/downloads/cancel", "stremio/downloads/retry"):
+                body = self._read_json_body(1024)
+                if body is None or not isinstance(body.get("id"), str):
+                    return self.send_error(400)
+                act = self.server.movie_library.cancel if resource.endswith("cancel") else self.server.movie_library.retry
+                self._send_json({"ok": act(body["id"])})
             elif resource == "tv/play":
                 body = self._read_json_body(8192)
                 if body is None:
@@ -389,6 +412,12 @@ class TVHandler(BaseHTTPRequestHandler):
                 payload = stremio.meta(query.get("type", ""), query.get("id", ""))
             elif resource == "stremio/streams.json":
                 payload = stremio.streams(query.get("type", ""), query.get("id", ""))
+            elif resource == "stremio/next.json":
+                payload = stremio.next_episode(query.get("id", ""), query.get("group") or None)
+            elif resource == "stremio/history.json":
+                payload = self.server.movie_history.listing()
+            elif resource == "stremio/downloads.json":
+                payload = self.server.movie_library.listing()
             else:
                 return self.send_error(404)
         except ValueError:
@@ -518,6 +547,8 @@ class TVServer(ThreadingHTTPServer):
         self.replica = Replica(queue_db or default_queue_path(folder))
         # Full titles, franchises and air dates for season grouping (series_catalog.py).
         self.stremio = Stremio()
+        self.movie_history = MovieHistory(QUEUE_DIR / "movie-history.json")
+        self.movie_library = MovieLibrary(folder, QUEUE_DIR / "movie-downloads.json", on_change=self.broadcast)
         self.series_catalog = SeriesCatalog(Path(queue_db or default_queue_path(folder)).with_suffix(".series.json"))
         super().__init__(address, TVHandler)
         self._bootstrap_replica()
@@ -598,8 +629,9 @@ class TVServer(ThreadingHTTPServer):
         path, item_id = stream.get("path"), stream.get("id")
         if not isinstance(path, str) or not STREAM_PATH.fullmatch(path) or not isinstance(item_id, str) or len(item_id) > 64:
             raise ValueError("bad stream")
+        poster = stream.get("poster") if isinstance(stream.get("poster"), str) and stream["poster"].startswith("https://") else None
         command = {"type": "tv_control", "action": "playStream", "stream": {
-            "id": item_id, "path": path,
+            "id": item_id, "path": path, "poster": poster, "bingeGroup": str(stream.get("bingeGroup") or "")[:200] or None,
             "title": str(stream.get("title") or "Movies & TV")[:200], "label": str(stream.get("label") or "")[:200]}}
         app_open = self.tv_app_open()
         with self.ws_lock:
@@ -628,6 +660,37 @@ class TVServer(ThreadingHTTPServer):
             if cleared:
                 self.broadcast(cleared)
         return app and on
+
+    def save_season(self, body):
+        """Queue every episode of a season for saving, one release group for all when it has them.
+        Returns how many episodes will be looked up; streams are found in the background."""
+        show = str(body.get("showId") or "")
+        season = body.get("season")
+        if not re.fullmatch(r"tt\d{1,10}", show) or not isinstance(season, int) or not 0 <= season < 1000:
+            raise ValueError("bad season")
+        episodes = [ep for ep in self.stremio.meta("series", show)["episodes"] if ep["season"] == season]
+        item = {"type": "series", "showId": show, "name": str(body.get("name") or show)[:200],
+                "year": str(body.get("year") or "")[:12], "poster": body.get("poster") if isinstance(body.get("poster"), str) else None}
+
+        def queue():
+            group = None
+            for ep in episodes:
+                try:
+                    streams = self.stremio.streams("series", ep["id"])["streams"]
+                except (OSError, ValueError):
+                    continue
+                pick = next((x for x in streams if group and x.get("bingeGroup") == group), None) or next(
+                    (x for x in streams if not x["risky"]), None)
+                if not pick:
+                    continue
+                group = group or pick.get("bingeGroup")
+                try:
+                    self.movie_library.add({"stream": pick, "item": {**item, "id": ep["id"], "season": ep["season"],
+                                                                      "episode": ep["episode"], "episodeName": ep["name"]}})
+                except ValueError:
+                    pass
+        threading.Thread(target=queue, daemon=True).start()
+        return len(episodes)
 
     def tv_device(self):
         info = self.samsung.device_info()
@@ -1087,7 +1150,7 @@ class TVServer(ThreadingHTTPServer):
         poster = f"{index}/poster" if (folder / "poster.jpg").is_file() or SERIES_ID_RE.search(folder.name) else None
         series_id = SERIES_ID_RE.search(folder.name)
         catalog = getattr(self, "series_catalog", None)
-        info = catalog.info(series_id.group(1)) if catalog and series_id else {}
+        info = catalog.info(series_id.group(1)) if catalog and series_id else sidecar_info(folder)
         return {
             "id": hashlib.sha256(str(folder).encode()).hexdigest()[:16],
             "folder": folder.name,

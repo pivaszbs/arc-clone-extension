@@ -36,7 +36,7 @@ export type TvSyncMessage = {
   text?: string;
   submit?: boolean;
   /** `playStream`: a Movies & TV stream picked on the phone. */
-  stream?: { id?: unknown; title?: unknown; label?: unknown; path?: unknown };
+  stream?: { id?: unknown; title?: unknown; label?: unknown; path?: unknown; poster?: unknown; bingeGroup?: unknown };
 };
 
 /** Validate and normalize a private LAN Anime Study TV server URL. */

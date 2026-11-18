@@ -3,6 +3,7 @@ import { hasJapanese, type Cue } from '../japanese/study';
 import { PhraseStops } from '../japanese/study-player';
 import type { VideoThemes } from '../japanese/video-themes';
 import { tvDiagnostics } from './diagnostics';
+import { episodeCode, nextPath, playPath, type HistoryEntry, type StreamOption, type StremioEpisode } from '../../shared/tv-stremio';
 import { createStremioBrowser, type StreamPick } from './stremio';
 import {
   applyTvSyncEvent,
@@ -100,6 +101,8 @@ let lastTvStateSent = 0;
 /** While a Movies & TV stream plays, the anime selection to return to (the player holds a one-video library). */
 let streamReturn: { library: Library | undefined; seriesIndex: number; showingTitles: boolean } | undefined;
 let streamTitle = '';
+/** The Movies & TV stream playing (or last played), for progress reports and the next episode. */
+let streamPick: StreamPick | undefined;
 const stremio = createStremioBrowser({
   list,
   heading: element('title'),
@@ -112,6 +115,10 @@ const stremio = createStremioBrowser({
     try { return (JSON.parse(stored(`tv:stremio:${id}:video`) || 'null') as Progress | null) ?? undefined; } catch { return undefined; }
   },
   play: playStream,
+  playNext: entry => {
+    streamPick = { id: entry.id, title: entry.title, label: entry.label, path: entry.path, poster: entry.poster, bingeGroup: entry.bingeGroup };
+    void playNextStream();
+  },
   log: line => diagnostics.log(line)
 });
 
@@ -121,10 +128,69 @@ function episodeLabel(episode: Episode) {
 
 /** Play a torrent picked in Movies & TV in the regular player, as a library of one video. */
 function playStream(pick: StreamPick) {
+  const switching = !player.hidden;
+  if (switching) saveProgress();
   if (!streamReturn) streamReturn = { library, seriesIndex, showingTitles };
   streamTitle = pick.label;
+  streamPick = pick;
   library = { id: `stremio:${pick.id}`, title: pick.title, episodes: [{ name: 'video', video: pick.path, subtitles: null }] };
-  void openEpisode(0, false, true);
+  const request = ++streamRequest;
+  void resumeFromMac(pick.id).then(() => {
+    // previousFinished: the old video's progress is already saved under its own key.
+    if (request === streamRequest) void openEpisode(0, true, true);
+  });
+}
+let streamRequest = 0;
+
+/** The Mac's resume point when it is newer than this TV's (watched elsewhere, or reinstalled). */
+async function resumeFromMac(id: string) {
+  try {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 2500);
+    const response = await fetch(`${base}stremio/history.json`, { signal: controller.signal });
+    window.clearTimeout(timer);
+    const body = await response.json() as { items?: HistoryEntry[] };
+    const remote = (body.items || []).find(item => item.id === id);
+    const key = `tv:stremio:${id}:video`;
+    const local = JSON.parse(stored(key) || 'null') as Progress | null;
+    if (remote && (!local || remote.watchedAt > local.watchedAt)) {
+      save(key, JSON.stringify({ position: remote.position, duration: remote.duration ?? undefined, watchedAt: remote.watchedAt, finished: remote.finished }));
+    }
+  } catch { /* Resume from this TV's own record. */ }
+}
+
+/** Tell the Mac how far this stream got, so the phone and the TV list it under Continue watching. */
+function reportStreamProgress(progress: Progress) {
+  if (!streamPick || !base) return;
+  void fetch(`${base}stremio/progress`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...streamPick, ...progress })
+  }).catch(() => { /* The TV keeps its own copy. */ });
+}
+
+/** After an episode: the next one, from the same release group when the Mac can find it. */
+async function playNextStream() {
+  const pick = streamPick;
+  if (!pick || !pick.id.includes(':')) return false;
+  flashOsd('Finding the next episode…');
+  try {
+    const response = await fetch(base + nextPath(pick.id, pick.bingeGroup));
+    const body = await response.json() as { episode?: StremioEpisode; stream?: StreamOption };
+    if (!body.episode || !body.stream) {
+      flashOsd(body.episode ? 'No stream for the next episode' : 'That was the last episode');
+      return false;
+    }
+    if (pick !== streamPick) return false;
+    playStream({
+      id: body.episode.id, title: pick.title, label: `${episodeCode(body.episode)} · ${body.episode.name}`,
+      path: playPath(body.stream), poster: pick.poster, bingeGroup: body.stream.bingeGroup || pick.bingeGroup
+    });
+    return true;
+  } catch {
+    flashOsd('Could not reach the Mac for the next episode');
+    return false;
+  }
 }
 
 /** Text typed on the phone: into the focused field, otherwise a Movies & TV search. */
@@ -317,7 +383,11 @@ function handleTvControl(msg: TvSyncMessage) {
     if (typeof id !== 'string' || typeof path !== 'string' || !/^stremio\/play\/[a-f0-9]{40}\/(?:-1|\d{1,5})$/.test(path)) return;
     if (!player.hidden) closeEpisode();
     if (!stremio.active) enterMovies();
-    playStream({ id, path, title: typeof title === 'string' ? title : 'Movies & TV', label: typeof label === 'string' ? label : '' });
+    const { poster, bingeGroup } = msg.stream;
+    playStream({
+      id, path, title: typeof title === 'string' ? title : 'Movies & TV', label: typeof label === 'string' ? label : '',
+      poster: typeof poster === 'string' ? poster : null, bingeGroup: typeof bingeGroup === 'string' ? bingeGroup : null
+    });
     return;
   }
   if (player.hidden) return;
@@ -359,7 +429,8 @@ function handleTvControl(msg: TvSyncMessage) {
       sendTvState(true);
     }
   } else if (action === 'next') {
-    if (library && index + 1 < library.episodes.length) void openEpisode(index + 1, false, true);
+    if (streamReturn) void playNextStream();
+    else if (library && index + 1 < library.episodes.length) void openEpisode(index + 1, false, true);
     else playNextSeason(false, true);
   } else if (action === 'prev') {
     if (library && index > 0) void openEpisode(index - 1, false, true);
@@ -423,6 +494,7 @@ function saveProgress(finished = false) {
   save(progressKey(episode), JSON.stringify(progress));
   episode.saved = { ...(episode.saved || {}), progress };
   syncToServer({ episode: episode.name, progress });
+  if (streamReturn) reportStreamProgress(progress);
   lastSave = Date.now();
 }
 
@@ -989,7 +1061,8 @@ async function openEpisode(position: number, previousFinished = false, autoplay 
   element('clock').textContent = '';
   libraryScreen.hidden = true;
   player.hidden = false;
-  next.disabled = index + 1 >= (library?.episodes.length || 0) && nextSeasonIndex() === undefined;
+  next.disabled = streamReturn ? !streamPick?.id.includes(':')
+    : index + 1 >= (library?.episodes.length || 0) && nextSeasonIndex() === undefined;
   element('series-badge').textContent = library ? cleanTitle(library.title) : '';
   element('episode-title').textContent = episodeLabel(episode);
   learn.hidden = skipMenuBtn.hidden = Boolean(streamReturn);
@@ -1070,6 +1143,11 @@ video.addEventListener('play', () => { play.textContent = 'Pause'; syncPauseCirc
 video.addEventListener('pause', () => { play.textContent = 'Play'; if (ready && !video.ended) saveProgress(); syncPauseCircle(); sendTvState(true); });
 video.addEventListener('ended', () => {
   saveProgress(true);
+  if (streamReturn) {
+    if (!serverAutoplay) sendTvState(true);
+    else void playNextStream().then(started => { if (!started) sendTvState(true); });
+    return;
+  }
   if (serverAutoplay && library && index + 1 < library.episodes.length) void openEpisode(index + 1, true, true);
   else if (!(serverAutoplay && playNextSeason(true, true))) sendTvState(true);
 });
@@ -1116,6 +1194,7 @@ skipDelayBtn.addEventListener('click', () => {
   renderSkipSettings();
 });
 next.addEventListener('click', () => {
+  if (streamReturn) { void playNextStream(); return; }
   if (library && index + 1 < library.episodes.length) void openEpisode(index + 1);
   else playNextSeason(false, serverAutoplay);
 });

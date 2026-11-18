@@ -64,7 +64,7 @@ export async function fetchStremio<T>(serverUrl: string, path: string): Promise<
   return body;
 }
 
-export type TvStream = { id: string; title: string; label: string; path: string };
+export type TvStream = { id: string; title: string; label: string; path: string; poster?: string | null; bingeGroup?: string | null };
 
 /** Plays a Movies & TV stream on the TV, turning it on and opening Anime Study first when needed. */
 export async function playOnTv(serverUrl: string, stream: TvStream): Promise<{ state?: 'playing' | 'starting'; error?: string }> {
@@ -79,4 +79,16 @@ export async function playOnTv(serverUrl: string, stream: TvStream): Promise<{ s
   } catch {
     return { error: 'The Mac did not answer.' };
   }
+}
+
+/** A Movies & TV action on the Mac (save, cancel, retry). Resolves to the answer, or throws its error. */
+export async function postStremio<T>(serverUrl: string, path: string, body: unknown): Promise<T> {
+  const res = await request(`${normalizeTvServerUrl(serverUrl)}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, 40_000);
+  const answer = await res.json().catch(() => ({})) as T & { error?: string };
+  if (!res.ok) throw new Error(answer.error || `HTTP ${res.status}`);
+  return answer;
 }

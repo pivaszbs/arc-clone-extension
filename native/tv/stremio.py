@@ -137,6 +137,8 @@ def stream_option(stream):
         "seeders": int(seeders.group(1)) if seeders else None,
         "size": size.group(1) if size else None,
         "risky": dolby_only or bool(RISKY.search(details)),
+        # Torrentio's release group: the next episode from the same group plays the same way.
+        "bingeGroup": str(hints.get("bingeGroup") or "")[:200] or None,
         "sources": sources,
     }
 
@@ -188,6 +190,22 @@ class Stremio:
             for option in options:
                 self.sources[option["infoHash"]] = option.pop("sources")
         return {"streams": options}
+
+    def next_episode(self, item_id, group=None):
+        """The episode after `item_id` and a stream for it (the same release group when there is one)."""
+        item_id = valid_id(item_id)
+        if ":" not in item_id:
+            return {}
+        show = item_id.split(":")[0]
+        episodes = [ep for ep in self.meta("series", show)["episodes"] if ep["season"] > 0]
+        at = next((i for i, ep in enumerate(episodes) if ep["id"] == item_id), None)
+        if at is None or at + 1 >= len(episodes):
+            return {}
+        following = episodes[at + 1]
+        streams = self.streams("series", following["id"])["streams"]
+        stream = next((s for s in streams if group and s.get("bingeGroup") == group), None) or next(
+            (s for s in streams if not s["risky"]), None)
+        return {"episode": following, "stream": stream} if stream else {"episode": following}
 
     def prepare(self, info_hash):
         """Ask the Stremio server to start the torrent with peer sources (best effort: a plain
