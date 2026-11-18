@@ -38,3 +38,25 @@ except ValueError:
 `);
   assert.equal(out, 'rejected');
 });
+
+test('UPnP volume requests carry the level, clamped to 0-100, and replies are parsed', () => {
+  const out = python(`
+from native.tv.samsung_remote import SamsungRemote, soap_envelope, soap_value
+body = soap_envelope('SetVolume', (('DesiredVolume', 35),)).decode()
+assert '<u:SetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">' in body
+assert '<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>35</DesiredVolume>' in body
+print(soap_value('<u:GetVolumeResponse><CurrentVolume>40\\n</CurrentVolume></u:GetVolumeResponse>', 'CurrentVolume'))
+sent = []
+r = SamsungRemote('/dev/null/none.json')
+r._rendering_control = lambda action, arguments=(): sent.append((action, arguments)) or ''
+r.set_volume(140); r.set_volume(-3); r.set_volume(22.6)
+print([a[0][1] for _, a in sent])
+for bad in ('50', True, None):
+    try:
+        r.set_volume(bad)
+    except ValueError:
+        sent.append('rejected')
+print(sent.count('rejected'))
+`);
+  assert.equal(out, '40\n[100, 0, 23]\n3');
+});

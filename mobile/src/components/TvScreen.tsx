@@ -12,6 +12,7 @@ import { colors, radius, space, status, type } from '../theme';
 import { MoviesBrowser } from './MoviesBrowser';
 import { TvRemotePanel } from './TvRemotePanel';
 import { Button, Section, StatusDot } from './ui';
+import { VolumeSlider } from './VolumeSlider';
 
 type Props = {
   serverUrl: string;
@@ -56,11 +57,24 @@ export function TvScreen({ serverUrl, tvState, tvAutoplay, onCommand, onPlayOnPh
 
   const remote = async (action: TvRemoteAction, done?: string) => {
     haptics.select();
-    if (!('key' in action)) setBusy(true);
+    if ('power' in action || 'open' in action) setBusy(true);
     const error = await sendTvRemote(serverUrl, action);
     setBusy(false);
     setMessage(error || done || '');
-    if (!('key' in action)) setTimeout(() => void refresh(), 1500);
+    if ('power' in action || 'open' in action) setTimeout(() => void refresh(), 1500);
+  };
+
+  /** Slider moves go straight out; the device poll catches the TV's own reading up. */
+  const setVolume = async (volume: number) => {
+    setDevice(current => (current ? { ...current, volume } : current));
+    const error = await sendTvRemote(serverUrl, { volume });
+    if (error) setMessage(error);
+  };
+  const toggleMute = async () => {
+    const mute = !device?.muted;
+    setDevice(current => (current ? { ...current, muted: mute } : current));
+    const error = await sendTvRemote(serverUrl, { mute });
+    setMessage(error || '');
   };
 
   const appOpen = Boolean(device?.appOpen);
@@ -118,6 +132,16 @@ export function TvScreen({ serverUrl, tvState, tvAutoplay, onCommand, onPlayOnPh
           style={styles.flex}
         />
       </View>
+
+      {tvOn && (
+        <VolumeSlider
+          volume={device?.volume}
+          muted={device?.muted}
+          disabled={device?.volume === undefined}
+          onChange={volume => void setVolume(volume)}
+          onToggleMute={() => void toggleMute()}
+        />
+      )}
 
       {tvState?.active && (
         <TvRemotePanel tvState={tvState} tvAutoplay={tvAutoplay} onCommand={command => onCommand(command)} onPlayOnPhone={onPlayOnPhone} />

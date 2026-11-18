@@ -709,12 +709,18 @@ class TVServer(ThreadingHTTPServer):
 
     def tv_device(self):
         info = self.samsung.device_info()
-        return {**info, "appOpen": self.tv_app_open(info)}
+        volume = self.samsung.volume() if info.get("power") == "on" else None
+        return {**info, **(volume or {}), "appOpen": self.tv_app_open(info)}
 
     def tv_remote(self, body):
-        """One phone remote action on the TV set: a key, power on/off, or opening Anime Study."""
+        """One phone remote action on the TV set: a key, a volume level, mute, power on/off, or
+        opening Anime Study."""
         if isinstance(body.get("key"), str):
             self.samsung.key(body["key"])
+        elif "volume" in body:
+            self.samsung.set_volume(body["volume"])
+        elif isinstance(body.get("mute"), bool):
+            self.samsung.set_mute(body["mute"])
         elif body.get("power") in ("on", "off"):
             self.samsung.power(body["power"])
         elif body.get("open") is True:

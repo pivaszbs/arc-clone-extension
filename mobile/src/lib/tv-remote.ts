@@ -14,6 +14,9 @@ export type TvDevice = {
   model?: string;
   /** The Anime Study app is open on the TV and connected to the Mac. */
   appOpen?: boolean;
+  /** The TV's volume (0-100) and mute state, when it is on and answers UPnP. */
+  volume?: number;
+  muted?: boolean;
 };
 
 export type TvKey =
@@ -21,7 +24,7 @@ export type TvKey =
   | 'KEY_ENTER' | 'KEY_RETURN' | 'KEY_HOME' | 'KEY_SOURCE' | 'KEY_MENU' | 'KEY_INFO' | 'KEY_PLAY' | 'KEY_PAUSE'
   | 'KEY_FF' | 'KEY_REWIND' | 'KEY_EXIT';
 
-export type TvRemoteAction = { key: TvKey } | { power: 'on' | 'off' } | { open: true };
+export type TvRemoteAction = { key: TvKey } | { volume: number } | { mute: boolean } | { power: 'on' | 'off' } | { open: true };
 
 async function request(url: string, init?: RequestInit, timeoutMs = 10_000) {
   const controller = new AbortController();

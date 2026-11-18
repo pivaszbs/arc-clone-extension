@@ -5,6 +5,8 @@ port 8002 for keys and app launches. The first connection shows an "Allow" promp
 token it hands back is kept in ~/Library/Application Support/AnimeStudy/samsung-tv.json. The TV's
 address is learnt from the Anime Study TV app's own connection to this server, so nothing needs
 configuring. Turning the TV on from off uses Wake-on-LAN with the TV's network MAC address.
+The volume level is read and set exactly through the TV's UPnP RenderingControl service (port 9197),
+which the key-based remote API can't do; it needs no pairing.
 """
 
 import base64
@@ -15,6 +17,7 @@ import socket
 import ssl
 import struct
 import threading
+import re
 import time
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -28,6 +31,21 @@ KEYS = frozenset({
     "KEY_MENU", "KEY_INFO", "KEY_PLAY", "KEY_PAUSE", "KEY_STOP", "KEY_FF", "KEY_REWIND",
     "KEY_HDMI", "KEY_HDMI1", "KEY_HDMI2", "KEY_HDMI3", "KEY_HDMI4", "KEY_TV", "KEY_EXIT",
 })
+
+RENDERING_CONTROL = "urn:schemas-upnp-org:service:RenderingControl:1"
+
+
+def soap_envelope(action, arguments=()):
+    """A UPnP RenderingControl request body for InstanceID 0, Master channel."""
+    fields = "".join(f"<{name}>{value}</{name}>" for name, value in (("InstanceID", 0), ("Channel", "Master"), *arguments))
+    return ('<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+            f'<u:{action} xmlns:u="{RENDERING_CONTROL}">{fields}</u:{action}></s:Body></s:Envelope>').encode("utf-8")
+
+
+def soap_value(xml, name):
+    match = re.search(rf"<{name}>\s*([^<]*?)\s*</{name}>", xml)
+    return match.group(1) if match else None
 
 
 def _private(ip):
@@ -141,6 +159,38 @@ class SamsungRemote:
             self._save()
         return {**info, "power": "standby" if str(device.get("PowerState", "on")).lower() == "standby" else "on",
                 "name": str(device.get("name") or "Samsung TV").replace("&quot;", '"'), "model": device.get("modelName")}
+
+    def _rendering_control(self, action, arguments=()):
+        ip = self.ip
+        if not ip:
+            raise ConnectionError("The TV hasn't connected to this Mac yet. Open Anime Study on the TV once.")
+        request = Request(f"http://{ip}:9197/upnp/control/RenderingControl1", data=soap_envelope(action, arguments),
+                          method="POST", headers={"Content-Type": 'text/xml; charset="utf-8"',
+                                                  "SOAPACTION": f'"{RENDERING_CONTROL}#{action}"'})
+        try:
+            with urlopen(request, timeout=3) as response:
+                return response.read(65_536).decode("utf-8", "replace")
+        except OSError:
+            raise ConnectionError("The TV did not answer. Is it on and on the same network?")
+
+    def volume(self):
+        """The TV's volume (0-100) and mute state, or None when the TV doesn't answer."""
+        try:
+            level = soap_value(self._rendering_control("GetVolume"), "CurrentVolume")
+            muted = soap_value(self._rendering_control("GetMute"), "CurrentMute")
+        except ConnectionError:
+            return None
+        if level is None or not level.isdigit():
+            return None
+        return {"volume": int(level), "muted": muted in ("1", "true")}
+
+    def set_volume(self, level):
+        if isinstance(level, bool) or not isinstance(level, (int, float)):
+            raise ValueError("volume must be a number")
+        self._rendering_control("SetVolume", (("DesiredVolume", max(0, min(100, round(level)))),))
+
+    def set_mute(self, muted):
+        self._rendering_control("SetMute", (("DesiredMute", 1 if muted else 0),))
 
     def _close_locked(self):
         if self.sock:
