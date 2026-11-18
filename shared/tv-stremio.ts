@@ -39,6 +39,8 @@ export type SaveJob = {
   id: string;
   type: StremioType;
   itemId: string;
+  showId?: string | null;
+  poster?: string | null;
   name: string;
   year?: string;
   season?: number;
@@ -69,6 +71,34 @@ export function continueLabel(entry: HistoryEntry) {
     : entry.duration && entry.duration - entry.position > 60 ? `${clock(entry.duration - entry.position)} left`
       : `Resume at ${clock(entry.position)}`;
   return [code, where].filter(Boolean).join(' · ');
+}
+
+/** One gallery card per saved movie or show: its jobs, and a badge saying how far saving got. */
+export type SavedTitle = { card: TitleCard; jobs: SaveJob[]; badge: string; fraction: number | null; failed: boolean };
+
+const activeJob = (job: SaveJob) => job.state === 'queued' || job.state === 'downloading' || job.state === 'converting';
+
+export function savedTitles(jobs: SaveJob[]): SavedTitle[] {
+  const byTitle = new Map<string, SaveJob[]>();
+  for (const job of jobs) {
+    const key = job.type === 'series' ? job.showId || job.itemId.split(':')[0] : job.itemId;
+    byTitle.set(key, [...(byTitle.get(key) || []), job]);
+  }
+  return [...byTitle.entries()].map(([id, items]) => {
+    const first = items[0];
+    const done = items.filter(job => job.state === 'done').length;
+    const running = items.find(job => job.state === 'downloading' || job.state === 'converting');
+    const failed = items.some(job => job.state === 'failed');
+    const waiting = items.some(activeJob);
+    const fraction = running ? running.fraction || 0 : null;
+    const badge = items.length > 1
+      ? `${done} of ${items.length} saved${failed ? ' · failed' : ''}`
+      : first.state === 'done' ? 'Saved'
+        : first.state === 'failed' ? 'Failed'
+          : running ? (running.state === 'converting' ? 'Converting' : `Saving ${Math.round((fraction || 0) * 100)}%`)
+            : waiting ? 'Waiting' : '';
+    return { card: { id, type: first.type, name: first.name, year: first.year || '', poster: first.poster || null }, jobs: items, badge, fraction, failed };
+  });
 }
 
 /** What a stream save is doing, for a progress line. */

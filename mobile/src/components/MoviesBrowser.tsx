@@ -1,7 +1,7 @@
 // Movies & TV on the phone: search, seasons, episodes and torrent streams; a stream plays on the TV.
 import { SymbolView } from 'expo-symbols';
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import {
   continueLabel,
@@ -9,7 +9,7 @@ import {
   metaPath,
   nextPath,
   playPath,
-  saveJobLabel,
+  savedTitles,
   searchPath,
   seasonName,
   seasonsOf,
@@ -17,6 +17,7 @@ import {
   streamsPath,
   type HistoryEntry,
   type SaveJob,
+  type SavedTitle,
   type SeriesMeta,
   type StreamOption,
   type StremioEpisode,
@@ -116,10 +117,28 @@ export function MoviesBrowser({ serverUrl, onPlay }: Props) {
     } catch (e) { setNotice(e instanceof Error ? e.message : String(e)); }
   };
 
-  const jobAction = async (job: SaveJob, action: 'cancel' | 'retry') => {
-    haptics.select();
-    try { await postStremio(serverUrl, `stremio/downloads/${action}`, { id: job.id }); } catch { /* refreshed below */ }
+  const jobAction = async (items: SaveJob[], action: 'cancel' | 'retry') => {
+    for (const job of items) {
+      try { await postStremio(serverUrl, `stremio/downloads/${action}`, { id: job.id }); } catch { /* refreshed below */ }
+    }
     void refreshMac();
+  };
+
+  const saved = savedTitles(jobs);
+  const savedIds = new Set(saved.map(item => item.card.id));
+
+  /** Long press on a saved title: stop saving it, or try failed files again. */
+  const manageSaved = (item: SavedTitle) => {
+    haptics.select();
+    const active = item.jobs.filter(job => job.state !== 'done' && job.state !== 'failed');
+    const failed = item.jobs.filter(job => job.state === 'failed');
+    const done = item.jobs.length - active.length - failed.length;
+    const buttons: { text: string; style?: 'cancel' | 'destructive'; onPress?: () => void }[] = [];
+    if (failed.length) buttons.push({ text: `Retry ${failed.length > 1 ? `${failed.length} failed` : 'failed'}`, onPress: () => void jobAction(failed, 'retry') });
+    if (active.length) buttons.push({ text: 'Stop saving', style: 'destructive', onPress: () => void jobAction(active, 'cancel') });
+    if (failed.length) buttons.push({ text: 'Remove failed', style: 'destructive', onPress: () => void jobAction(failed, 'cancel') });
+    buttons.push({ text: 'Close', style: 'cancel' });
+    Alert.alert(item.card.name, done ? `${done} saved in the Mac library. Saved files stay there; delete them on the Mac.` : 'Saving to the Mac library.', buttons);
   };
 
   const search = async (nextKind = kind, nextQuery = query) => {
@@ -246,31 +265,38 @@ export function MoviesBrowser({ serverUrl, onPlay }: Props) {
         </View>
       )}
 
-      {!view && jobs.length > 0 && (
-        <View style={{ gap: space.xs }}>
-          <Text style={type.section}>Saving to the Mac library</Text>
-          {jobs.slice(0, 8).map(job => {
-            const label = saveJobLabel(job);
-            const active = job.state === 'queued' || job.state === 'downloading' || job.state === 'converting';
-            return (
-              <View key={job.id} style={styles.row}>
-                <View style={{ flex: 1, gap: 2 }}>
-                  <Text style={type.body} numberOfLines={1}>{label.name}</Text>
-                  <Text style={[type.caption, job.state === 'failed' && { color: '#f87171' }]} numberOfLines={2}>{label.state}</Text>
-                </View>
-                {job.state === 'failed' && <Button title="Retry" variant="plain" onPress={() => void jobAction(job, 'retry')} />}
-                {(active || job.state === 'failed') && <Button title={active ? 'Cancel' : 'Remove'} variant="plain" onPress={() => void jobAction(job, 'cancel')} />}
-                {job.state === 'done' && <SymbolView name="checkmark.circle.fill" size={18} tintColor="#34d399" />}
-              </View>
-            );
-          })}
-        </View>
-      )}
       {loading && <ActivityIndicator color={colors.accent} style={{ marginVertical: space.m }} />}
 
       {!view && !loading && (
         <View style={styles.grid}>
-          {results.map(card => (
+          {/* Saved and saving titles head the gallery, before search results and popular titles. */}
+          {!query.trim() && saved.map(item => (
+            <Pressable
+              key={`saved:${item.card.id}`}
+              accessibilityRole="button"
+              accessibilityLabel={`${item.card.name}, ${item.badge}`}
+              accessibilityHint="Long press to stop or retry saving"
+              onPress={() => push(item.card.type === 'series' ? { kind: 'seasons', card: item.card } : { kind: 'streams', card: item.card })}
+              onLongPress={() => manageSaved(item)}
+              style={({ pressed }) => [styles.card, pressed && styles.pressed]}
+            >
+              <View>
+                {item.card.poster ? <Image source={{ uri: item.card.poster }} style={styles.poster} resizeMode="cover" /> : <View style={styles.poster} />}
+                {!!item.badge && (
+                  <View style={[styles.savedBadge, item.failed && styles.savedBadgeFailed]}>
+                    {item.badge === 'Saved' && <SymbolView name="checkmark" size={10} tintColor={colors.text} />}
+                    <Text style={styles.savedBadgeText} numberOfLines={1}>{item.badge}</Text>
+                  </View>
+                )}
+                {item.fraction !== null && (
+                  <View style={styles.savedTrack}><View style={[styles.continueFill, { width: `${Math.round(item.fraction * 100)}%` }]} /></View>
+                )}
+              </View>
+              <Text style={styles.cardName} numberOfLines={2}>{item.card.name}</Text>
+              {!!item.card.year && <Text style={type.caption}>{item.card.year}</Text>}
+            </Pressable>
+          ))}
+          {results.filter(card => query.trim() || !savedIds.has(card.id)).map(card => (
             <Pressable
               key={card.id}
               accessibilityRole="button"
@@ -367,5 +393,12 @@ const styles = StyleSheet.create({
   continueTrack: { height: 3, borderRadius: 1.5, backgroundColor: 'rgba(255,255,255,0.15)', overflow: 'hidden', marginTop: -6, marginHorizontal: 4 },
   continueFill: { height: 3, backgroundColor: colors.accent },
   saveButton: { paddingHorizontal: 4, paddingVertical: 2 },
+  savedBadge: {
+    position: 'absolute', top: 6, left: 6, flexDirection: 'row', alignItems: 'center', gap: 3,
+    backgroundColor: 'rgba(0,0,0,0.72)', borderRadius: radius.pill, paddingHorizontal: 7, paddingVertical: 3, maxWidth: '88%',
+  },
+  savedBadgeFailed: { backgroundColor: 'rgba(160,30,30,0.85)' },
+  savedBadgeText: { color: colors.text, fontSize: 11, fontWeight: '700', flexShrink: 1 },
+  savedTrack: { position: 'absolute', left: 0, right: 0, bottom: 0, height: 4, backgroundColor: 'rgba(0,0,0,0.5)' },
   error: { color: '#f87171', fontSize: 13 },
 });

@@ -159,7 +159,7 @@ class MovieLibrary:
             pass
 
     def _public(self, job):
-        return {key: job.get(key) for key in ("id", "type", "itemId", "name", "year", "season", "episode", "episodeName",
+        return {key: job.get(key) for key in ("id", "type", "itemId", "showId", "poster", "name", "year", "season", "episode", "episodeName",
                                                "quality", "state", "fraction", "error", "folder", "addedAt", "doneAt")}
 
     def listing(self):

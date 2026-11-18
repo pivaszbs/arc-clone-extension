@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import test from 'node:test';
-import { continueLabel, saveJobLabel } from '../shared/tv-stremio.ts';
+import { continueLabel, saveJobLabel, savedTitles } from '../shared/tv-stremio.ts';
 
 /** Runs Python that prints JSON, and returns it parsed. */
 function python(code) {
@@ -77,4 +77,16 @@ test('Continue watching and save labels read naturally', () => {
   assert.equal(continueLabel({ ...base, type: 'movie', label: 'Film', position: 3725, duration: null, finished: false }), 'Resume at 1:02:05');
   assert.deepEqual(saveJobLabel({ id: '1', type: 'series', itemId: 'tt1:1:2', name: 'Show', season: 1, episode: 2, state: 'downloading', fraction: 0.4 }),
     { name: 'Show · S01E02', state: 'Downloading 40%' });
+});
+
+test('saved titles make one gallery card per movie or show, with a badge', () => {
+  const job = (id, extra) => ({ id, type: 'series', itemId: `tt9:1:${id}`, showId: 'tt9', name: 'Show', poster: 'https://p', state: 'done', ...extra });
+  const cards = savedTitles([
+    job('1'), job('2', { state: 'downloading', fraction: 0.5 }), job('3', { state: 'queued' }),
+    { id: 'm', type: 'movie', itemId: 'tt5', name: 'Film', year: '2012', state: 'downloading', fraction: 0.76 },
+  ]);
+  assert.deepEqual(cards.map(c => [c.card.id, c.card.type, c.badge, c.fraction]), [
+    ['tt9', 'series', '1 of 3 saved', 0.5],
+    ['tt5', 'movie', 'Saving 76%', 0.76],
+  ]);
 });
