@@ -51,7 +51,14 @@ export type SaveJob = {
   fraction?: number;
   error?: string | null;
   folder?: string;
+  /** The saved MP4 inside `folder`, once done. */
+  file?: string | null;
 };
+
+/** Saved copies by movie or episode id: these play from the library instead of a torrent. */
+export function savedCopies(jobs: SaveJob[]) {
+  return new Map(jobs.filter(job => job.state === 'done' && job.folder && job.file).map(job => [job.itemId, job]));
+}
 
 export function nextPath(id: string, group?: string | null) {
   return `stremio/next.json?id=${encodeURIComponent(id)}${group ? `&group=${encodeURIComponent(group)}` : ''}`;

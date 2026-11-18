@@ -39,12 +39,12 @@ export function TvScreen({ serverUrl, tvState, tvAutoplay, onCommand, onPlayOnPh
     try { setDevice(await fetchTvDevice(serverUrl)); } catch { setDevice(null); }
   }, [serverUrl]);
 
-  const play = async (stream: TvStream) => {
+  const play = async (stream: TvStream, saved?: { folder: string; file: string }) => {
     setMessage(`Sending ${stream.title} to the TV…`);
-    const result = await playOnTv(serverUrl, stream);
+    const result = await playOnTv(serverUrl, saved ? { saved } : { stream });
     if (result.error) setMessage(result.error);
     else if (result.state === 'starting') setMessage(`Turning on the TV and opening Anime Study… ${stream.title} starts by itself.`);
-    else setMessage(`Starting ${stream.title} on the TV… a torrent can take up to a minute.`);
+    else setMessage(saved ? `Playing the saved ${stream.title} on the TV.` : `Starting ${stream.title} on the TV… a torrent can take up to a minute.`);
     setTimeout(() => void refresh(), 1500);
   };
 
@@ -138,7 +138,11 @@ export function TvScreen({ serverUrl, tvState, tvAutoplay, onCommand, onPlayOnPh
       </View>
 
       {panel === 'movies' ? (
-        <MoviesBrowser serverUrl={serverUrl} onPlay={stream => void play(stream)} />
+        <MoviesBrowser
+          serverUrl={serverUrl}
+          onPlay={stream => void play(stream)}
+          onPlaySaved={job => void play({ id: job.itemId, title: job.name, label: job.name, path: '' }, { folder: job.folder!, file: job.file! })}
+        />
       ) : (
       <>
       <View style={styles.pad}>

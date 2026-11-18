@@ -9,6 +9,7 @@ import {
   metaPath,
   nextPath,
   playPath,
+  savedCopies,
   savedTitles,
   searchPath,
   seasonName,
@@ -38,9 +39,11 @@ type Props = {
   serverUrl: string;
   /** Play the picked stream on the TV. */
   onPlay: (stream: TvStream) => void;
+  /** Play a saved copy from the Mac library on the TV (no torrent, no choosing a version). */
+  onPlaySaved: (job: SaveJob) => void;
 };
 
-export function MoviesBrowser({ serverUrl, onPlay }: Props) {
+export function MoviesBrowser({ serverUrl, onPlay, onPlaySaved }: Props) {
   const [kind, setKind] = useState<StremioType>('movie');
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<TitleCard[]>([]);
@@ -74,6 +77,8 @@ export function MoviesBrowser({ serverUrl, onPlay }: Props) {
   /** Continue watching: resume it, or after a finished episode, the next one. */
   const resume = async (entry: HistoryEntry) => {
     haptics.select();
+    const copy = !entry.finished ? savedCopies(jobs).get(entry.id) : undefined;
+    if (copy) { onPlaySaved(copy); return; }
     if (!(entry.finished && entry.type === 'series')) {
       onPlay({ id: entry.id, title: entry.title, label: entry.label, path: entry.path, poster: entry.poster, bingeGroup: entry.bingeGroup });
       return;
@@ -125,6 +130,13 @@ export function MoviesBrowser({ serverUrl, onPlay }: Props) {
   };
 
   const saved = savedTitles(jobs);
+  const copies = savedCopies(jobs);
+  /** A saved copy plays straight away; only titles not saved yet go to the list of versions. */
+  const openTitle = (card: TitleCard) => {
+    const copy = card.type === 'movie' ? copies.get(card.id) : undefined;
+    if (copy) { haptics.select(); onPlaySaved(copy); return; }
+    push(card.type === 'series' ? { kind: 'seasons', card } : { kind: 'streams', card });
+  };
   const savedIds = new Set(saved.map(item => item.card.id));
 
   /** Long press on a saved title: stop saving it, or try failed files again. */
@@ -276,7 +288,7 @@ export function MoviesBrowser({ serverUrl, onPlay }: Props) {
               accessibilityRole="button"
               accessibilityLabel={`${item.card.name}, ${item.badge}`}
               accessibilityHint="Long press to stop or retry saving"
-              onPress={() => push(item.card.type === 'series' ? { kind: 'seasons', card: item.card } : { kind: 'streams', card: item.card })}
+              onPress={() => openTitle(item.card)}
               onLongPress={() => manageSaved(item)}
               style={({ pressed }) => [styles.card, pressed && styles.pressed]}
             >
@@ -301,7 +313,7 @@ export function MoviesBrowser({ serverUrl, onPlay }: Props) {
               key={card.id}
               accessibilityRole="button"
               accessibilityLabel={`${card.name} ${card.year}`}
-              onPress={() => push(card.type === 'series' ? { kind: 'seasons', card } : { kind: 'streams', card })}
+              onPress={() => openTitle(card)}
               style={({ pressed }) => [styles.card, pressed && styles.pressed]}
             >
               {card.poster ? <Image source={{ uri: card.poster }} style={styles.poster} resizeMode="cover" /> : <View style={styles.poster} />}
@@ -329,9 +341,26 @@ export function MoviesBrowser({ serverUrl, onPlay }: Props) {
         <Button title={`Save ${seasonName(view.season)} for offline`} icon="arrow.down.circle" onPress={() => void saveSeason(view.card, view.season)} />
       )}
       {view?.kind === 'episodes' && view.meta.episodes.filter(ep => ep.season === view.season).map(ep => (
-        <ListRow key={ep.id} title={`${episodeCode(ep)} · ${ep.name}`} onPress={() => push({ kind: 'streams', card: view.card, episode: ep })} />
+        <ListRow
+          key={ep.id}
+          title={`${episodeCode(ep)} · ${ep.name}`}
+          detail={copies.has(ep.id) ? 'Saved · plays from the Mac library' : undefined}
+          icon={copies.has(ep.id) ? 'tv' : undefined}
+          onPress={() => {
+            const copy = copies.get(ep.id);
+            if (copy) { haptics.select(); onPlaySaved(copy); } else push({ kind: 'streams', card: view.card, episode: ep });
+          }}
+        />
       ))}
 
+      {view?.kind === 'streams' && copies.get(view.episode?.id || view.card.id) && (
+        <Button
+          title="Play saved copy on TV"
+          icon="play.tv"
+          variant="primary"
+          onPress={() => onPlaySaved(copies.get(view.episode?.id || view.card.id)!)}
+        />
+      )}
       {view?.kind === 'streams' && view.streams && (
         <>
           <Text style={type.subhead}>

@@ -332,27 +332,46 @@ function handleMenuAction() {
   }
 }
 
+/** A library episode picked on the phone. A series saved since the TV connected isn't in its
+ * catalog yet, so the catalog is read again before giving up on it. */
+async function playLibraryEpisode(msg: TvSyncMessage) {
+  if (streamReturn) closeEpisode();
+  if (stremio.active) leaveMovies();
+  const find = () => typeof msg.series === 'number'
+    ? msg.series
+    : typeof msg.seriesName === 'string'
+      ? catalog.findIndex(s => s.title === msg.seriesName || s.id === msg.seriesName)
+      : seriesIndex;
+  let targetSeries = find();
+  let reloaded = false;
+  if (targetSeries < 0 && typeof msg.seriesName === 'string' && base) {
+    try {
+      const response = await fetch(base + 'catalog.json');
+      const payload = await response.json() as { series?: Library[] };
+      const seriesList = Array.isArray(payload.series) ? payload.series.filter(item => Array.isArray(item.episodes) && item.episodes.length) : [];
+      if (seriesList.length) {
+        catalog = seriesList;
+        reloaded = true;
+        targetSeries = find();
+      }
+    } catch { /* Nothing to play then. */ }
+  }
+  if (targetSeries >= 0 && targetSeries < catalog.length && (reloaded || targetSeries !== seriesIndex)) {
+    if (!player.hidden) saveProgress();
+    selectSeries(targetSeries);
+  }
+  const epIdx = typeof msg.episode === 'string' && library
+    ? library.episodes.findIndex(e => e.name === msg.episode)
+    : -1;
+  if (epIdx >= 0) void openEpisode(epIdx, false, true);
+  else flashOsd('That episode is not in the library yet');
+}
+
 function handleTvControl(msg: TvSyncMessage) {
   const action = msg.action;
   if (!action) return;
   if (action === 'playEpisode') {
-    if (streamReturn) closeEpisode();
-    if (stremio.active) leaveMovies();
-    const targetSeries = typeof msg.series === 'number'
-      ? msg.series
-      : typeof msg.seriesName === 'string'
-        ? catalog.findIndex(s => s.title === msg.seriesName || s.id === msg.seriesName)
-        : seriesIndex;
-    if (targetSeries >= 0 && targetSeries < catalog.length && targetSeries !== seriesIndex) {
-      if (!player.hidden) saveProgress();
-      selectSeries(targetSeries);
-    }
-    const epIdx = typeof msg.episode === 'string' && library
-      ? library.episodes.findIndex(e => e.name === msg.episode)
-      : -1;
-    if (epIdx >= 0) {
-      void openEpisode(epIdx, false, true);
-    }
+    void playLibraryEpisode(msg);
     return;
   }
   if (action === 'up') { handleDirectionKey(38); return; }

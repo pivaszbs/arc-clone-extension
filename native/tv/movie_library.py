@@ -159,8 +159,17 @@ class MovieLibrary:
             pass
 
     def _public(self, job):
+        public = self._fields(job)
+        if job.get("state") == "done" and not public.get("file"):
+            try:
+                public["file"] = target_paths(job)[1] + ".mp4"
+            except (KeyError, ValueError, TypeError):
+                pass
+        return public
+
+    def _fields(self, job):
         return {key: job.get(key) for key in ("id", "type", "itemId", "showId", "poster", "name", "year", "season", "episode", "episodeName",
-                                               "quality", "state", "fraction", "error", "folder", "addedAt", "doneAt")}
+                                               "quality", "state", "fraction", "error", "folder", "file", "addedAt", "doneAt")}
 
     def listing(self):
         with self.lock:
@@ -286,7 +295,7 @@ class MovieLibrary:
         folder = self.folder / folder_name
         output = folder / f"{stem}.mp4"
         if output.exists():
-            self._update(job, state="done", fraction=1.0, folder=folder_name, doneAt=time.time())
+            self._update(job, state="done", fraction=1.0, folder=folder_name, file=output.name, doneAt=time.time())
             return
         partial = self._partial(job)
         self._update(job, state="downloading", folder=folder_name)
@@ -307,7 +316,7 @@ class MovieLibrary:
         self._poster(job, folder)
         tmp.replace(output)
         partial.unlink(missing_ok=True)
-        self._update(job, state="done", fraction=1.0, doneAt=time.time())
+        self._update(job, state="done", fraction=1.0, file=output.name, doneAt=time.time())
 
 
 def sidecar_info(folder):

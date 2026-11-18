@@ -66,13 +66,17 @@ export async function fetchStremio<T>(serverUrl: string, path: string): Promise<
 
 export type TvStream = { id: string; title: string; label: string; path: string; poster?: string | null; bingeGroup?: string | null };
 
-/** Plays a Movies & TV stream on the TV, turning it on and opening Anime Study first when needed. */
-export async function playOnTv(serverUrl: string, stream: TvStream): Promise<{ state?: 'playing' | 'starting'; error?: string }> {
+/** Plays a Movies & TV stream, or a saved copy in the Mac library, on the TV, turning it on and
+ * opening Anime Study first when needed. */
+export async function playOnTv(
+  serverUrl: string,
+  what: { stream: TvStream } | { saved: { folder: string; file: string } },
+): Promise<{ state?: 'playing' | 'starting'; error?: string }> {
   try {
     const res = await request(`${normalizeTvServerUrl(serverUrl)}tv/play`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stream }),
+      body: JSON.stringify(what),
     });
     const body = await res.json().catch(() => ({})) as { state?: 'playing' | 'starting'; error?: string };
     return res.ok ? body : { error: body.error || `The Mac answered HTTP ${res.status}` };

@@ -623,8 +623,10 @@ class TVServer(ThreadingHTTPServer):
                 pass
 
     def tv_play(self, body):
-        """Play a Movies & TV stream picked on the phone, turning the TV on and opening Anime Study
-        first when needed. Returns "playing" or "starting" (the TV is waking up)."""
+        """Play a Movies & TV stream picked on the phone, or a saved copy in the library, turning the
+        TV on and opening Anime Study first when needed. Returns "playing" or "starting" (waking up)."""
+        if isinstance(body.get("saved"), dict):
+            return self._deliver_to_tv(self._saved_command(body["saved"]))
         stream = body.get("stream") if isinstance(body.get("stream"), dict) else {}
         path, item_id = stream.get("path"), stream.get("id")
         if not isinstance(path, str) or not STREAM_PATH.fullmatch(path) or not isinstance(item_id, str) or len(item_id) > 64:
@@ -633,6 +635,19 @@ class TVServer(ThreadingHTTPServer):
         command = {"type": "tv_control", "action": "playStream", "stream": {
             "id": item_id, "path": path, "poster": poster, "bingeGroup": str(stream.get("bingeGroup") or "")[:200] or None,
             "title": str(stream.get("title") or "Movies & TV")[:200], "label": str(stream.get("label") or "")[:200]}}
+        return self._deliver_to_tv(command)
+
+    def _saved_command(self, saved):
+        """playEpisode for a file in the library, by the series' id (stable, unlike its index)."""
+        folder, file = saved.get("folder"), saved.get("file")
+        self.refresh_series()
+        for index, (path, episodes) in enumerate(self.series):
+            if path.name == folder and any(video.name == file for video, _ in episodes):
+                return {"type": "tv_control", "action": "playEpisode",
+                        "seriesName": self.library(index)["id"], "episode": file}
+        raise ValueError("That saved file is not in the library.")
+
+    def _deliver_to_tv(self, command):
         app_open = self.tv_app_open()
         with self.ws_lock:
             if not app_open:
