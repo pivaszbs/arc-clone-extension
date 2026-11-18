@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import test from 'node:test';
-import { episodeCode, playPath, searchPath, seasonsOf, streamLabel, streamsPath } from '../src/tv/stremio-client.ts';
+import { episodeCode, playPath, searchPath, seasonsOf, streamLabel, streamsPath } from '../shared/tv-stremio.ts';
 
 const hash = 'a4a01fa88c9714cf66bcd3d2a769a47c8f51527a';
 

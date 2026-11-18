@@ -1,4 +1,4 @@
-/** Movies and TV on the Samsung app: data shapes and helpers for the Mac server's stremio/ routes
+/** Movies and TV (Samsung app and the phone remote): data shapes and helpers for the Mac server's stremio/ routes
  * (native/tv/stremio.py), which relay Cinemeta, Torrentio and the Stremio streaming server. */
 
 export type StremioType = 'movie' | 'series';

@@ -48,6 +48,7 @@ from native.tv.queue_store import QueueStore
 from native.tv.replica import Replica
 from native.tv.series_catalog import SeriesCatalog
 from native.tv.stremio import Stremio
+from native.tv.samsung_remote import SamsungRemote
 
 PROJECT = Path(__file__).resolve().parents[2] / "outputs" / "samsung-tv" / "AnimeStudy"
 ASSETS = {"": ("index.html", "text/html; charset=utf-8"), "tv.css": ("tv.css", "text/css; charset=utf-8"),
@@ -62,6 +63,7 @@ def default_queue_path(folder):
     return QUEUE_DIR / f"queue-{digest}.sqlite3"
 MEDIA_PATH = re.compile(r"(?:(\d+)/)?(\d+)/(video|subtitles)")
 POSTER_PATH = re.compile(r"(\d+)/poster")
+STREAM_PATH = re.compile(r"stremio/play/[a-f0-9]{40}/(?:-1|\d{1,5})")
 STREMIO_PLAY = re.compile(r"stremio/play/([a-f0-9]{40})/(-1|\d{1,5})")
 WS_SEND_TIMEOUT_SECONDS = 5
 SERIES_ID_RE = re.compile(r"\s-\s(\d+)(?:\s-\s|$)")
@@ -178,6 +180,8 @@ class TVHandler(BaseHTTPRequestHandler):
         if path == f"/{self.server.token}/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
             self.handle_websocket()
             return
+        if path == f"/{self.server.token}/tv/device.json":
+            return self._send_json(self.server.tv_device())
         if path == f"/{self.server.token}/downloads":
             return self._send_json({"requests": self.server.download_requests()})
         if path == f"/{self.server.token}/worker/status":
@@ -226,6 +230,7 @@ class TVHandler(BaseHTTPRequestHandler):
                                 self.server.sync_metadata(event)
                             elif msg_type == "tv_state":
                                 event = self.server.set_tv_state(event, conn)
+                                self.server.note_tv_app(conn, self.client_address[0])
                             self.server.broadcast(event, exclude=conn)
                     except (ValueError, OSError):
                         pass
@@ -303,6 +308,20 @@ class TVHandler(BaseHTTPRequestHandler):
                 if body is None:
                     return self.send_error(400)
                 self._send_json(self.server.update_download(body))
+            elif resource == "tv/play":
+                body = self._read_json_body(8192)
+                if body is None:
+                    return self.send_error(400)
+                self._send_json({"state": self.server.tv_play(body)})
+            elif resource == "tv/remote":
+                body = self._read_json_body(4096)
+                if body is None:
+                    return self.send_error(400)
+                try:
+                    self.server.tv_remote(body)
+                except ConnectionError as error:
+                    return self._send_json({"error": str(error)}, code=502)
+                self._send_json({"ok": True})
             elif resource == "worker/retry":
                 body = self._read_json_body(65_536)
                 if body is None:
@@ -477,6 +496,9 @@ class TVServer(ThreadingHTTPServer):
         self.worker_lock = threading.Lock()
         self.downloads_lock = threading.Lock()
         self.ws_clients = set()
+        self.tv_app_conns = set()
+        self.pending_tv_play = None
+        self.samsung = SamsungRemote()
         self.tv_state = {"type": "tv_state", "active": False}
         self.tv_state_conn = None
         self.worker_nodes = {}
@@ -553,6 +575,81 @@ class TVServer(ThreadingHTTPServer):
     def remove_ws(self, conn):
         with self.ws_lock:
             self.ws_clients.discard(conn)
+            self.tv_app_conns.discard(conn)
+
+    def note_tv_app(self, conn, ip):
+        """A connection that reports tv_state is the Anime Study TV app; its address is the TV's."""
+        with self.ws_lock:
+            fresh = conn not in self.tv_app_conns
+            self.tv_app_conns.add(conn)
+            pending, self.pending_tv_play = self.pending_tv_play, None
+        self.samsung.learn_address(ip)
+        # A movie picked on the phone while the TV was off or the app closed: play it now.
+        if fresh and pending and time.time() - pending[0] < 120:
+            try:
+                conn.sendall(ws_encode_text(json.dumps(pending[1])))
+            except OSError:
+                pass
+
+    def tv_play(self, body):
+        """Play a Movies & TV stream picked on the phone, turning the TV on and opening Anime Study
+        first when needed. Returns "playing" or "starting" (the TV is waking up)."""
+        stream = body.get("stream") if isinstance(body.get("stream"), dict) else {}
+        path, item_id = stream.get("path"), stream.get("id")
+        if not isinstance(path, str) or not STREAM_PATH.fullmatch(path) or not isinstance(item_id, str) or len(item_id) > 64:
+            raise ValueError("bad stream")
+        command = {"type": "tv_control", "action": "playStream", "stream": {
+            "id": item_id, "path": path,
+            "title": str(stream.get("title") or "Movies & TV")[:200], "label": str(stream.get("label") or "")[:200]}}
+        app_open = self.tv_app_open()
+        with self.ws_lock:
+            if not app_open:
+                self.pending_tv_play = (time.time(), command)
+        if app_open:
+            self.broadcast(command)
+            return "playing"
+        threading.Thread(target=self._open_tv_app, daemon=True).start()
+        return "starting"
+
+    def tv_app_open(self, info=None):
+        """Anime Study is open on a TV that is on. A TV going to standby leaves its old connection
+        looking open here for a long time, so the TV's own power state decides."""
+        info = info or self.samsung.device_info()
+        with self.ws_lock:
+            app = bool(self.tv_app_conns)
+        on = info.get("power") == "on" or not info.get("known")
+        if not on:
+            cleared = None
+            with self.ws_lock:
+                if self.tv_state.get("active"):
+                    self.tv_state = {"type": "tv_state", "active": False}
+                    self.tv_state_conn = None
+                    cleared = dict(self.tv_state)
+            if cleared:
+                self.broadcast(cleared)
+        return app and on
+
+    def tv_device(self):
+        info = self.samsung.device_info()
+        return {**info, "appOpen": self.tv_app_open(info)}
+
+    def tv_remote(self, body):
+        """One phone remote action on the TV set: a key, power on/off, or opening Anime Study."""
+        if isinstance(body.get("key"), str):
+            self.samsung.key(body["key"])
+        elif body.get("power") in ("on", "off"):
+            self.samsung.power(body["power"])
+        elif body.get("open") is True:
+            # Waking the TV can take ~20 s; the phone sees the app connect over the WebSocket.
+            threading.Thread(target=self._open_tv_app, daemon=True).start()
+        else:
+            raise ValueError("unknown remote action")
+
+    def _open_tv_app(self):
+        try:
+            self.samsung.open_app()
+        except (ConnectionError, OSError) as error:
+            self.broadcast({"type": "tv_device_error", "error": str(error)})
 
     # Series download requests: a phone or iPad asks for a series, and Chrome on this Mac (signed in to
     # Anime365) claims the request, downloads it into this library and reports progress back here.

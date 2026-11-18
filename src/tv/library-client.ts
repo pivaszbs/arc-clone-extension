@@ -32,6 +32,11 @@ export type TvSyncMessage = {
   progress?: Progress;
   done?: number;
   total?: number;
+  /** `text`: what the phone typed; `submit` (default true) runs the search or form. */
+  text?: string;
+  submit?: boolean;
+  /** `playStream`: a Movies & TV stream picked on the phone. */
+  stream?: { id?: unknown; title?: unknown; label?: unknown; path?: unknown };
 };
 
 /** Validate and normalize a private LAN Anime Study TV server URL. */

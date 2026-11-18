@@ -9,7 +9,7 @@ export const DEFAULT_TV_SERVER_URL = 'http://10.131.140.3:46158/cf7f1d1d391d8231
 export type Progress = { position: number; duration: number; watchedAt: number; finished: boolean };
 export type Settings = { autoSkip: boolean; subtitles: boolean; tvServerUrl: string;
   /** The tab to reopen on. */
-  tab?: 'watch' | 'learn' | 'download' | 'pipelines';
+  tab?: 'watch' | 'tv' | 'learn' | 'download' | 'pipelines';
   /** The library to reopen on: the Mac's or this device's. */
   source?: 'server' | 'local';
   /** Learn: the player stops on lines with words in play to teach or ask them. */

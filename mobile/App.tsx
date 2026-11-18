@@ -13,6 +13,7 @@ import { SeriesGallery, seriesGroups } from './src/components/SeriesGallery';
 import { SeriesScreen } from './src/components/SeriesScreen';
 import { ZoomFrom, type Rect, type ZoomHandle } from './src/components/ZoomFrom';
 import { TvRemotePanel } from './src/components/TvRemotePanel';
+import { TvScreen } from './src/components/TvScreen';
 import { StatusDot, TabBar, type Tab } from './src/components/ui';
 import { installCrashLog } from './src/lib/crash-log';
 import { episodeDownloads } from './src/lib/episode-downloads';
@@ -39,7 +40,7 @@ import { colors, radius, space, type } from './src/theme';
 // Write the cause of any crash to Documents/.anime-study/errors.log.
 installCrashLog();
 
-type AppMode = 'watch' | 'learn' | 'download' | 'pipelines';
+type AppMode = 'watch' | 'tv' | 'learn' | 'download' | 'pipelines';
 type LibrarySource = 'server' | 'local';
 
 export default function App() {
@@ -59,7 +60,7 @@ function Study() {
   const initialServerUrl = normalizeTvServerUrl(savedSettings().tvServerUrl || DEFAULT_TV_SERVER_URL);
   const [mode, setModeState] = useState<AppMode>(() => {
     const saved = savedSettings().tab;
-    return saved === 'download' || saved === 'pipelines' || saved === 'learn' ? saved : 'watch';
+    return saved === 'download' || saved === 'pipelines' || saved === 'learn' || saved === 'tv' ? saved : 'watch';
   });
   // Reopen on the tab you left.
   const setMode = useCallback((next: AppMode) => { setModeState(next); saveSettings({ tab: next }); }, []);
@@ -551,7 +552,7 @@ function Study() {
   );
 
   // TV controls belong to the app, not the selected library or series.
-  const tvRemote = tvState?.active && !fullscreen ? (
+  const tvRemote = tvState?.active && !fullscreen && mode !== 'tv' ? (
     <TvRemotePanel
       tvState={tvState}
       tvAutoplay={tvAutoplay}
@@ -710,6 +711,7 @@ function Study() {
 
   const tabs: Tab<AppMode>[] = [
     { key: 'watch', title: 'Library', icon: 'play.rectangle.on.rectangle' },
+    { key: 'tv', title: 'TV', icon: 'appletvremote.gen4' },
     { key: 'learn', title: 'Learn', icon: 'graduationcap' },
     { key: 'download', title: 'Download', icon: 'arrow.down.circle' },
     { key: 'pipelines', title: 'Server', icon: 'server.rack', badge: !online && !connecting },
@@ -770,6 +772,17 @@ function Study() {
           <View style={mode === 'download' ? styles.tabScreen : styles.hidden}>
             {header}
             <DownloadView serverUrl={serverUrl} onMacProgress={reloadRemote} openUrl={siteRequest} />
+          </View>
+        )}
+        {mode === 'tv' && (
+          <View style={styles.tabScreen}>
+            <TvScreen
+              serverUrl={serverUrl}
+              tvState={tvState}
+              tvAutoplay={tvAutoplay}
+              onCommand={command => tvSyncRef.current?.sendTvControl(command)}
+              onPlayOnPhone={() => { setPlayOnPhoneOverride(true); setMode('watch'); }}
+            />
           </View>
         )}
         {mode === 'learn' && (

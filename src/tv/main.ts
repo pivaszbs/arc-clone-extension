@@ -127,6 +127,20 @@ function playStream(pick: StreamPick) {
   void openEpisode(0, false, true);
 }
 
+/** Text typed on the phone: into the focused field, otherwise a Movies & TV search. */
+function typeOnTv(text: string, submit: boolean) {
+  const focused = document.activeElement instanceof HTMLInputElement ? document.activeElement : null;
+  let field = focused && !focused.closest('[hidden]') ? focused : null;
+  if (!field) {
+    if (!player.hidden) closeEpisode();
+    if (connectForm.hidden && !stremio.active) enterMovies();
+    field = connectForm.hidden ? element<HTMLInputElement>('stremio-query') : address;
+  }
+  field.value = text;
+  field.focus();
+  if (submit) field.form?.dispatchEvent(new Event('submit', { cancelable: true }));
+}
+
 function enterMovies() {
   allTitlesBtn.hidden = change.hidden = true;
   connectForm.hidden = true;
@@ -287,6 +301,23 @@ function handleTvControl(msg: TvSyncMessage) {
     syncToServer({ autoplay: serverAutoplay });
     flashOsd(serverAutoplay ? 'Autoplay on' : 'Autoplay stopped');
     sendTvState(true);
+    return;
+  }
+  if (action === 'text' && typeof msg.text === 'string') {
+    typeOnTv(msg.text.slice(0, 200), msg.submit !== false);
+    return;
+  }
+  if (action === 'movies') {
+    if (!player.hidden) closeEpisode();
+    if (!stremio.active) enterMovies();
+    return;
+  }
+  if (action === 'playStream' && msg.stream) {
+    const { id, title, label, path } = msg.stream;
+    if (typeof id !== 'string' || typeof path !== 'string' || !/^stremio\/play\/[a-f0-9]{40}\/(?:-1|\d{1,5})$/.test(path)) return;
+    if (!player.hidden) closeEpisode();
+    if (!stremio.active) enterMovies();
+    playStream({ id, path, title: typeof title === 'string' ? title : 'Movies & TV', label: typeof label === 'string' ? label : '' });
     return;
   }
   if (player.hidden) return;
@@ -1041,6 +1072,11 @@ video.addEventListener('ended', () => {
   saveProgress(true);
   if (serverAutoplay && library && index + 1 < library.episodes.length) void openEpisode(index + 1, true, true);
   else if (!(serverAutoplay && playNextSeason(true, true))) sendTvState(true);
+});
+// Back from standby or another app, the old WebSocket may be dead without having closed: reconnect,
+// so the Mac sees the app again (and hands over a movie picked on the phone meanwhile).
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && base) openWebSocket(base);
 });
 window.addEventListener('pagehide', () => {
   if (!player.hidden && !video.ended) saveProgress();

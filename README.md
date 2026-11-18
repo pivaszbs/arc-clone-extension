@@ -163,3 +163,17 @@ The TV app's **Movies & TV** button plays films and series that aren't anime, us
 Set up: install and open the [Stremio desktop app](https://www.stremio.com/downloads) on the Mac and leave it running (it starts the streaming server), then run `npm run mac:up` as usual. To use your own Torrentio settings (providers, quality filter, a debrid service), set `ANIME_STUDY_TORRENTIO` to the configured address from torrentio.strem.fun/configure, without `/manifest.json`.
 
 On the TV, Movies & TV starts with popular titles. **Movies / Series** switches the type. Type a name and choose **Search**. Series open to seasons, then episodes, then the list of streams. A torrent can take up to a minute to start. If a stream fails, go back and pick another; 1080p x264 files start fastest. Resume positions are kept on the TV only; Learn, subtitles, auto-skip and Next episode aren't available for these streams yet. Torrents download from, and upload to, other peers from the Mac's internet connection, so only play what you're allowed to.
+
+### The phone's TV tab: pick a movie on the phone, watch it on the TV
+
+The phone and iPad app has a **TV** tab. **Movies & TV** opens first: search or browse popular titles, open a series' seasons and episodes, then tap a stream. The Mac (`tv/play`) plays it on the TV. When the TV is off or in standby, or Anime Study isn't open, the Mac turns the TV on, opens Anime Study and hands the stream over as soon as the app connects. From standby that takes about 10 seconds.
+
+**Remote** controls the TV itself, through the Mac and Samsung's remote API (`native/tv/samsung_remote.py`):
+- Power and **Open Anime Study**.
+- A d-pad with OK, Back, Home, Menu and Source.
+- Volume and mute, plus play/pause.
+- **Type on the TV**, which fills the TV's focused field or runs a Movies & TV search.
+
+While Anime Study is open, the d-pad and typing go to the app; otherwise they go to the TV set's own keys. What's playing shows with its usual controls.
+
+The Mac learns the TV's address from the Anime Study TV app's connection, so nothing needs configuring (or set `ANIME_STUDY_SAMSUNG_TV`). The first control asks for **Allow** on the TV; the token is kept in `~/Library/Application Support/AnimeStudy/samsung-tv.json`. Waking the TV from fully off uses Wake-on-LAN, which a Wi-Fi Samsung TV only answers with **Settings → All Settings → Connection → Expert Settings → Power On with Mobile** turned on.

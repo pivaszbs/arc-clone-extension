@@ -14,7 +14,7 @@ import {
   type StremioEpisode,
   type StremioType,
   type TitleCard
-} from './stremio-client';
+} from '../../shared/tv-stremio';
 
 export type StreamPick = { id: string; title: string; label: string; path: string };
 

@@ -98,7 +98,13 @@ export type TvControlCommand =
   | { action: 'markWatched'; finished?: boolean }
   | { action: 'seekBy'; delta: number }
   | { action: 'seek'; position: number }
-  | { action: 'playEpisode'; series?: number; seriesName?: string; episode: string };
+  | { action: 'playEpisode'; series?: number; seriesName?: string; episode: string }
+  /** Open Movies & TV on the TV. */
+  | { action: 'movies' }
+  /** Type into the TV's focused field (or its Movies & TV search) and, unless submit is false, run it. */
+  | { action: 'text'; text: string; submit?: boolean }
+  /** Play a Movies & TV stream (path from shared/tv-stremio.ts playPath). */
+  | { action: 'playStream'; stream: { id: string; title: string; label: string; path: string } };
 
 /** Normalize a user-provided Mac TV companion server URL. */
 export function normalizeTvServerUrl(input: string): string {
