@@ -172,6 +172,8 @@ The phone and iPad app has a **TV** tab. **Movies & TV** opens first: search or 
 - Power and **Open Anime Study**.
 - A d-pad with OK, Back, Home, Menu and Source.
 - Volume and mute, plus play/pause.
+
+While the TV is on, a **volume slider** sits above Movies & TV / Remote: drag or tap the track to set the exact level, or tap the speaker to mute. The Mac reads and sets it through the TV's UPnP RenderingControl service (port 9197), which needs no pairing, and reports it in `tv/device.json`.
 - **Type on the TV**, which fills the TV's focused field or runs a Movies & TV search.
 
 While Anime Study is open, the d-pad and typing go to the app; otherwise they go to the TV set's own keys. What's playing shows with its usual controls.
