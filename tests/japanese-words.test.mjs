@@ -7,7 +7,7 @@ const load = async (entry) => {
   const compiled = await build({ stdin: { contents: entry, resolveDir: 'src/japanese', loader: 'ts' }, bundle: true, write: false, format: 'esm', platform: 'node' });
   return import('data:text/javascript;base64,' + Buffer.from(compiled.outputFiles[0].text).toString('base64'));
 };
-const { loadDictionary, tokenize, romaji, tokenRomaji, segmentRomaji, spell, analyseEpisode, episodeTargets, coverage, wordStop, wordChoices, wordId, scheduleWord, applyWordMessage, createStudyStore, WORDS_KEY } =
+const { loadDictionary, tokenize, romaji, tokenRomaji, segmentRomaji, spell, analyseEpisode, episodeTargets, episodeDeck, coverage, wordStop, wordChoices, wordId, scheduleWord, applyWordMessage, createStudyStore, WORDS_KEY } =
   await load("export * from './dictionary'; export * from './episode-words'; export * from './word-cards'; export * from './storage';");
 loadDictionary(JSON.parse(readFileSync('shared/study/dictionary-data.json', 'utf8')).entries);
 
@@ -79,6 +79,19 @@ test('words still being learned use up the slots for new ones', () => {
   assert.equal(targets.fresh.length, 1);
   assert.equal(coverage(episode, new Map([[card.id, { ...card, interval: 1 }]])).knownWords, 1);
   assert.ok(coverage(episode, new Map([[card.id, { ...card, known: true }]])).share > 0.2);
+});
+
+test('the episode deck has every word and phrase not yet known, most heard first', () => {
+  const deck = episodeDeck(episode, new Map());
+  assert.deepEqual(deck.map((word) => word.word).slice(0, 2), ['友達', '映画']);
+  assert.ok(deck.some((word) => word.word === '猫'), 'words heard once are in the deck, unlike the words in play');
+  const known = { id: friend.id, word: '友達', reading: 'ともだち', gloss: 'friend', step: 0, interval: 0, due: 0, known: true };
+  assert.ok(!episodeDeck(episode, new Map([[known.id, known]])).some((word) => word.word === '友達'));
+  const learning = { ...known, known: undefined };
+  assert.equal(episodeDeck(episode, new Map([[known.id, learning]]))[0].word, '友達');
+  const phrases = episodeDeck(analyseEpisode([cue('あっという間に終わった', 0)]), new Map());
+  assert.ok(phrases.some((word) => word.phrase && word.word.startsWith('あっという間に')));
+  assert.ok(phrases.every((word) => word.phrase === word.entry.pos.includes('exp')));
 });
 
 test('teaches a new word first, then asks it once it is due', () => {

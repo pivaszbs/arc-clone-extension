@@ -53,4 +53,4 @@ for (const [outDir, manifest] of [[arc, arcManifest], [anime, animeManifest]]) {
   await cp(resolve(root, outDir === anime ? 'public/anime-icons' : 'public/icons'), resolve(root, outDir, 'icons'), { recursive: true });
   await writeFile(resolve(root, outDir, 'manifest.json'), JSON.stringify({ ...manifest, version }, null, 2) + '\n');
 }
-console.log(`Built Arc for Chrome in ${arc}/ and Anime Study in ${anime}/ (v${version})`);
+console.log(`Built Arc clone in ${arc}/ and Anime Study in ${anime}/ (v${version})`);

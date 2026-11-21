@@ -3,9 +3,14 @@ import { desktopPipRequest } from './desktop-pip';
 import { findFolder, pinnedLinks, pinnedRows, removePin } from '../shared/pins';
 import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
 import {
-  type Boost, DEFAULT_SITE_SEARCHES, boostsFor, matchSiteSearch, normalizePattern, routeFor,
+  type Boost, DEFAULT_SITE_SEARCHES, boostsFor, compileBoostCss, matchSiteSearch, normalizePattern, routeFor,
   siteSearchUrl, suggestSiteSearches, validSiteSearchUrl
 } from '../shared/site-tools';
+import { cleanUrl, parsePairingUri } from '../shared/arc-sync';
+import { addEaselItem, createEasel, type EaselDocument } from '../shared/easels';
+import { parseLiveFeed } from '../shared/live-folders';
+import { ArcLiveSyncClient, SYNC_ALARM_NAME, exportArcSidebarBundle } from './sync';
+import { type CapturedImage, resolveSpaceTheme } from '../shared/types';
 import { canPreviewInPeek, isBrowserPageUrl } from '../shared/interaction';
 import {
   type ArcState,
@@ -224,11 +229,130 @@ async function loadState(): Promise<ArcState> {
   return cachedState;
 }
 
-async function saveState(state: ArcState): Promise<void> {
+async function saveState(state: ArcState, opts?: { fromSync?: boolean }): Promise<void> {
   cachedState = state;
   await chrome.storage.local.set({ [STORAGE_KEY]: state });
   broadcastStateUpdate();
+  if (!opts?.fromSync) liveSync.schedulePush();
 }
+
+const EASELS_KEY = 'arc_easels_v1';
+const CAPTURES_KEY = 'arc_captures_v1';
+
+async function loadEasels(): Promise<EaselDocument[]> {
+  const res = await chrome.storage.local.get(EASELS_KEY);
+  return Array.isArray(res[EASELS_KEY]) ? (res[EASELS_KEY] as EaselDocument[]) : [];
+}
+
+async function loadCaptures(): Promise<CapturedImage[]> {
+  const res = await chrome.storage.local.get(CAPTURES_KEY);
+  return Array.isArray(res[CAPTURES_KEY]) ? (res[CAPTURES_KEY] as CapturedImage[]) : [];
+}
+
+const SPACE_GROUP_COLOR_MAP: Record<string, chrome.tabGroups.ColorEnum> = {
+  indigo: 'purple',
+  rose: 'pink',
+  emerald: 'green',
+  sunset: 'orange',
+  ocean: 'blue',
+  midnight: 'grey'
+};
+
+let syncingGroups = false;
+async function syncChromeTabGroups(state: ArcState): Promise<void> {
+  if (!state.settings.syncChromeTabGroups || !chrome.tabs?.group || !chrome.tabGroups?.update || syncingGroups) return;
+  syncingGroups = true;
+  try {
+    const allTabs = await chrome.tabs.query({});
+    for (const space of state.spaces) {
+      const byWindow = new Map<number, number[]>();
+      for (const tab of allTabs) {
+        if (tab.id === undefined || tab.pinned) continue;
+        if (state.tabSpaceMap[tab.id] !== space.id) continue;
+        const list = byWindow.get(tab.windowId) || [];
+        list.push(tab.id);
+        byWindow.set(tab.windowId, list);
+      }
+      for (const tabIds of byWindow.values()) {
+        if (!tabIds.length) continue;
+        try {
+          const existingGroupId = space.chromeGroupId && allTabs.some((t) => tabIds.includes(t.id!) && t.groupId === space.chromeGroupId)
+            ? space.chromeGroupId
+            : undefined;
+          const groupId = await chrome.tabs.group(existingGroupId ? { tabIds, groupId: existingGroupId } : { tabIds });
+          space.chromeGroupId = groupId;
+          await chrome.tabGroups.update(groupId, {
+            title: space.name.slice(0, 24),
+            color: SPACE_GROUP_COLOR_MAP[space.theme] || 'blue'
+          });
+        } catch {
+          // Ignore ungrouped windows or transient Chrome errors
+        }
+      }
+    }
+  } finally {
+    syncingGroups = false;
+  }
+}
+
+async function refreshFolderFeed(spaceId: string, folderId: string): Promise<ArcState> {
+  const state = await loadState();
+  const space = state.spaces.find((s) => s.id === spaceId);
+  const folder = space ? findFolder(space.pinnedItems, folderId) : undefined;
+  if (!folder?.liveFeed?.url) return state;
+  try {
+    const res = await fetch(folder.liveFeed.url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.text();
+    const entries = parseLiveFeed(body, 15);
+    folder.children = entries.map((entry, idx) => ({
+      id: `live-${folder.id}-${idx}`,
+      type: 'link',
+      title: entry.subtitle ? `${entry.title} · ${entry.subtitle}` : entry.title,
+      url: entry.url,
+      parentId: folder.id
+    }));
+    folder.liveFeed.lastUpdatedAt = Date.now();
+    folder.liveFeed.lastError = undefined;
+  } catch (error) {
+    folder.liveFeed.lastError = error instanceof Error ? error.message : 'Feed unavailable';
+  }
+  await saveState(state);
+  return state;
+}
+
+async function refreshAllLiveFolders(): Promise<void> {
+  const state = await loadState();
+  for (const space of state.spaces) {
+    for (const { item } of pinnedRows(space.pinnedItems)) {
+      if (item.type === 'folder' && item.liveFeed?.url) {
+        const refreshMs = (item.liveFeed.refreshMinutes || 15) * 60_000;
+        if (!item.liveFeed.lastUpdatedAt || Date.now() - item.liveFeed.lastUpdatedAt >= refreshMs) {
+          await refreshFolderFeed(space.id, item.id);
+        }
+      }
+    }
+  }
+}
+
+const liveSync = new ArcLiveSyncClient({
+  loadState,
+  saveState,
+  getTabs: async () => (await getFullSnapshot()).tabs,
+  onHandoff: async (handoff) => {
+    const state = await loadState();
+    const targetSpace = handoff.spaceId && state.spaces.some((s) => s.id === handoff.spaceId)
+      ? handoff.spaceId
+      : state.activeSpaceId;
+    const created = await createTab({ url: handoff.url, active: true });
+    if (created.id !== undefined) {
+      state.tabSpaceMap[created.id] = targetSpace;
+      state.tabLastAccessed[created.id] = Date.now();
+      state.activeSpaceId = targetSpace;
+      await saveState(state, { fromSync: true });
+    }
+  }
+});
 
 async function getFullSnapshot(_windowId?: number) {
   const state = await loadState();
@@ -311,8 +435,12 @@ async function autoArchiveTabs() {
 if (chrome.alarms) {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'arc-auto-archive') void autoArchiveTabs().catch(console.warn);
+    else if (alarm.name === SYNC_ALARM_NAME) void liveSync.pullIfChanged().catch(console.warn);
+    else if (alarm.name === 'arc-live-folders') void refreshAllLiveFolders().catch(console.warn);
   });
   void chrome.alarms.create('arc-auto-archive', { periodInMinutes: 1 });
+  void chrome.alarms.create('arc-live-folders', { periodInMinutes: 15 });
+  liveSync.start();
 }
 
 async function resetSpace(spaceId: string) {
@@ -500,27 +628,98 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 
 // Boosts: user CSS for a site, inserted as the page starts loading.
 const boostTarget = (tabId: number) => ({ tabId, allFrames: false });
-async function insertBoost(tabId: number, css: string) {
-  await chrome.scripting?.insertCSS({ target: boostTarget(tabId), css, origin: 'USER' }).catch(() => {});
+const appliedBoostCssByTab = new Map<number, string>();
+
+function arcPaletteCssForSpace(space?: Space): string {
+  const theme = resolveSpaceTheme(space);
+  const bg = space?.customColors?.[0] || '#1e1b2e';
+  const focus = theme.accent || '#6366f1';
+  return `:root { --arc-palette-background: ${bg}; --arc-palette-foreground: #ffffff; --arc-palette-focus: ${focus}; }`;
 }
-async function removeBoost(tabId: number, css: string) {
-  await chrome.scripting?.removeCSS({ target: boostTarget(tabId), css, origin: 'USER' }).catch(() => {});
+
+function combinedCssForTab(url: string, space: Space | undefined, state: ArcState): string {
+  const chunks = boostsFor(state.boosts, url).map((b) => compileBoostCss(b)).filter(Boolean);
+  if (state.settings.exposeArcPalette) {
+    chunks.unshift(arcPaletteCssForSpace(space));
+  }
+  return chunks.join('\n').trim();
 }
-/** Swap one boost's CSS in every open tab it applies to. */
+
 async function refreshBoost(before: Boost | undefined, after: Boost | undefined) {
+  const state = await loadState();
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
     if (!tab.id || !tab.url) continue;
-    if (before && boostsFor([before], tab.url).length) await removeBoost(tab.id, before.css);
-    if (after && boostsFor([after], tab.url).length) await insertBoost(tab.id, after.css);
+    const prevTracked = appliedBoostCssByTab.get(tab.id);
+    const beforeCss = prevTracked ?? (before && boostsFor([before], tab.url).length ? compileBoostCss(before) : '');
+    const space = state.spaces.find((s) => s.id === (state.tabSpaceMap[tab.id!] || state.activeSpaceId)) || state.spaces[0];
+    const nextCss = combinedCssForTab(tab.url, space, state);
+    if (beforeCss && beforeCss !== nextCss) {
+      await chrome.scripting?.removeCSS({ target: boostTarget(tab.id), css: beforeCss, origin: 'USER' }).catch(() => {});
+      appliedBoostCssByTab.delete(tab.id);
+    }
+    if (nextCss && nextCss !== beforeCss) {
+      await chrome.scripting?.insertCSS({ target: boostTarget(tab.id), css: nextCss, origin: 'USER' }).catch(() => {});
+      appliedBoostCssByTab.set(tab.id, nextCss);
+    }
+    if (after?.enabled && after.js?.trim() && boostsFor([after], tab.url).length) {
+      await chrome.scripting?.executeScript({
+        target: boostTarget(tab.id),
+        world: 'MAIN',
+        func: (scriptBody: string) => {
+          try {
+            const el = document.createElement('script');
+            el.textContent = scriptBody;
+            (document.head || document.documentElement)?.appendChild(el);
+            el.remove();
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        args: [after.js]
+      }).catch(() => {});
+    }
   }
 }
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   broadcastStateUpdate();
-  if (changeInfo?.status !== 'loading' || !tab?.url) return;
+  if (!tab?.url) return;
   const state = await loadState();
-  for (const boost of boostsFor(state.boosts, tab.url)) await insertBoost(tabId, boost.css);
+  const space = state.spaces.find((s) => s.id === (state.tabSpaceMap[tabId] || state.activeSpaceId)) || state.spaces[0];
+  if (changeInfo?.status === 'loading') {
+    const css = combinedCssForTab(tab.url, space, state);
+    if (css) {
+      await chrome.scripting?.insertCSS({ target: boostTarget(tabId), css, origin: 'USER' }).catch(() => {});
+      appliedBoostCssByTab.set(tabId, css);
+    } else {
+      appliedBoostCssByTab.delete(tabId);
+    }
+  } else if (changeInfo?.status === 'complete') {
+    for (const boost of boostsFor(state.boosts, tab.url)) {
+      if (!boost.js?.trim()) continue;
+      await chrome.scripting?.executeScript({
+        target: boostTarget(tabId),
+        world: 'MAIN',
+        func: (scriptBody: string) => {
+          try {
+            const el = document.createElement('script');
+            el.textContent = scriptBody;
+            (document.head || document.documentElement)?.appendChild(el);
+            el.remove();
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        args: [boost.js]
+      }).catch(() => {});
+    }
+    if (state.settings.syncChromeTabGroups) {
+      await syncChromeTabGroups(state);
+    }
+  }
 });
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
@@ -531,6 +730,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  appliedBoostCssByTab.delete(tabId);
   const state = await loadState();
   delete state.tabSpaceMap[tabId];
   delete state.tabLastAccessed[tabId];
@@ -679,6 +879,84 @@ async function searchOmnibox(query: string): Promise<OmniboxResultItem[]> {
       title: 'Toggle Mute on Current Tab',
       subtitle: 'Mute or unmute audio on the active tab',
       actionId: 'TOGGLE_MUTE_ACTIVE_TAB'
+    },
+    {
+      id: 'action-new-easel',
+      kind: 'action',
+      title: 'New Easel',
+      subtitle: 'Create an interactive Arc Easel board',
+      actionId: 'NEW_EASEL'
+    },
+    {
+      id: 'action-new-boost',
+      kind: 'action',
+      title: 'Style This Site (Boost)',
+      subtitle: 'Customize colors, fonts, CSS, and zapped elements',
+      actionId: 'OPEN_BOOST_EDITOR'
+    },
+    {
+      id: 'action-zap-element',
+      kind: 'action',
+      title: 'Zap Element on Page',
+      subtitle: 'Interactive element zapper for active tab',
+      actionId: 'START_ZAP_MODE'
+    },
+    {
+      id: 'action-capture-area',
+      kind: 'action',
+      title: 'Capture Portion of Page',
+      subtitle: 'Crop a screenshot to Library or an Easel',
+      actionId: 'START_CAPTURE_MODE'
+    },
+    {
+      id: 'action-open-library',
+      kind: 'action',
+      title: 'Open Arc Library',
+      subtitle: 'Archive, Easels, Boosts, Captures, and Downloads',
+      actionId: 'OPEN_LIBRARY'
+    },
+    {
+      id: 'action-copy-clean-url',
+      kind: 'action',
+      title: 'Copy Clean URL',
+      subtitle: 'Copy active URL with tracking parameters removed',
+      actionId: 'COPY_CLEAN_URL',
+      shortcut: '⇧⌘C'
+    },
+    {
+      id: 'action-copy-markdown-url',
+      kind: 'action',
+      title: 'Copy Page Link as Markdown',
+      subtitle: 'Format active tab as [Title](URL)',
+      actionId: 'COPY_MARKDOWN_URL'
+    },
+    {
+      id: 'action-sync-now',
+      kind: 'action',
+      title: 'Sync Now (Mac & iPhone)',
+      subtitle: 'Synchronize Spaces, pins, Boosts, and routes',
+      actionId: 'SYNC_NOW'
+    },
+    {
+      id: 'action-send-handoff',
+      kind: 'action',
+      title: 'Send Tab to Mac / iPhone',
+      subtitle: 'Hand off the current tab to paired devices',
+      actionId: 'SEND_TAB_HANDOFF'
+    },
+    {
+      id: 'action-toggle-folders',
+      kind: 'action',
+      title: 'Collapse / Expand All Folders',
+      subtitle: 'Toggle all folders in active Space',
+      actionId: 'TOGGLE_ALL_FOLDERS'
+    },
+    {
+      id: 'action-tidy-tabs',
+      kind: 'action',
+      title: 'Tidy Tabs by Site',
+      subtitle: 'Sort and group today’s tabs by hostname',
+      actionId: 'TIDY_TABS_BY_SITE'
     }
   ];
 
@@ -939,6 +1217,51 @@ async function searchOmnibox(query: string): Promise<OmniboxResultItem[]> {
     }
   }
 
+  // 6.5 Easels, Archived Tabs & Remote Device Tabs
+  if (q.length >= 1) {
+    const easels = await loadEasels();
+    for (const easel of easels) {
+      if (easel.title.toLowerCase().includes(q)) {
+        results.push({
+          id: `easel-${easel.id}`,
+          kind: 'action',
+          title: `🎨 Easel: ${easel.title}`,
+          subtitle: `${easel.items.length} item(s)`,
+          actionId: `OPEN_EASEL:${easel.id}`,
+          shortcut: 'Easel'
+        });
+      }
+    }
+    for (const arch of state.archive || []) {
+      if (arch.title.toLowerCase().includes(q) || arch.url.toLowerCase().includes(q)) {
+        results.push({
+          id: `arch-${arch.id}`,
+          kind: 'history',
+          title: arch.title,
+          subtitle: `Archived · ${formatHostname(arch.url)}`,
+          url: arch.url,
+          spaceId: arch.spaceId,
+          shortcut: 'Archive'
+        });
+      }
+    }
+    for (const dev of state.remoteDevices || []) {
+      for (const rtab of dev.activeTabs || []) {
+        if (rtab.title.toLowerCase().includes(q) || rtab.url.toLowerCase().includes(q)) {
+          results.push({
+            id: `remote-${rtab.id}`,
+            kind: 'tab',
+            title: rtab.title || rtab.url,
+            subtitle: `${dev.name} · ${formatHostname(rtab.url)}`,
+            url: rtab.url,
+            spaceId: rtab.spaceId,
+            shortcut: dev.platform
+          });
+        }
+      }
+    }
+  }
+
   return results.slice(0, 18);
 }
 
@@ -1072,13 +1395,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       case 'UPDATE_SPACE': {
-        const { spaceId, name, icon, theme } = message;
+        const { spaceId, name, icon, theme, customColors, appearance } = message;
         const space = state.spaces.find((s) => s.id === spaceId);
         if (space) {
           if (name) space.name = name.trim();
           if (icon) space.icon = icon;
           if (theme && theme in SPACE_THEMES) space.theme = theme;
+          if (Array.isArray(customColors)) {
+            space.customColors = customColors.length ? customColors : undefined;
+          }
+          if (appearance === 'auto' || appearance === 'light' || appearance === 'dark') {
+            space.appearance = appearance;
+          }
           await saveState(state);
+          if (state.settings.syncChromeTabGroups) await syncChromeTabGroups(state);
         }
         sendResponse(await getFullSnapshot());
         break;
@@ -1398,8 +1728,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       case 'UPDATE_SETTINGS': {
         const { settings } = message;
+        const paletteChanged = settings.exposeArcPalette !== undefined && settings.exposeArcPalette !== state.settings.exposeArcPalette;
         state.settings = { ...state.settings, ...settings };
         await saveState(state);
+        if (state.settings.syncChromeTabGroups) await syncChromeTabGroups(state);
+        if (paletteChanged) await refreshBoost(undefined, undefined);
         sendResponse(await getFullSnapshot());
         break;
       }
@@ -1455,12 +1788,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const host = normalizePattern(String(message.host || '')).split('/')[0];
         const css = String(message.css || '');
         if (!host) throw new Error('Enter a site such as github.com');
-        if (!css.trim()) throw new Error('Write some CSS for this Boost');
+        const hasVisuals =
+          Boolean(message.tintColor) ||
+          Boolean(message.invert) ||
+          Boolean(message.js?.trim()) ||
+          (Array.isArray(message.zappedSelectors) && message.zappedSelectors.length > 0) ||
+          (message.fontFamily && message.fontFamily !== 'default') ||
+          (message.textCase && message.textCase !== 'none') ||
+          Boolean(css.trim());
+        if (!hasVisuals) throw new Error('Change a Boost style, zap an element, or write CSS/JS');
         state.boosts ||= [];
         const existing = state.boosts.find((boost) => boost.id === message.id)
           || state.boosts.find((boost) => boost.host === host);
         const before = existing && { ...existing };
-        const after: Boost = { id: existing?.id || crypto.randomUUID(), host, css, enabled: message.enabled !== false };
+        const after: Boost = {
+          id: existing?.id || crypto.randomUUID(),
+          host,
+          name: message.name ? String(message.name) : existing?.name || host,
+          css,
+          enabled: message.enabled !== false,
+          tintColor: message.tintColor ?? existing?.tintColor,
+          hue: message.hue ?? existing?.hue,
+          tintIntensity: message.tintIntensity ?? existing?.tintIntensity,
+          invert: message.invert ?? existing?.invert,
+          brightness: message.brightness ?? existing?.brightness,
+          contrast: message.contrast ?? existing?.contrast,
+          saturate: message.saturate ?? existing?.saturate,
+          fontFamily: message.fontFamily ?? existing?.fontFamily,
+          fontSize: message.fontSize ?? existing?.fontSize,
+          textCase: message.textCase ?? existing?.textCase,
+          zappedSelectors: Array.isArray(message.zappedSelectors) ? message.zappedSelectors : existing?.zappedSelectors,
+          js: message.js ?? existing?.js
+        };
         if (existing) Object.assign(existing, after);
         else state.boosts.push(after);
         await saveState(state);
@@ -1581,8 +1940,291 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           await chrome.tabs.duplicate(activeTab.id);
         } else if (actionId === 'TOGGLE_MUTE_ACTIVE_TAB' && activeTab?.id) {
           await chrome.tabs.update(activeTab.id, { muted: !activeTab.mutedInfo?.muted });
+        } else if (actionId === 'NEW_EASEL') {
+          await createTab({ url: chrome.runtime.getURL('easel.html'), active: true });
+        } else if (typeof actionId === 'string' && actionId.startsWith('OPEN_EASEL:')) {
+          const eid = actionId.slice('OPEN_EASEL:'.length);
+          await createTab({ url: chrome.runtime.getURL(`easel.html?id=${encodeURIComponent(eid)}`), active: true });
+        } else if (actionId === 'START_ZAP_MODE' && activeTab?.id && !activeTab.url?.startsWith('chrome://')) {
+          await chrome.tabs.sendMessage(activeTab.id, { type: 'START_ZAP_MODE' }).catch(() => {});
+        } else if (actionId === 'START_CAPTURE_MODE' && activeTab?.id && !activeTab.url?.startsWith('chrome://')) {
+          await chrome.tabs.sendMessage(activeTab.id, { type: 'START_CAPTURE_MODE' }).catch(() => {});
+        } else if (actionId === 'SYNC_NOW') {
+          await liveSync.syncNow('full');
+        } else if (actionId === 'SEND_TAB_HANDOFF' && activeTab?.url) {
+          await liveSync.sendTabHandoff(activeTab.url, activeTab.title || activeTab.url, state.activeSpaceId);
+        } else if (actionId === 'TOGGLE_ALL_FOLDERS') {
+          const sp = state.spaces.find((s) => s.id === state.activeSpaceId);
+          if (sp) {
+            const folders = pinnedRows(sp.pinnedItems).filter((r) => r.item.type === 'folder').map((r) => r.item as PinnedFolder);
+            const anyOpen = folders.some((f) => !f.collapsed);
+            for (const f of folders) f.collapsed = anyOpen;
+            await saveState(state);
+          }
+        } else if (actionId === 'TIDY_TABS_BY_SITE') {
+          const snapshot = await getFullSnapshot();
+          const today = getTodayTabs(state, snapshot.tabs, state.activeSpaceId)
+            .sort((a, b) => formatHostname(a.url).localeCompare(formatHostname(b.url)));
+          for (let i = 0; i < today.length; i++) {
+            await chrome.tabs.move(today[i].id, { index: i }).catch(() => {});
+          }
+        } else if ((actionId === 'COPY_CLEAN_URL' || actionId === 'COPY_MARKDOWN_URL') && activeTab?.id && activeTab.url) {
+          const text = actionId === 'COPY_MARKDOWN_URL'
+            ? `[${activeTab.title || formatHostname(activeTab.url)}](${cleanUrl(activeTab.url)})`
+            : cleanUrl(activeTab.url);
+          await chrome.scripting?.executeScript({
+            target: { tabId: activeTab.id },
+            func: (val: string) => { void navigator.clipboard?.writeText(val).catch(() => {}); },
+            args: [text]
+          }).catch(() => {});
+        } else if (actionId === 'OPEN_BOOST_EDITOR' || actionId === 'OPEN_LIBRARY') {
+          chrome.runtime.sendMessage({ type: 'OPEN_SIDEBAR_PANEL', panel: actionId === 'OPEN_BOOST_EDITOR' ? 'boosts' : 'library' }).catch(() => {});
         }
         sendResponse({ ok: true });
+        break;
+      }
+
+      case 'ZAP_SELECTOR': {
+        const host = normalizePattern(String(message.host || '')).split('/')[0];
+        const selectors = Array.isArray(message.selectors)
+          ? message.selectors.map(String)
+          : message.selector ? [String(message.selector)] : [];
+        if (!host || !selectors.length) throw new Error('Nothing to zap');
+        state.boosts ||= [];
+        let boost = state.boosts.find((b) => b.host === host);
+        if (!boost) {
+          boost = { id: crypto.randomUUID(), host, name: host, css: '', enabled: true, zappedSelectors: [] };
+          state.boosts.push(boost);
+        }
+        boost.enabled = true;
+        boost.zappedSelectors = [...new Set([...(boost.zappedSelectors || []), ...selectors])];
+        await saveState(state);
+        await refreshBoost(boost, boost);
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'UNZAP_SELECTOR': {
+        const host = normalizePattern(String(message.host || '')).split('/')[0];
+        const boost = (state.boosts || []).find((b) => b.host === host);
+        if (boost) {
+          boost.zappedSelectors = (boost.zappedSelectors || []).filter((s) => s !== message.selector);
+          await saveState(state);
+          await refreshBoost(boost, boost);
+        }
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'UNZAP_ALL': {
+        const host = normalizePattern(String(message.host || '')).split('/')[0];
+        const boost = (state.boosts || []).find((b) => b.host === host);
+        if (boost) {
+          boost.zappedSelectors = [];
+          await saveState(state);
+          await refreshBoost(boost, boost);
+        }
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'SET_FOLDER_LIVE_FEED': {
+        const space = state.spaces.find((s) => s.id === (message.spaceId || state.activeSpaceId));
+        const folder = space ? findFolder(space.pinnedItems, message.folderId) : undefined;
+        if (!folder) throw new Error('Folder not found');
+        if (message.url && String(message.url).trim()) {
+          folder.liveFeed = {
+            kind: message.kind || 'rss',
+            url: String(message.url).trim(),
+            refreshMinutes: Number(message.refreshMinutes) || 15
+          };
+          await saveState(state);
+          await refreshFolderFeed(space!.id, folder.id);
+        } else {
+          folder.liveFeed = undefined;
+          await saveState(state);
+        }
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'REFRESH_LIVE_FOLDER': {
+        await refreshFolderFeed(message.spaceId || state.activeSpaceId, message.folderId);
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'COLLAPSE_ALL_FOLDERS': {
+        const sp = state.spaces.find((s) => s.id === (message.spaceId || state.activeSpaceId));
+        if (sp) {
+          const folders = pinnedRows(sp.pinnedItems).filter((r) => r.item.type === 'folder').map((r) => r.item as PinnedFolder);
+          const next = Boolean(message.collapsed);
+          for (const f of folders) f.collapsed = next;
+          await saveState(state);
+        }
+        sendResponse(await getFullSnapshot());
+        break;
+      }
+
+      case 'START_ZAP_MODE':
+      case 'START_CAPTURE_MODE': {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (activeTab?.id && !activeTab.url?.startsWith('chrome://')) {
+          await chrome.tabs.sendMessage(activeTab.id, { type: message.type }).catch(() => {});
+        }
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'CAPTURE_VISIBLE_TAB': {
+        const dataUrl = sender.tab?.windowId !== undefined
+          ? await chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: 'png' })
+          : await chrome.tabs.captureVisibleTab({ format: 'png' });
+        sendResponse({ ok: true, dataUrl });
+        break;
+      }
+
+      case 'SAVE_CAPTURE': {
+        const cap: CapturedImage = {
+          id: `cap-${Date.now()}`,
+          dataUrl: String(message.dataUrl || ''),
+          title: String(message.title || 'Capture'),
+          pageUrl: String(message.pageUrl || ''),
+          createdAt: Date.now()
+        };
+        const list = [cap, ...(await loadCaptures())].slice(0, 40);
+        await chrome.storage.local.set({ [CAPTURES_KEY]: list });
+        if (message.sendToEasel) {
+          if (message.easelId) {
+            const easels = await loadEasels();
+            const target = easels.find((e) => e.id === message.easelId);
+            if (target) {
+              const updated = addEaselItem(target, {
+                id: `item-${Date.now()}`,
+                kind: 'image',
+                x: 80,
+                y: 80,
+                w: 500,
+                h: 320,
+                color: '#ffffff',
+                src: cap.dataUrl,
+                title: cap.title
+              });
+              await chrome.storage.local.set({ [EASELS_KEY]: easels.map((e) => (e.id === target.id ? updated : e)) });
+              await createTab({ url: chrome.runtime.getURL(`easel.html?id=${encodeURIComponent(target.id)}`), active: true });
+            }
+          } else {
+            await createTab({ url: chrome.runtime.getURL(`easel.html?captureId=${encodeURIComponent(cap.id)}`), active: true });
+          }
+        }
+        sendResponse({ ok: true, capture: cap });
+        break;
+      }
+
+      case 'GET_LIBRARY_DATA': {
+        const [easels, captures, downloads] = await Promise.all([
+          loadEasels(),
+          loadCaptures(),
+          chrome.downloads?.search ? chrome.downloads.search({ limit: 30, orderBy: ['-startTime'] }).catch(() => []) : Promise.resolve([])
+        ]);
+        sendResponse({ ok: true, easels, captures, downloads });
+        break;
+      }
+
+      case 'SAVE_EASEL': {
+        const easels = await loadEasels();
+        const doc = message.easel as EaselDocument | undefined;
+        const created = doc || createEasel(message.title || 'Untitled Easel');
+        const next = [created, ...easels.filter((e) => e.id !== created.id)];
+        await chrome.storage.local.set({ [EASELS_KEY]: next });
+        sendResponse({ ok: true, easel: created, easels: next });
+        break;
+      }
+
+      case 'DELETE_EASEL': {
+        const next = (await loadEasels()).filter((e) => e.id !== message.id);
+        await chrome.storage.local.set({ [EASELS_KEY]: next });
+        sendResponse({ ok: true, easels: next });
+        break;
+      }
+
+      case 'DELETE_CAPTURE': {
+        const next = (await loadCaptures()).filter((c) => c.id !== message.id);
+        await chrome.storage.local.set({ [CAPTURES_KEY]: next });
+        sendResponse({ ok: true, captures: next });
+        break;
+      }
+
+      case 'OPEN_EASEL': {
+        const url = message.id
+          ? chrome.runtime.getURL(`easel.html?id=${encodeURIComponent(String(message.id))}`)
+          : chrome.runtime.getURL('easel.html');
+        await createTab({ url, active: true });
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'PAIR_FROM_URI': {
+        if (!parsePairingUri(String(message.uri || ''))) throw new Error('Invalid pairing link');
+        const next = await liveSync.pairFromUri(String(message.uri));
+        sendResponse({ ok: true, state: next, tabs: (await getFullSnapshot()).tabs });
+        break;
+      }
+
+      case 'CONFIGURE_SYNC': {
+        const urls = Array.isArray(message.urls)
+          ? message.urls
+          : String(message.url || '').split(',').map((s) => s.trim()).filter(Boolean);
+        const next = await liveSync.configure({ urls, token: String(message.token || ''), peerName: message.peerName });
+        sendResponse({ ok: true, state: next, tabs: (await getFullSnapshot()).tabs });
+        break;
+      }
+
+      case 'AUTO_PAIR_SYNC': {
+        const res = await liveSync.pairFromNativeHost();
+        if (!res.ok) throw new Error(res.error || 'Could not auto-pair with Cra');
+        sendResponse({ ok: true, state: res.state, tabs: (await getFullSnapshot()).tabs });
+        break;
+      }
+
+      case 'DISCONNECT_SYNC': {
+        const next = await liveSync.disconnect();
+        sendResponse({ ok: true, state: next, tabs: (await getFullSnapshot()).tabs });
+        break;
+      }
+
+      case 'SYNC_NOW': {
+        const next = await liveSync.syncNow('full');
+        sendResponse({ ok: true, state: next, tabs: (await getFullSnapshot()).tabs });
+        break;
+      }
+
+      case 'SEND_TAB_HANDOFF': {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const url = message.url || activeTab?.url;
+        const title = message.title || activeTab?.title || url;
+        if (!url) throw new Error('No page URL to send');
+        await liveSync.sendTabHandoff(url, title, message.spaceId || state.activeSpaceId, message.targetDeviceId);
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'EXPORT_SIDEBAR_BUNDLE': {
+        sendResponse({ ok: true, json: exportArcSidebarBundle(state) });
+        break;
+      }
+
+      case 'IMPORT_SIDEBAR_BUNDLE': {
+        const parsed = JSON.parse(String(message.json || '{}'));
+        if (Array.isArray(parsed.spaces) && parsed.spaces.length > 0) {
+          state.spaces = parsed.spaces;
+          state.activeSpaceId = parsed.spaces[0].id;
+        }
+        if (Array.isArray(parsed.routingRules)) state.routingRules = parsed.routingRules;
+        if (Array.isArray(parsed.siteSearches)) state.siteSearches = parsed.siteSearches;
+        if (Array.isArray(parsed.boosts)) state.boosts = parsed.boosts;
+        await saveState(state);
+        sendResponse(await getFullSnapshot());
         break;
       }
 
@@ -2380,7 +3022,7 @@ async function callOpenAiVoiceAgent(
     const systemContent = [
       agentMode === 'antigravity'
         ? 'You are Antigravity Browser Agent, an agentic coding & browser assistant inside Chrome with direct access to the current webpage DOM, media players, and browser tabs.'
-        : 'You are ChatGPT Browser Agent inside Arc for Chrome, with direct live access to the current webpage DOM, buttons, inputs, video players, and open tabs.',
+        : 'You are ChatGPT Browser Agent inside Arc clone, with direct live access to the current webpage DOM, buttons, inputs, video players, and open tabs.',
       'Be helpful, concrete, and directly use your browser/DOM tools whenever the user asks to interact with, fix, click, type, or inspect something on the page.',
       `Current Page: "${pageContext.title || ''}" (${pageContext.url || ''})`,
       pageContext.selection ? `Selected Text: "${pageContext.selection.slice(0, 1000)}"` : '',

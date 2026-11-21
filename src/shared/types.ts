@@ -81,11 +81,22 @@ export interface PinnedLink {
   tabId?: number;
 }
 
+export interface PinnedLiveFeed {
+  kind: 'rss' | 'json' | 'github-prs';
+  url: string;
+  refreshMinutes?: number;
+  lastUpdatedAt?: number;
+  lastError?: string;
+}
+
 export interface PinnedFolder {
   id: string;
   type: 'folder';
   title: string;
   collapsed?: boolean;
+  icon?: string;
+  iconColor?: string;
+  liveFeed?: PinnedLiveFeed;
   children: PinnedItem[];
 }
 
@@ -96,6 +107,8 @@ export interface Space {
   name: string;
   icon: string;
   theme: SpaceThemeId;
+  customColors?: string[];
+  appearance?: 'auto' | 'light' | 'dark';
   favorites?: FavoriteItem[];
   pinnedItems: PinnedItem[];
   chromeGroupId?: number;
@@ -135,6 +148,45 @@ export interface ExtensionSettings {
   openaiApiKey?: string;
   voiceAutoSpeak?: boolean;
   voiceContinuous?: boolean;
+  exposeArcPalette?: boolean;
+  cleanCopyUrl?: boolean;
+}
+
+export interface SyncConfig {
+  enabled: boolean;
+  urls: string[];
+  token: string;
+  deviceId: string;
+  deviceName: string;
+  peerName?: string;
+  lastRevision?: number;
+  lastSyncedAt?: number;
+  lastError?: string;
+}
+
+export interface RemoteTabInfo {
+  id: string;
+  url: string;
+  title: string;
+  spaceId?: string;
+  fromDeviceId: string;
+  fromDeviceName: string;
+}
+
+export interface RemoteDeviceSummary {
+  id: string;
+  name: string;
+  platform: string;
+  lastSeenAt: string;
+  activeTabs: RemoteTabInfo[];
+}
+
+export interface CapturedImage {
+  id: string;
+  dataUrl: string;
+  title: string;
+  pageUrl: string;
+  createdAt: number;
 }
 
 export interface ArchivedTab {
@@ -157,6 +209,25 @@ export interface ArcState {
   routingRules?: RoutingRule[];
   siteSearches?: SiteSearch[];
   boosts?: Boost[];
+  syncConfig?: SyncConfig;
+  remoteDevices?: RemoteDeviceSummary[];
+}
+
+export function resolveSpaceTheme(space?: Pick<Space, 'theme' | 'customColors'>): SpaceTheme {
+  const base = SPACE_THEMES[space?.theme || 'indigo'] || SPACE_THEMES.indigo;
+  if (space?.customColors && space.customColors.length > 0) {
+    const colors = space.customColors;
+    const gradient =
+      colors.length === 1
+        ? colors[0]
+        : `linear-gradient(145deg, ${colors.join(', ')})`;
+    return {
+      ...base,
+      gradient,
+      accent: colors[colors.length - 1] || base.accent
+    };
+  }
+  return base;
 }
 
 export interface OmniboxResultItem {

@@ -10,3 +10,4 @@
 .DS_Store
 .venv/
 __pycache__/
+/native/arc-sync/arc-sync-host.sh

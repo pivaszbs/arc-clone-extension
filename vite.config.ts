@@ -14,7 +14,8 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         input: anime ? { offline: resolve(__dirname, 'offline.html') } : {
           sidepanel: resolve(__dirname, 'sidepanel.html'),
-          newtab: resolve(__dirname, 'newtab.html')
+          newtab: resolve(__dirname, 'newtab.html'),
+          easel: resolve(__dirname, 'easel.html')
         }
       }
     }

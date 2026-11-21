@@ -17,12 +17,86 @@ export interface SiteSearch {
   url: string;
 }
 
+export type BoostTextCase = 'none' | 'upper' | 'lower' | 'capitalize';
+
 export interface Boost {
   id: string;
   /** Host the CSS applies to, subdomains included. */
   host: string;
+  name?: string;
   css: string;
   enabled: boolean;
+  tintColor?: string;
+  hue?: number;
+  tintIntensity?: number;
+  invert?: boolean;
+  brightness?: number;
+  contrast?: number;
+  saturate?: number;
+  fontFamily?: string;
+  fontSize?: number;
+  textCase?: BoostTextCase;
+  zappedSelectors?: string[];
+  js?: string;
+}
+
+export function compileBoostCss(boost: Boost): string {
+  const parts: string[] = [];
+
+  if (boost.zappedSelectors && boost.zappedSelectors.length > 0) {
+    const valid = boost.zappedSelectors.map((s) => s.trim()).filter(Boolean);
+    if (valid.length > 0) {
+      parts.push(`${valid.join(', ')} { display: none !important; }`);
+    }
+  }
+
+  const filters: string[] = [];
+  if (boost.invert) filters.push('invert(1) hue-rotate(180deg)');
+  if (typeof boost.hue === 'number' && boost.hue !== 0) {
+    filters.push(`hue-rotate(${Math.round(boost.hue)}deg)`);
+  }
+  if (typeof boost.brightness === 'number' && boost.brightness !== 100 && boost.brightness !== 50) {
+    filters.push(`brightness(${Math.max(20, Math.min(250, boost.brightness))}%)`);
+  }
+  if (typeof boost.contrast === 'number' && boost.contrast !== 100) {
+    filters.push(`contrast(${Math.max(20, Math.min(250, boost.contrast))}%)`);
+  }
+  if (typeof boost.saturate === 'number' && boost.saturate !== 100) {
+    filters.push(`saturate(${Math.max(0, Math.min(300, boost.saturate))}%)`);
+  }
+  if (filters.length > 0) {
+    parts.push(`html { filter: ${filters.join(' ')} !important; }`);
+    if (boost.invert) {
+      parts.push('img, video, picture, canvas, svg { filter: invert(1) hue-rotate(180deg) !important; }');
+    }
+  }
+
+  if (boost.tintColor && (boost.tintIntensity ?? 0) > 0) {
+    const alpha = Math.max(0.05, Math.min(0.65, (boost.tintIntensity ?? 25) / 100));
+    parts.push(
+      `html::after { content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 2147483640; background: ${boost.tintColor}; opacity: ${alpha.toFixed(2)}; mix-blend-mode: multiply; }`
+    );
+  }
+
+  const bodyRules: string[] = [];
+  if (boost.fontFamily && boost.fontFamily !== 'default') {
+    bodyRules.push(`font-family: ${boost.fontFamily} !important;`);
+  }
+  if (typeof boost.fontSize === 'number' && boost.fontSize !== 100) {
+    bodyRules.push(`font-size: ${Math.max(60, Math.min(200, boost.fontSize))}% !important;`);
+  }
+  if (boost.textCase && boost.textCase !== 'none') {
+    const tf = boost.textCase === 'upper' ? 'uppercase' : boost.textCase === 'lower' ? 'lowercase' : 'capitalize';
+    bodyRules.push(`text-transform: ${tf} !important;`);
+  }
+  if (bodyRules.length > 0) {
+    parts.push(`body, body * { ${bodyRules.join(' ')} }`);
+  }
+
+  if (boost.css && boost.css.trim()) {
+    parts.push(boost.css);
+  }
+  return parts.join('\n').trim();
 }
 
 export const DEFAULT_SITE_SEARCHES: SiteSearch[] = [
@@ -103,5 +177,5 @@ export function boostsFor(boosts: Boost[] | undefined, url: string): Boost[] {
   const host = hostOf(url);
   if (!host) return [];
   return (boosts || []).filter((boost) =>
-    boost.enabled && boost.css.trim() && hostMatches(host, normalizePattern(boost.host).split('/')[0]));
+    boost.enabled && Boolean(compileBoostCss(boost).trim()) && hostMatches(host, normalizePattern(boost.host).split('/')[0]));
 }

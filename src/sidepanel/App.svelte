@@ -4,7 +4,9 @@
   import { shouldPeek } from '../shared/interaction';
   import CommandPalette from '../shared/CommandPalette.svelte';
   import Icon from '../shared/Icon.svelte';
+  import LibraryDrawer from './LibraryDrawer.svelte';
   import SiteTools from './SiteTools.svelte';
+  import { cleanUrl, parsePairingUri } from '../shared/arc-sync';
   import { containFocus, isActivationKey } from '../shared/focus';
   import { findFolder, pinnedRows } from '../shared/pins';
   import { getSpaceFavorites, getTodayTabs, isRootDomainUrl, sameHost, urlKey } from '../shared/tabs';
@@ -18,7 +20,8 @@
     SPACE_THEMES,
     SUPPORTED_LANGUAGES,
     getFaviconUrl,
-    parseCommandBarInput
+    parseCommandBarInput,
+    resolveSpaceTheme
   } from '../shared/types';
 
   let arcState = $state<ArcState>({
@@ -91,7 +94,21 @@
   // Settings drawer
   let showSettings = $state(false);
   let showArchive = $state(false);
+  let showLibrary = $state(false);
   let showSiteTools = $state(false);
+  let hoveredFav = $state<FavoriteItem | null>(null);
+  let hoverFavTimer: ReturnType<typeof setTimeout> | null = null;
+  let syncPairUriInput = $state('');
+  let syncUrlInput = $state('');
+  let syncTokenInput = $state('');
+  let syncBusy = $state(false);
+  let showRemoteDevices = $state(true);
+  let spaceUseCustomColors = $state(false);
+  let spaceCustomStart = $state('#4f46e5');
+  let spaceCustomEnd = $state('#1e1b4b');
+  let editingFeedFolderId = $state<string | null>(null);
+  let feedUrlInput = $state('');
+  let feedKindInput = $state<'rss' | 'json' | 'github-prs'>('rss');
   let archiveQuery = $state('');
   let renamingItem = $state<string | null>(null);
   let renameValue = $state('');
@@ -145,7 +162,7 @@
   let customPinUrl = $state('');
   let customPinTitle = $state('');
 
-  let currentTheme = $derived(SPACE_THEMES[activeSpace?.theme || 'indigo'] || SPACE_THEMES.indigo);
+  let currentTheme = $derived(resolveSpaceTheme(activeSpace));
 
   let activeTab = $derived<TabInfo | undefined>(tabs.find((t) => t.active && (panelWindowId === undefined || t.windowId === panelWindowId)));
 
@@ -169,9 +186,12 @@
     chrome.windows.getCurrent().then((window) => panelWindowId = window.id).catch(() => {});
     refreshSnapshot();
 
-    const listener = (msg: { type?: string }) => {
+    const listener = (msg: { type?: string; panel?: string }) => {
       if (msg?.type === 'ARC_STATE_UPDATED') {
         refreshSnapshot();
+      } else if (msg?.type === 'OPEN_SIDEBAR_PANEL') {
+        if (msg.panel === 'boosts') showSiteTools = true;
+        else if (msg.panel === 'library') showLibrary = true;
       }
     };
     chrome.runtime.onMessage.addListener(listener);
@@ -221,7 +241,9 @@
 
   async function copyActiveUrl(e: MouseEvent) {
     e.stopPropagation();
-    if (!activeTab?.url || !await copyText(activeTab.url, 'Link copied')) return;
+    if (!activeTab?.url) return;
+    const text = arcState.settings.cleanCopyUrl !== false ? cleanUrl(activeTab.url) : activeTab.url;
+    if (!await copyText(text, 'Clean link copied')) return;
     copiedUrl = true;
     setTimeout(() => copiedUrl = false, 1600);
   }
@@ -275,6 +297,7 @@
     spaceNameInput = '';
     spaceIconInput = '🪐';
     spaceThemeInput = 'sunset';
+    spaceUseCustomColors = false;
     showSpaceModal = true;
   }
 
@@ -286,6 +309,9 @@
     spaceNameInput = space.name;
     spaceIconInput = space.icon;
     spaceThemeInput = space.theme;
+    spaceUseCustomColors = Boolean(space.customColors?.length);
+    spaceCustomStart = space.customColors?.[0] || '#4f46e5';
+    spaceCustomEnd = space.customColors?.[1] || '#1e1b4b';
     showSpaceModal = true;
   }
 
@@ -293,8 +319,14 @@
     if (!spaceNameInput.trim() || savingSpace) return;
     savingSpace = true;
     try {
-      const res = await requestArc({ type: editingSpaceId ? 'UPDATE_SPACE' : 'CREATE_SPACE', spaceId: editingSpaceId,
-        name: spaceNameInput, icon: spaceIconInput, theme: spaceThemeInput });
+      const res = await requestArc({
+        type: editingSpaceId ? 'UPDATE_SPACE' : 'CREATE_SPACE',
+        spaceId: editingSpaceId,
+        name: spaceNameInput,
+        icon: spaceIconInput,
+        theme: spaceThemeInput,
+        customColors: spaceUseCustomColors ? [spaceCustomStart, spaceCustomEnd] : []
+      });
       if (res?.state) { arcState = res.state; tabs = res.tabs; }
       showSpaceModal = false;
       notify('Space saved');
@@ -546,6 +578,14 @@
           tabindex="0"
           onclick={(e) => openUrlOrSwitch(fav.url, e)}
           onkeydown={(e) => isActivationKey(e) && openUrlOrSwitch(fav.url)}
+          onpointerenter={() => {
+            if (hoverFavTimer) clearTimeout(hoverFavTimer);
+            hoverFavTimer = setTimeout(() => { hoveredFav = fav; }, 350);
+          }}
+          onpointerleave={() => {
+            if (hoverFavTimer) { clearTimeout(hoverFavTimer); hoverFavTimer = null; }
+            if (hoveredFav?.id === fav.id) hoveredFav = null;
+          }}
           title="{fav.title} ({fav.url}) — Shift+Click for Peek"
         >
           {#if getFaviconUrl(fav.url, fav.favIconUrl)}
@@ -576,6 +616,13 @@
         </button>
       {/if}
     </div>
+
+    {#if hoveredFav}
+      <div class="fav-preview-card" role="status">
+        <strong>{hoveredFav.title}</strong>
+        <span>{cleanUrl(hoveredFav.url)}</span>
+      </div>
+    {/if}
 
     {#if showAddFavForm}
       <div class="new-folder-box" style="flex-direction: column; align-items: stretch; gap: 6px; margin-top: 8px;">
@@ -716,6 +763,20 @@
               <span class="row-title">{item.title}</span>
               <div class="row-hover-actions">
                 <button class="row-btn" aria-label="Rename {item.title}" title="Rename" onclick={(event) => startRename(event, item.id, item.title)}>✎</button>
+                <button class="row-btn" aria-label="Live folder feed" title="Configure RSS / JSON Live Feed" onclick={(event) => {
+                  event.stopPropagation();
+                  editingFeedFolderId = editingFeedFolderId === item.id ? null : item.id;
+                  feedUrlInput = item.liveFeed?.url || '';
+                  feedKindInput = item.liveFeed?.kind || 'rss';
+                }}>📡</button>
+                {#if item.liveFeed?.url}
+                  <button class="row-btn" aria-label="Refresh {item.title}" title="Refresh Live Folder" onclick={async (event) => {
+                    event.stopPropagation();
+                    const res = await requestArc({ type: 'REFRESH_LIVE_FOLDER', spaceId: activeSpace.id, folderId: item.id });
+                    if (res?.state) arcState = res.state;
+                    notify('Live folder refreshed');
+                  }}>↻</button>
+                {/if}
                 <button
                   class="row-btn"
                   onclick={(e) => { e.stopPropagation(); startNewFolder(item.id); }}
@@ -744,6 +805,26 @@
                 </button>
               </div>
             </div>
+            {#if editingFeedFolderId === item.id}
+              <form class="new-folder-box" style="flex-direction:column;align-items:stretch;gap:6px;margin:4px 0;" onsubmit={async (e) => {
+                e.preventDefault();
+                const res = await requestArc({ type: 'SET_FOLDER_LIVE_FEED', spaceId: activeSpace.id, folderId: item.id, kind: feedKindInput, url: feedUrlInput });
+                if (res?.state) arcState = res.state;
+                editingFeedFolderId = null;
+                notify(feedUrlInput.trim() ? 'Live feed updated' : 'Live feed cleared');
+              }}>
+                <select bind:value={feedKindInput}>
+                  <option value="rss">RSS / Atom Feed</option>
+                  <option value="github-prs">GitHub JSON / PRs</option>
+                  <option value="json">Custom JSON</option>
+                </select>
+                <input placeholder="https://news.ycombinator.com/rss" bind:value={feedUrlInput} />
+                <div style="display:flex;gap:6px;">
+                  <button type="submit">Save Feed</button>
+                  <button type="button" onclick={() => (editingFeedFolderId = null)}>Cancel</button>
+                </div>
+              </form>
+            {/if}
           {:else}
             <div
               class="pinned-row" class:child-row={depth > 0} class:active={isCurrentUrl(item.url) || activeTab?.id === item.tabId}
@@ -889,6 +970,52 @@
         <p class="empty-state">No tabs in Today.<br /><span>Open a new tab to get started.</span></p>
       {/if}
     </section>
+
+    {#if arcState.remoteDevices && arcState.remoteDevices.length > 0}
+      <div class="arc-divider">
+        <button class="clear-btn" onclick={() => (showRemoteDevices = !showRemoteDevices)}>
+          {showRemoteDevices ? '▾' : '▸'} Other Devices · {arcState.remoteDevices.length}
+        </button>
+        <div class="divider-line"></div>
+        {#if activeTab?.url}
+          <button
+            class="clear-btn"
+            onclick={async () => {
+              try {
+                await requestArc({ type: 'SEND_TAB_HANDOFF', url: activeTab.url, title: activeTab.title });
+                notify('Sent active tab to Mac / iPhone');
+              } catch (err) {
+                notify(err instanceof Error ? err.message : 'Handoff failed');
+              }
+            }}
+          >Send Tab</button>
+        {/if}
+      </div>
+      {#if showRemoteDevices}
+        <section class="today-tabs">
+          {#each arcState.remoteDevices as device (device.id)}
+            <div class="remote-device-label">{device.name} ({device.platform})</div>
+            {#each device.activeTabs as rtab (rtab.id)}
+              <div
+                class="tab-row"
+                role="button"
+                tabindex="0"
+                onclick={() => openUrlOrSwitch(rtab.url)}
+                onkeydown={(e) => isActivationKey(e) && openUrlOrSwitch(rtab.url)}
+                title="{rtab.title} ({rtab.url})"
+              >
+                {#if getFaviconUrl(rtab.url)}
+                  <img src={getFaviconUrl(rtab.url)} alt="" class="row-favicon" />
+                {:else}
+                  <span class="row-favicon-fallback"><Icon name="globe" /></span>
+                {/if}
+                <span class="row-title">{rtab.title || rtab.url}</span>
+              </div>
+            {/each}
+          {/each}
+        </section>
+      {/if}
+    {/if}
   </main>
 
   <!-- Bottom Dock: Space Switcher, Translator & Settings -->
@@ -914,6 +1041,7 @@
     </div>
 
     <div class="dock-utilities">
+      <button class="utility-btn" title="Arc Library (Archive, Easels, Boosts, Captures)" aria-label="Arc Library" onclick={() => showLibrary = true}>⊞</button>
       <button class="utility-btn" title="Archived Tabs" aria-label="Archived Tabs" onclick={() => showArchive = true}>↺</button>
       <button class="utility-btn" title="Split View" aria-label="Split View" onclick={() => { splitTargetId = ''; showSplit = true; }}>◫</button>
       <button
@@ -941,6 +1069,16 @@
 
   {#if showSiteTools}
     <SiteTools {arcState} activeUrl={activeTab?.url} {notify} onstate={(next) => arcState = next} onclose={() => showSiteTools = false} />
+  {/if}
+
+  {#if showLibrary}
+    <LibraryDrawer
+      {arcState}
+      {notify}
+      onstate={(next) => (arcState = next)}
+      onclose={() => (showLibrary = false)}
+      onOpenBoosts={() => (showSiteTools = true)}
+    />
   {/if}
 
   {#if showArchive}
@@ -1146,6 +1284,95 @@
         </div>
         <button class="primary-btn" onclick={() => { showSettings = false; showSiteTools = true; }}>Routes, Site Search and Boosts</button>
         <button class="primary-btn" onclick={async () => { try { await requestArc({ type: 'RESET_SPACE' }); notify('Pinned tabs reset'); } catch { notify('Could not reset pinned tabs.'); } }}>Reset pinned tabs to saved URLs</button>
+
+        <div class="form-row">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" style="width:auto" checked={arcState.settings.syncChromeTabGroups} onchange={(e) => updateSettings({ syncChromeTabGroups: e.currentTarget.checked })} />
+            <span>Sync Spaces as Chrome Tab Groups</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" style="width:auto" checked={arcState.settings.cleanCopyUrl !== false} onchange={(e) => updateSettings({ cleanCopyUrl: e.currentTarget.checked })} />
+            <span>Strip tracking parameters on Copy Link</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" style="width:auto" checked={Boolean(arcState.settings.exposeArcPalette)} onchange={(e) => updateSettings({ exposeArcPalette: e.currentTarget.checked })} />
+            <span>Expose --arc-palette CSS variables to sites</span>
+          </label>
+        </div>
+
+        <div class="sync-panel">
+          <strong>Sync with Mac &amp; iPhone</strong>
+          {#if arcState.syncConfig?.enabled}
+            <p class="drawer-hint">
+              Connected to <strong>{arcState.syncConfig.peerName || 'Mac'}</strong>
+              {#if arcState.syncConfig.lastRevision}· rev #{arcState.syncConfig.lastRevision}{/if}
+              {#if arcState.syncConfig.lastError}· {arcState.syncConfig.lastError}{/if}
+            </p>
+            <div style="display:flex;gap:6px;">
+              <button class="primary-btn" disabled={syncBusy} onclick={async () => {
+                syncBusy = true;
+                try {
+                  const res = await requestArc({ type: 'SYNC_NOW' });
+                  if (res?.state) arcState = res.state;
+                  notify('Synced with Mac & iPhone');
+                } catch (err) { notify(err instanceof Error ? err.message : 'Sync failed'); }
+                finally { syncBusy = false; }
+              }}>Sync Now</button>
+              <button class="mini-action-btn" onclick={async () => {
+                const res = await requestArc({ type: 'DISCONNECT_SYNC' });
+                if (res?.state) arcState = res.state;
+                notify('Sync paused');
+              }}>Disconnect</button>
+            </div>
+          {:else}
+            <button class="primary-btn" disabled={syncBusy} onclick={async () => {
+              syncBusy = true;
+              try {
+                const res = await requestArc({ type: 'AUTO_PAIR_SYNC' });
+                if (res?.state) arcState = res.state;
+                notify('Auto-paired with Cra Mac app');
+              } catch (err) { notify(err instanceof Error ? err.message : 'Auto-pair unavailable'); }
+              finally { syncBusy = false; }
+            }}>Auto-Pair with Cra Mac</button>
+          {/if}
+          <input placeholder="Paste arcsync://pair?... link" bind:value={syncPairUriInput} />
+          <button class="mini-action-btn" disabled={syncBusy || !parsePairingUri(syncPairUriInput)} onclick={async () => {
+            syncBusy = true;
+            try {
+              const res = await requestArc({ type: 'PAIR_FROM_URI', uri: syncPairUriInput });
+              if (res?.state) arcState = res.state;
+              syncPairUriInput = '';
+              notify('Paired successfully');
+            } catch (err) { notify(err instanceof Error ? err.message : 'Pairing failed'); }
+            finally { syncBusy = false; }
+          }}>Pair from Link</button>
+          <div style="display:flex;gap:6px;">
+            <input placeholder="http://127.0.0.1:46280" bind:value={syncUrlInput} />
+            <input placeholder="Token" bind:value={syncTokenInput} />
+            <button class="mini-action-btn" disabled={syncBusy || !syncUrlInput.trim() || !syncTokenInput.trim()} onclick={async () => {
+              syncBusy = true;
+              try {
+                const res = await requestArc({ type: 'CONFIGURE_SYNC', url: syncUrlInput, token: syncTokenInput });
+                if (res?.state) arcState = res.state;
+                notify('Manual sync connected');
+              } catch (err) { notify(err instanceof Error ? err.message : 'Connection failed'); }
+              finally { syncBusy = false; }
+            }}>Connect</button>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="mini-action-btn" onclick={async () => {
+              const res = await requestArc({ type: 'EXPORT_SIDEBAR_BUNDLE' });
+              if (res?.json) {
+                const blob = new Blob([res.json], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = 'arc-sidebar-bundle.json'; a.click();
+                URL.revokeObjectURL(url);
+                notify('Exported sidebar JSON');
+              }
+            }}>Export Sidebar JSON</button>
+          </div>
+        </div>
         <div class="shortcuts-summary">
           <div><span>Toggle Left Sidebar</span><kbd>Alt + S</kbd></div>
           <div><span>Command Bar</span><kbd>⌘K / Ctrl+K</kbd></div>
@@ -1204,6 +1431,19 @@
               </button>
             {/each}
           </div>
+        </div>
+
+        <div class="form-row">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+            <input type="checkbox" style="width:auto" bind:checked={spaceUseCustomColors} />
+            <span>Use Custom Gradient Colors</span>
+          </label>
+          {#if spaceUseCustomColors}
+            <div style="display:flex;gap:8px;">
+              <input type="color" aria-label="Custom start color" bind:value={spaceCustomStart} style="height:32px;padding:2px;" />
+              <input type="color" aria-label="Custom end color" bind:value={spaceCustomEnd} style="height:32px;padding:2px;" />
+            </div>
+          {/if}
         </div>
 
         {#if confirmSpaceDelete}
@@ -1960,5 +2200,10 @@
   .arc-sidebar :global(button:focus-visible), .arc-sidebar :global([role="button"]:focus-visible), .arc-sidebar :global(input:focus-visible), .arc-sidebar :global(select:focus-visible), .arc-sidebar :global(textarea:focus-visible) { outline: 2px solid #c5bdf6; outline-offset: 2px; }
   .arc-sidebar :global(button:disabled) { opacity: .4; cursor: default; }
   .arc-sidebar :global(button:active:not(:disabled)) { filter: brightness(.9); }
+  .fav-preview-card { margin-top: 6px; padding: 6px 10px; border-radius: 8px; background: rgba(0,0,0,0.32); display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
+  .fav-preview-card strong, .fav-preview-card span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fav-preview-card span { opacity: 0.7; font-size: 10px; }
+  .remote-device-label { font-size: 10.5px; font-weight: 600; opacity: 0.65; padding: 6px 6px 2px; }
+  .sync-panel { display: flex; flex-direction: column; gap: 6px; padding: 10px; border-radius: 9px; background: rgba(255,255,255,0.06); font-size: 12px; }
   @media (prefers-reduced-motion: reduce) { .arc-sidebar, .arc-sidebar :global(*) { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
 </style>

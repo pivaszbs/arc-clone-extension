@@ -1,7 +1,7 @@
 {
   "name": "arc-chrome-extension",
   "private": true,
-  "version": "1.3.52",
+  "version": "1.4.0",
   "description": "Arc Browser experience in Chrome: Vertical Sidebar Spaces, Favorites, Pinned Tabs, Command Bar (Cmd+K), Little Arc / Peek, and Highlight-to-Translate",
   "type": "module",
   "scripts": {
@@ -19,7 +19,14 @@
     "cast:serve": "native/cast/.venv/bin/python native/cast/serve.py",
     "build:tv": "node scripts/build-tv.mjs",
     "tv:serve": "npm run build:tv && python3 -m native.tv.serve",
-    "mac:up": "bash scripts/mac-up.sh"
+    "mac:up": "bash scripts/mac-up.sh",
+    "build:mac": "bash arc-browser/scripts/build.sh",
+    "run:mac": "bash arc-browser/scripts/run.sh",
+    "test:mac": "bash arc-browser/scripts/test.sh",
+    "build:ios": "bash arc-browser/scripts/ios.sh build",
+    "run:ios": "bash arc-browser/scripts/ios.sh run",
+    "test:ios": "bash arc-browser/scripts/ios.sh test",
+    "install:arc-sync": "node scripts/install-arc-sync.mjs"
   },
   "devDependencies": {
     "@cucumber/cucumber": "^13.3.0",

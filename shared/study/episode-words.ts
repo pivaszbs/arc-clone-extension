@@ -51,6 +51,20 @@ export function episodeTargets(episode: EpisodeWords, cards: Map<string, WordCar
   return { learning, fresh };
 }
 
+export type DeckCard = EpisodeWord & { phrase: boolean };
+
+/**
+ * Everything in an episode worth learning before watching it: its words and set phrases (JMdict
+ * expressions), the ones heard most first and then in the order they come up, without those
+ * already known. Words still being learned stay in, so the deck doubles as their review.
+ */
+export function episodeDeck(episode: EpisodeWords, cards: Map<string, WordCard>): DeckCard[] {
+  return [...episode.words.values()]
+    .filter((word) => !isKnown(cards.get(word.id)))
+    .sort((a, b) => b.count - a.count || a.first.start - b.first.start)
+    .map((word) => ({ ...word, phrase: word.entry.pos.includes('exp') }));
+}
+
 /** The word to stop for on a line that has just finished, if any. */
 export function wordStop(tokens: Token[], cards: Map<string, WordCard>, fresh: (id: string) => boolean, now = Date.now()): WordStop | null {
   let teach: WordStop | null = null;

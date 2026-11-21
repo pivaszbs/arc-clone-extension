@@ -28,7 +28,21 @@
 
   let boostId = $state<string | undefined>();
   let boostHost = $state('');
+  let boostName = $state('');
   let boostCss = $state('');
+  let boostJs = $state('');
+  let boostTintColor = $state('#6366f1');
+  let boostTintIntensity = $state(0);
+  let boostHue = $state(0);
+  let boostInvert = $state(false);
+  let boostBrightness = $state(100);
+  let boostContrast = $state(100);
+  let boostSaturate = $state(100);
+  let boostFontFamily = $state('default');
+  let boostFontSize = $state(100);
+  let boostTextCase = $state<'none' | 'upper' | 'lower' | 'capitalize'>('none');
+  let boostZapped = $state<string[]>([]);
+  let showBoostCode = $state(false);
 
   const spaceLabel = (id: string) => {
     const space = arcState.spaces.find((entry) => entry.id === id);
@@ -64,12 +78,77 @@
   }
 
   function editBoost(boost?: Boost) {
-    boostId = boost?.id; boostHost = boost?.host || ''; boostCss = boost?.css || '';
+    boostId = boost?.id;
+    boostHost = boost?.host || '';
+    boostName = boost?.name || '';
+    boostCss = boost?.css || '';
+    boostJs = boost?.js || '';
+    boostTintColor = boost?.tintColor || '#6366f1';
+    boostTintIntensity = boost?.tintIntensity ?? 0;
+    boostHue = boost?.hue ?? 0;
+    boostInvert = Boolean(boost?.invert);
+    boostBrightness = boost?.brightness ?? 100;
+    boostContrast = boost?.contrast ?? 100;
+    boostSaturate = boost?.saturate ?? 100;
+    boostFontFamily = boost?.fontFamily || 'default';
+    boostFontSize = boost?.fontSize ?? 100;
+    boostTextCase = boost?.textCase || 'none';
+    boostZapped = [...(boost?.zappedSelectors || [])];
     error = '';
   }
   async function saveBoost() {
     const enabled = arcState.boosts?.find((boost) => boost.id === boostId)?.enabled ?? true;
-    if (await send({ type: 'SAVE_BOOST', id: boostId, host: boostHost, css: boostCss, enabled }, 'Boost saved')) editBoost();
+    if (
+      await send(
+        {
+          type: 'SAVE_BOOST',
+          id: boostId,
+          host: boostHost,
+          name: boostName.trim() || boostHost,
+          css: boostCss,
+          js: boostJs,
+          enabled,
+          tintColor: boostTintIntensity > 0 ? boostTintColor : undefined,
+          tintIntensity: boostTintIntensity,
+          hue: boostHue,
+          invert: boostInvert,
+          brightness: boostBrightness,
+          contrast: boostContrast,
+          saturate: boostSaturate,
+          fontFamily: boostFontFamily,
+          fontSize: boostFontSize,
+          textCase: boostTextCase,
+          zappedSelectors: boostZapped
+        },
+        'Boost saved'
+      )
+    ) {
+      editBoost();
+    }
+  }
+  function exportBoostJson(boost: Boost) {
+    const blob = new Blob([JSON.stringify(boost, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${boost.host}.boost.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    notify('Boost exported');
+  }
+  async function importBoostJson(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as Partial<Boost>;
+      if (!parsed.host) throw new Error('Missing host in Boost file');
+      await send({ type: 'SAVE_BOOST', ...parsed, id: undefined }, 'Boost imported');
+    } catch (err) {
+      error = err instanceof Error ? err.message : 'Invalid Boost JSON';
+    } finally {
+      input.value = '';
+    }
   }
   const toggleBoost = (boost: Boost) =>
     send({ type: 'SAVE_BOOST', ...boost, enabled: !boost.enabled }, boost.enabled ? 'Boost turned off' : 'Boost turned on');
@@ -145,17 +224,82 @@
           </div>
         {:else}<p class="hint">No Boosts yet.</p>{/each}
       </div>
+      <div class="inline" style="margin-bottom: 8px;">
+        <button type="button" class="ghost grow" onclick={() => requestArc({ type: 'START_ZAP_MODE' })}>⚡ Zap Element on Page</button>
+        <label class="ghost" style="margin:0; cursor:pointer;">Import JSON<input type="file" accept="application/json" style="display:none" onchange={importBoostJson} /></label>
+      </div>
       <form onsubmit={(event) => { event.preventDefault(); saveBoost(); }}>
         <label for="boost-host">Site</label>
         <div class="inline">
           <input id="boost-host" placeholder="news.ycombinator.com" bind:value={boostHost} autocomplete="off" spellcheck="false" />
           {#if currentHost && boostHost !== currentHost}<button type="button" class="ghost" onclick={() => boostHost = currentHost}>This site</button>{/if}
         </div>
-        <label for="boost-css">CSS</label>
-        <textarea id="boost-css" rows="6" placeholder={'body { font-family: Georgia, serif; }\n.sidebar-ad { display: none; }'} bind:value={boostCss} spellcheck="false"></textarea>
         <div class="inline">
-          <button class="primary grow" disabled={!boostHost.trim() || !boostCss.trim()}>{boostId ? 'Save changes' : 'Add Boost'}</button>
-          {#if boostId}<button type="button" class="ghost" onclick={() => editBoost()}>Cancel</button>{/if}
+          <div class="grow">
+            <label for="boost-tint">Tint</label>
+            <input id="boost-tint" type="color" bind:value={boostTintColor} style="height:30px;padding:2px" />
+          </div>
+          <div class="grow">
+            <label for="boost-tint-pct">Tint {boostTintIntensity}%</label>
+            <input id="boost-tint-pct" type="range" min="0" max="60" bind:value={boostTintIntensity} />
+          </div>
+          <label style="display:flex;align-items:center;gap:4px;margin:0 0 6px;">
+            <input type="checkbox" style="width:auto" bind:checked={boostInvert} /> Invert
+          </label>
+        </div>
+        <div class="inline">
+          <div class="grow"><label for="boost-hue">Hue {boostHue}°</label><input id="boost-hue" type="range" min="-180" max="180" bind:value={boostHue} /></div>
+          <div class="grow"><label for="boost-bright">Bright {boostBrightness}%</label><input id="boost-bright" type="range" min="50" max="150" bind:value={boostBrightness} /></div>
+          <div class="grow"><label for="boost-contrast">Contrast {boostContrast}%</label><input id="boost-contrast" type="range" min="50" max="150" bind:value={boostContrast} /></div>
+        </div>
+        <div class="inline">
+          <div class="grow">
+            <label for="boost-font">Font</label>
+            <select id="boost-font" bind:value={boostFontFamily}>
+              <option value="default">Default</option>
+              <option value="-apple-system, BlinkMacSystemFont, sans-serif">System Sans</option>
+              <option value="Georgia, serif">Serif</option>
+              <option value="ui-monospace, SFMono-Regular, monospace">Mono</option>
+            </select>
+          </div>
+          <div class="grow">
+            <label for="boost-size">Size {boostFontSize}%</label>
+            <input id="boost-size" type="range" min="80" max="140" bind:value={boostFontSize} />
+          </div>
+          <div class="grow">
+            <label for="boost-case">Case</label>
+            <select id="boost-case" bind:value={boostTextCase}>
+              <option value="none">As Is</option>
+              <option value="upper">UPPER</option>
+              <option value="lower">lower</option>
+              <option value="capitalize">Title</option>
+            </select>
+          </div>
+        </div>
+        {#if boostZapped.length > 0}
+          <div class="zap-list">
+            <span class="hint">Zapped selectors ({boostZapped.length}):</span>
+            {#each boostZapped as sel}
+              <button type="button" class="ghost" onclick={() => { boostZapped = boostZapped.filter((s) => s !== sel); }}>{sel} ×</button>
+            {/each}
+          </div>
+        {/if}
+        <button type="button" class="ghost" onclick={() => (showBoostCode = !showBoostCode)}>
+          {showBoostCode ? 'Hide CSS / JS Code' : 'Edit Custom CSS / JS'}
+        </button>
+        {#if showBoostCode || boostCss || boostJs}
+          <label for="boost-css">Custom CSS</label>
+          <textarea id="boost-css" rows="4" placeholder={'body { font-family: Georgia, serif; }\n.sidebar-ad { display: none; }'} bind:value={boostCss} spellcheck="false"></textarea>
+          <label for="boost-js">Custom JS (runs in page world; strict CSP sites may block inline JS)</label>
+          <textarea id="boost-js" rows="3" placeholder={'console.log("Boost active");'} bind:value={boostJs} spellcheck="false"></textarea>
+        {/if}
+        <div class="inline">
+          <button class="primary grow" disabled={!boostHost.trim()}>{boostId ? 'Save changes' : 'Add Boost'}</button>
+          {#if boostId}
+            {@const cur = arcState.boosts?.find((b) => b.id === boostId)}
+            {#if cur}<button type="button" class="ghost" onclick={() => exportBoostJson(cur)}>Export</button>{/if}
+            <button type="button" class="ghost" onclick={() => editBoost()}>Cancel</button>
+          {/if}
         </div>
       </form>
     {/if}
@@ -190,6 +334,7 @@
   .primary:disabled { opacity: 0.5; cursor: default; }
   .ghost { background: rgba(255, 255, 255, 0.1); border: none; color: #fff; border-radius: 7px; padding: 6px 8px; font-size: 11.5px; cursor: pointer; white-space: nowrap; }
   .ghost:hover { background: rgba(255, 255, 255, 0.2); }
+  .zap-list { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 4px 0; }
   kbd { font: inherit; font-size: 10.5px; background: rgba(255, 255, 255, 0.14); border-radius: 4px; padding: 1px 5px; }
   button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #d8d3fa; outline-offset: 1px; }
   @media (prefers-reduced-motion: no-preference) { .ghost, .tabs button { transition: background 0.12s; } }

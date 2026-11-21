@@ -246,6 +246,90 @@
   let commandMode = $state<'default' | 'little-arc'>('default');
   let commandQuery = $state('');
 
+  // Interactive Boost Zap & Area Capture state
+  let zapMode = $state(false);
+  let hoveredElement = $state<Element | null>(null);
+  let zapRect = $state<{ top: number; left: number; width: number; height: number } | null>(null);
+  let zappedOnHost = $state<string[]>([]);
+  let captureMode = $state(false);
+  let captureDragStart = $state<{ x: number; y: number } | null>(null);
+  let captureRect = $state<{ x: number; y: number; w: number; h: number } | null>(null);
+  let pendingCaptureUrl = $state<string | null>(null);
+  let pendingCaptureTitle = $state('');
+
+  function selectorForElement(el: Element): string {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const parts: string[] = [];
+    let cur: Element | null = el;
+    for (let depth = 0; cur && cur.nodeType === 1 && depth < 4; depth++) {
+      if (cur.id) { parts.unshift(`#${CSS.escape(cur.id)}`); break; }
+      const tag = cur.tagName.toLowerCase();
+      const cls = [...cur.classList].filter((c) => c && !c.startsWith('arc-')).slice(0, 2).map((c) => `.${CSS.escape(c)}`).join('');
+      parts.unshift(cls ? `${tag}${cls}` : tag);
+      cur = cur.parentElement;
+    }
+    return parts.join(' > ') || el.tagName.toLowerCase();
+  }
+
+  function refreshHostZaps() {
+    const host = window.location.hostname.replace(/^www\./, '');
+    const match = (arcState.boosts || []).find((b) => host === b.host || host.endsWith('.' + b.host));
+    zappedOnHost = [...(match?.zappedSelectors || [])];
+  }
+
+  function stopZapMode() {
+    zapMode = false;
+    hoveredElement = null;
+    zapRect = null;
+  }
+
+  async function zapHoveredElement(related: boolean) {
+    if (!hoveredElement) return;
+    const sel = related
+      ? `${hoveredElement.tagName.toLowerCase()}${[...hoveredElement.classList].slice(0, 1).map((c) => `.${CSS.escape(c)}`).join('')}`
+      : selectorForElement(hoveredElement);
+    const host = window.location.hostname.replace(/^www\./, '');
+    await chrome.runtime.sendMessage({ type: 'ZAP_SELECTOR', host, selector: sel });
+    await syncSnapshot();
+    refreshHostZaps();
+    hoveredElement = null;
+    zapRect = null;
+  }
+
+  async function unzapSelector(sel: string) {
+    const host = window.location.hostname.replace(/^www\./, '');
+    await chrome.runtime.sendMessage({ type: 'UNZAP_SELECTOR', host, selector: sel });
+    await syncSnapshot();
+    refreshHostZaps();
+  }
+
+  async function cropCapture(rect: { x: number; y: number; w: number; h: number }) {
+    captureRect = null;
+    captureMode = false;
+    const res = await chrome.runtime.sendMessage({ type: 'CAPTURE_VISIBLE_TAB' });
+    if (!res?.ok || !res.dataUrl) {
+      showToast('Could not capture tab');
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      const dpr = window.devicePixelRatio || 1;
+      const canvas = document.createElement('canvas');
+      const sx = Math.max(0, Math.round(rect.x * dpr));
+      const sy = Math.max(0, Math.round(rect.y * dpr));
+      const sw = Math.max(10, Math.round(rect.w * dpr));
+      const sh = Math.max(10, Math.round(rect.h * dpr));
+      canvas.width = sw;
+      canvas.height = sh;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+      pendingCaptureUrl = canvas.toDataURL('image/png');
+      pendingCaptureTitle = document.title || window.location.hostname;
+    };
+    img.src = res.dataUrl;
+  }
+
   // 2. Peek / Little Arc Modal State
   let peekUrl = $state<string | null>(null);
   let peekCopied = $state(false);
@@ -1181,6 +1265,18 @@
           y: Math.min(window.innerHeight - 240, Math.max(24, window.innerHeight / 3))
         };
         triggerTranslation(msg.text);
+        sendResponse({ ok: true });
+        return;
+      } else if (msg?.type === 'START_ZAP_MODE') {
+        captureMode = false;
+        refreshHostZaps();
+        zapMode = true;
+        sendResponse({ ok: true });
+        return;
+      } else if (msg?.type === 'START_CAPTURE_MODE') {
+        zapMode = false;
+        pendingCaptureUrl = null;
+        captureMode = true;
         sendResponse({ ok: true });
         return;
       } else if (msg?.type === 'ARC_STATE_UPDATED') {
@@ -3060,6 +3156,67 @@
     .arc-agent-send.agy {
       background: linear-gradient(135deg, #a78bfa, #f472b6);
     }
+
+    .arc-zap-outline {
+      position: fixed;
+      border: 2px dashed #fb7185;
+      background: rgba(244, 63, 94, 0.16);
+      border-radius: 6px;
+      pointer-events: none;
+      z-index: 2147483645;
+    }
+
+    .arc-zap-shield {
+      position: fixed;
+      inset: 0;
+      z-index: 2147483644;
+      cursor: crosshair;
+      background: rgba(10, 10, 20, 0.08);
+    }
+
+    .arc-zap-shelf, .arc-capture-preview {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 2147483646;
+      background: rgba(20, 20, 32, 0.96);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 12px;
+      padding: 10px 14px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 12px 36px rgba(0,0,0,0.45);
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 12px;
+      max-width: 90vw;
+    }
+
+    .arc-zap-shelf button, .arc-capture-preview button {
+      background: rgba(255,255,255,0.12);
+      color: #fff;
+      border: none;
+      border-radius: 7px;
+      padding: 5px 9px;
+      cursor: pointer;
+      font-size: 11.5px;
+    }
+
+    .arc-zap-shelf button.primary, .arc-capture-preview button.primary {
+      background: #6366f1;
+      font-weight: 600;
+    }
+
+    .arc-capture-crop {
+      position: fixed;
+      border: 2px solid #818cf8;
+      background: rgba(99, 102, 241, 0.16);
+      pointer-events: none;
+      z-index: 2147483645;
+    }
   `;
 </script>
 
@@ -4645,4 +4802,102 @@
       </div>
     </div>
   </aside>
+{/if}
+
+{#if zapMode}
+  <div
+    class="arc-zap-shield"
+    role="button"
+    aria-label="Boost Element Zapper"
+    onpointermove={(e) => {
+      const shield = e.currentTarget as HTMLElement;
+      shield.style.pointerEvents = 'none';
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      shield.style.pointerEvents = 'auto';
+      if (el && !el.closest('#arc-chrome-extension-root') && el !== document.documentElement && el !== document.body) {
+        hoveredElement = el;
+        const r = el.getBoundingClientRect();
+        zapRect = { top: r.top, left: r.left, width: r.width, height: r.height };
+      } else {
+        hoveredElement = null;
+        zapRect = null;
+      }
+    }}
+    onkeydown={(e) => { if (e.key === 'Escape') stopZapMode(); else if (e.key === 'Enter') { e.preventDefault(); void zapHoveredElement(e.shiftKey); } }}
+    tabindex="0"
+    onclick={(e) => { e.preventDefault(); void zapHoveredElement(e.shiftKey); }}
+  ></div>
+  {#if zapRect}
+    <div class="arc-zap-outline" style="top:{zapRect.top}px;left:{zapRect.left}px;width:{zapRect.width}px;height:{zapRect.height}px;"></div>
+  {/if}
+  <div class="arc-zap-shelf">
+    <strong>⚡ Zap Mode:</strong>
+    <span>Click to hide · Shift+Click similar</span>
+    {#each zappedOnHost as sel}
+      <button onclick={() => void unzapSelector(sel)}>Restore {sel} ×</button>
+    {/each}
+    <button class="primary" onclick={stopZapMode}>Done</button>
+  </div>
+{/if}
+
+{#if captureMode}
+  <div
+    class="arc-zap-shield"
+    role="application"
+    aria-label="Web Capture Selection"
+    onpointerdown={(e) => {
+      captureDragStart = { x: e.clientX, y: e.clientY };
+      captureRect = { x: e.clientX, y: e.clientY, w: 0, h: 0 };
+    }}
+    onpointermove={(e) => {
+      if (!captureDragStart) return;
+      captureRect = {
+        x: Math.min(captureDragStart.x, e.clientX),
+        y: Math.min(captureDragStart.y, e.clientY),
+        w: Math.abs(e.clientX - captureDragStart.x),
+        h: Math.abs(e.clientY - captureDragStart.y)
+      };
+    }}
+    onpointerup={() => {
+      const finished = captureRect;
+      captureDragStart = null;
+      if (finished && finished.w >= 16 && finished.h >= 16) {
+        void cropCapture(finished);
+      } else {
+        captureMode = false;
+        captureRect = null;
+      }
+    }}
+  >
+    <div class="arc-zap-shelf">
+      <span>Drag to capture a region · Click anywhere to cancel</span>
+      <button onclick={() => { captureMode = false; captureRect = null; }}>Cancel</button>
+    </div>
+  </div>
+  {#if captureRect && captureRect.w > 2}
+    <div class="arc-capture-crop" style="left:{captureRect.x}px;top:{captureRect.y}px;width:{captureRect.w}px;height:{captureRect.h}px;"></div>
+  {/if}
+{/if}
+
+{#if pendingCaptureUrl}
+  <div class="arc-capture-preview">
+    <img src={pendingCaptureUrl} alt="Captured" style="max-height:56px;border-radius:6px;" />
+    <button class="primary" onclick={async () => {
+      await chrome.runtime.sendMessage({ type: 'SAVE_CAPTURE', dataUrl: pendingCaptureUrl, title: pendingCaptureTitle, pageUrl: window.location.href });
+      pendingCaptureUrl = null;
+      showToast('Capture saved to Arc Library');
+    }}>Save to Library</button>
+    <button onclick={async () => {
+      await chrome.runtime.sendMessage({ type: 'SAVE_CAPTURE', dataUrl: pendingCaptureUrl, title: pendingCaptureTitle, pageUrl: window.location.href, sendToEasel: true });
+      pendingCaptureUrl = null;
+    }}>New Easel</button>
+    <button onclick={() => {
+      const a = document.createElement('a');
+      a.href = pendingCaptureUrl!;
+      a.download = `capture-${Date.now()}.png`;
+      a.click();
+      pendingCaptureUrl = null;
+    }}>Download</button>
+    <button onclick={() => { pendingCaptureUrl = null; }}>Close</button>
+  </div>
 {/if}

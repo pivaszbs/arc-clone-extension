@@ -1,4 +1,4 @@
-# Arc for Chrome (Svelte 5 + TypeScript + Manifest V3)
+# Arc clone (Svelte 5 + TypeScript + Manifest V3)
 
 An Arc Browser experience inside Google Chrome built with **Svelte 5**, **TypeScript**, **Vite**, and native Chrome Extension APIs (`chrome.sidePanel`, `chrome.tabs`, `chrome.windows`, `chrome.bookmarks`, `chrome.history`, `chrome.storage`, `chrome.commands`, `chrome.contextMenus`).
 
@@ -10,7 +10,7 @@ The sidebar and command bar use the same Clear rules. Clear closes inactive Toda
 
 Pinned pages track the opened tab as well as the saved URL, so navigation keeps the tab out of Today. Reset Space returns linked open pins to their saved URLs. Pin bindings are local to the browser session. Chrome owns its toolbar, tab strip, and reserved shortcuts. An extension cannot guarantee an exact match to Arc's native browser frame. Peek also depends on whether the destination allows iframe embedding.
 
-Run `npm test` for tab behavior regression tests, `npm run check` for Svelte and TypeScript checks, and `npm run build` to build Arc for Chrome in `dist-arc/` and Anime Study in `dist/`.
+Run `npm test` for tab behavior regression tests, `npm run check` for Svelte and TypeScript checks, and `npm run build` to build Arc clone in `dist-arc/` and Anime Study in `dist/`.
 
 The sidebar, new-tab page, and webpage overlay share one command palette. It supports keyboard navigation, immediate input focus, loading and retry feedback, and ignores stale searches. Space dialogs keep keyboard focus inside and return it when dismissed. Row controls work with Enter and Space, and animations respect reduced-motion preferences.
 
@@ -141,8 +141,8 @@ For a local UI preview, run `npx vite --host 127.0.0.1` and open `/preview.html?
 Run `npm install` and `npm run build`, then open `chrome://extensions` and enable **Developer mode**.
 
 1. If you already use the combined extension, **reload its existing entry first**. The entry loaded from `dist/` becomes **Anime Study** and keeps your offline library and saved phrases. For a new install, use **Load unpacked** and select `dist/`.
-2. Use **Load unpacked** to select `dist-arc/` for **Arc for Chrome**. On its first load, Arc copies saved Spaces, pins, Favorites, and settings from the existing installation in `dist/` in the same Chrome profile.
-3. Refresh open website tabs. The **Anime Study** toolbar button opens the offline library. The **Arc for Chrome** toolbar button opens its sidebar.
+2. Use **Load unpacked** to select `dist-arc/` for **Arc clone**. On its first load, Arc copies saved Spaces, pins, Favorites, and settings from the existing installation in `dist/` in the same Chrome profile.
+3. Refresh open website tabs. The **Anime Study** toolbar button opens the offline library. The **Arc clone** toolbar button opens its sidebar.
 
 Either extension can run independently. On macOS, run `npm run install:desktop-pip` to register both unpacked extensions with the desktop companion.
 

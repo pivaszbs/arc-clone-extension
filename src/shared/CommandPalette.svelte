@@ -2,6 +2,7 @@
   import { onMount, tick, untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import { containFocus } from './focus';
+  import { DEFAULT_SITE_SEARCHES, siteSearchUrl, type SiteSearch } from './site-tools';
   import { getFaviconUrl, parseCommandBarInput, type OmniboxResultItem } from './types';
 
   let { onexecute, onclose, initialQuery = '', label = 'Search', previewLabel = 'Peek', embedded = false }: {
@@ -23,14 +24,39 @@
   let list: HTMLDivElement;
   let version = 0;
   let pending: Promise<void> = Promise.resolve();
+  let siteSearches = $state<SiteSearch[]>(DEFAULT_SITE_SEARCHES);
+  let lockedSite = $state<SiteSearch | null>(null);
 
   onMount(() => {
     input.focus();
     if (initialQuery) input.select();
+    void chrome.runtime?.sendMessage({ type: 'GET_SNAPSHOT' })
+      .then((res) => {
+        if (Array.isArray(res?.state?.siteSearches) && res.state.siteSearches.length) {
+          siteSearches = res.state.siteSearches;
+        }
+      })
+      .catch(() => {});
     return () => { version++; };
   });
 
   async function search(value: string) {
+    if (lockedSite) {
+      items = value.trim()
+        ? [{
+            id: `locked-${lockedSite.id}`,
+            kind: 'search',
+            title: `Search ${lockedSite.name} for "${value.trim()}"`,
+            subtitle: `Site Search · ${lockedSite.shortcut}`,
+            url: siteSearchUrl(lockedSite, value.trim()),
+            shortcut: lockedSite.name
+          }]
+        : [];
+      selected = items.length ? 0 : -1;
+      error = '';
+      loading = false;
+      return;
+    }
     const request = ++version;
     loading = true;
     error = '';
@@ -71,7 +97,27 @@
   async function keydown(event: KeyboardEvent) {
     event.stopPropagation();
     if (event.isComposing) return;
-    if (event.key === 'Escape') { event.preventDefault(); onclose(); return; }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      if (lockedSite) { lockedSite = null; return; }
+      onclose();
+      return;
+    }
+    if (event.key === 'Tab' && !lockedSite) {
+      const token = query.trim().toLowerCase();
+      const matched = siteSearches.find((s) => s.shortcut.toLowerCase() === token);
+      if (matched) {
+        event.preventDefault();
+        lockedSite = matched;
+        query = '';
+        return;
+      }
+    }
+    if (event.key === 'Backspace' && lockedSite && !query) {
+      event.preventDefault();
+      lockedSite = null;
+      return;
+    }
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
       if (!items.length) return;
@@ -80,6 +126,11 @@
     } else if (event.key === 'Enter') {
       event.preventDefault();
       const value = query;
+      if (lockedSite) {
+        const url = siteSearchUrl(lockedSite, value.trim());
+        await execute({ id: `locked-${lockedSite.id}`, kind: 'search', title: value, subtitle: '', url }, event.shiftKey || event.altKey);
+        return;
+      }
       // Enter waits for the current query, never a result left over from an older query.
       await pending;
       if (query !== value || executing) return;
@@ -96,10 +147,13 @@
 <div class="palette" class:embedded use:containFocus={!embedded} role="dialog" aria-modal={!embedded} aria-label={label} tabindex="-1">
   <div class="search-row">
     <span class="search-icon"><Icon name="search" size={19} /></span>
+    {#if lockedSite}
+      <span class="site-search-pill">Search {lockedSite.name}</span>
+    {/if}
     <input bind:this={input} bind:value={query} onkeydown={keydown} data-autofocus
       role="combobox" aria-label="Search tabs, commands, or enter a URL" aria-autocomplete="list"
       aria-expanded="true" aria-controls="{uid}-results" aria-activedescendant={selected >= 0 ? `${uid}-result-${selected}` : undefined}
-      placeholder="Search or enter URL" autocomplete="off" spellcheck="false" />
+      placeholder={lockedSite ? `Search ${lockedSite.name}...` : 'Search or enter URL'} autocomplete="off" spellcheck="false" />
     {#if loading}<span class="spinner" aria-label="Searching"></span>{/if}
     <button class="dismiss" aria-label="Close search" onclick={onclose}><kbd>esc</kbd></button>
   </div>
@@ -138,6 +192,7 @@
   .palette * { box-sizing: border-box; }
   .search-row { display: flex; align-items: center; gap: 12px; padding: 18px; border-bottom: 1px solid #ffffff12; }
   .search-icon { color: #b2b2bf; display: flex; }
+  .site-search-pill { flex-shrink: 0; background: #6366f1; color: #fff; border-radius: 6px; padding: 3px 8px; font-size: 11.5px; font-weight: 600; }
   input { flex: 1; min-width: 0; padding: 0; margin: 0; background: none; border: 0; outline: 0; color: inherit; font: inherit; font-size: 18px; letter-spacing: -.3px; }
   input::placeholder { color: #aaaab7; }
   .palette input:focus-visible { outline: none !important; }

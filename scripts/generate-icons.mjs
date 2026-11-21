@@ -4,9 +4,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const iconsDir = resolve(__dirname, '../public/icons');
 const animeIconsDir = resolve(__dirname, '../public/anime-icons');
-mkdirSync(iconsDir, { recursive: true });
 mkdirSync(animeIconsDir, { recursive: true });
 
 function crc32(buf) {
@@ -34,66 +32,6 @@ function makeChunk(type, data) {
   const combined = Buffer.concat([typeBuf, data]);
   crcBuf.writeUInt32BE(crc32(combined), 0);
   return Buffer.concat([len, combined, crcBuf]);
-}
-
-function drawArcIcon(size) {
-  const raw = Buffer.alloc(size * (size * 4 + 1));
-  const center = (size - 1) / 2;
-  const radius = size * 0.45;
-
-  for (let y = 0; y < size; y++) {
-    const rowStart = y * (size * 4 + 1);
-    raw[rowStart] = 0; // filter type 0
-    for (let x = 0; x < size; x++) {
-      const idx = rowStart + 1 + x * 4;
-      const dx = x - center;
-      const dy = y - center;
-
-      // Rounded rect / squircle mask
-      const nx = Math.abs(dx) / radius;
-      const ny = Math.abs(dy) / radius;
-      const squircle = Math.pow(nx, 3.2) + Math.pow(ny, 3.2);
-
-      if (squircle <= 1.0) {
-        // Gradient background (Arc Indigo -> Coral/Pink)
-        const tx = x / size;
-        const ty = y / size;
-        let r = Math.round(92 + tx * 145 - ty * 20);
-        let g = Math.round(70 + (1 - ty) * 60);
-        let b = Math.round(235 - ty * 55);
-
-        // Draw white Arc arch symbol in the center
-        const archDx = (x - center) / (size * 0.24);
-        const archDy = (y - center * 1.06) / (size * 0.24);
-        const archR = Math.sqrt(archDx * archDx + archDy * archDy);
-        const isArchCurve = archDy <= 0.15 && archR >= 0.68 && archR <= 1.12;
-        const isArchLegs =
-          archDy > 0.05 &&
-          archDy <= 0.85 &&
-          Math.abs(archDx) >= 0.68 &&
-          Math.abs(archDx) <= 1.12;
-
-        if (isArchCurve || isArchLegs) {
-          r = 255;
-          g = 250;
-          b = 255;
-        }
-
-        const alpha = squircle > 0.92 ? Math.max(0, Math.round(((1 - squircle) / 0.08) * 255)) : 255;
-        raw[idx] = Math.min(255, Math.max(0, r));
-        raw[idx + 1] = Math.min(255, Math.max(0, g));
-        raw[idx + 2] = Math.min(255, Math.max(0, b));
-        raw[idx + 3] = alpha;
-      } else {
-        raw[idx] = 0;
-        raw[idx + 1] = 0;
-        raw[idx + 2] = 0;
-        raw[idx + 3] = 0;
-      }
-    }
-  }
-
-  return raw;
 }
 
 function insidePolygon(x, y, points) {
@@ -175,10 +113,11 @@ function encodePng(size, raw, alpha = true) {
 }
 
 for (const size of [16, 48, 128]) {
-  writeFileSync(resolve(iconsDir, `icon${size}.png`), encodePng(size, drawArcIcon(size)));
+  // public/icons (Arc clone) come from arc-browser/brand/cra-segments-icon.svg:
+  //   rsvg-convert -w N -h N arc-browser/brand/cra-segments-icon.svg -o public/icons/iconN.png
   writeFileSync(resolve(animeIconsDir, `icon${size}.png`), encodePng(size, drawAnimeIcon(size)));
 }
 const mobileSize = 1024;
 writeFileSync(resolve(__dirname, '../mobile/assets/icon.png'),
   encodePng(mobileSize, drawAnimeIcon(mobileSize, true), false));
-console.log('Generated Arc and Anime Study icons.');
+console.log('Generated Anime Study icons.');
