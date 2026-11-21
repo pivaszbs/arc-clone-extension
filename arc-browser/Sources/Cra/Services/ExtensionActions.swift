@@ -1,0 +1,348 @@
+import AppKit
+import CraCEF
+
+/// Runs an extension's toolbar action on a page the way a click on its Chrome
+/// toolbar button does: `Extensions.triggerAction` over the browser-level DevTools
+/// pipe. Chrome then opens the real popup (with activeTab granted) or fires
+/// chrome.action.onClicked. The popup anchors to the page's hidden Chrome toolbar,
+/// so Cra frames it in a window under its own button (Arc: right edges aligned, just below the bar).
+@MainActor
+final class ExtensionActions {
+    static let shared = ExtensionActions()
+
+    private struct CachedTab { weak var browser: CraBrowser?; let tabTarget: String }
+    /// Page browser → its "tab" target (triggerAction only accepts tab targets).
+    private var tabTargets: [ObjectIdentifier: CachedTab] = [:]
+    /// Tab session → callback with the page target that auto-attaches under it.
+    private var childWaiters: [String: (String?) -> Void] = [:]
+
+    var isAvailable: Bool { CraCEFRuntime.hasBrowserDevTools() }
+
+    private init() {
+        // The pipe delivers on the main queue.
+        CraCEFRuntime.setBrowserDevToolsEventHandler { [weak self] method, params, sessionID in
+            MainActor.assumeIsolated { self?.handleEvent(method, params: params, sessionID: sessionID) }
+        }
+    }
+
+    /// Where a popup Cra did not ask for hangs (screen top-right point) for an extension ID, nil
+    /// to leave it where Chrome put it.
+    private var defaultAnchor: (String) -> NSPoint? = { _ in nil }
+    /// True while `run` waits for its own popup.
+    private var placingOwnPopup = false
+
+    /// Popups can open without Cra's buttons: the extension's keyboard shortcut (1Password's
+    /// ⌘⇧X) or chrome.action.openPopup() (1Password's inline menu). Arc hosts every popup
+    /// under its toolbar (ArcCore hands it over in browser:didOpenExtensionPopup:webContents:);
+    /// Cra watches for popup pages being created and moves those under `anchor` too.
+    func watchPopups(anchor: @escaping (String) -> NSPoint?) {
+        defaultAnchor = anchor
+        guard isAvailable else { return }
+        Task { _ = try? await call("Target.setDiscoverTargets", ["discover": true]) }
+    }
+
+    /// Triggers the action; `anchor` is the top-right point (screen coordinates) the popup hangs from.
+    /// Returns false when the pipe or the page is unavailable (the caller falls back).
+    /// `inDefaultProfile`: the page is in the "Default" profile folder, whose extensions the
+    /// pipe can list.
+    @discardableResult
+    func run(_ extensionID: String, on browser: CraBrowser, anchor: NSPoint, inDefaultProfile: Bool) async -> Bool {
+        guard isAvailable else { return false }
+        var triggered = false
+        HitchMonitor.mark("extension request \(extensionID)")
+        do {
+            // Turned off in chrome://extensions moments ago: Chromium writes that to the
+            // profile's prefs ~10 s later, and triggerAction on it crashes Chromium (#41).
+            if inDefaultProfile, await isTurnedOff(extensionID) { throw Failure.turnedOff }
+            let tab = try await tabTarget(for: browser)
+            let before = WindowSnapshot()
+            placingOwnPopup = true
+            triggered = true
+            HitchMonitor.mark("extension trigger \(extensionID)")
+            _ = try await call("Extensions.triggerAction", ["id": extensionID, "targetId": tab])
+            HitchMonitor.mark("extension trigger-replied \(extensionID)")
+            placePopup(appearingAfter: before, anchor: anchor, sourceHost: browser.hostWindow)
+            return true
+        } catch {
+            placingOwnPopup = false
+            NSLog("Cra: extension action %@ failed: %@", extensionID, String(describing: error))
+            // Off (CEF's TriggerAction patch says so too): nothing to fall back to.
+            if case Failure.turnedOff = error { ExtensionStore.shared.reload(); return true }
+            if case let Failure.protocolError(message) = error, message.contains("No enabled extension") {
+                ExtensionStore.shared.reload()
+                return true
+            }
+            tabTargets[ObjectIdentifier(browser)] = nil
+            // The action may still run after its reply timed out; a fallback page would be a
+            // second popup.
+            return triggered && error is ExtensionProtocolTimeout
+        }
+    }
+
+    // MARK: Popup placement
+
+    /// The windows before a popup: Chrome creates the popup's window hidden, sometimes before
+    /// the popup page exists, so "new" means newly visible.
+    @MainActor private struct WindowSnapshot {
+        let visible = Set(NSApp.windows.filter(\.isVisible).map(ObjectIdentifier.init))
+        let all = Set(NSApp.windows.map(ObjectIdentifier.init))
+    }
+
+    /// New bubbles kept transparent until they are framed.
+    private let hiddenBubbles = NSHashTable<NSWindow>.weakObjects()
+
+    /// Chrome shows the popup once its page has loaded; watch for the new window and frame it
+    /// under the anchor (ExtensionPopupWindow, Arc's BrowserExtensionWindow). Checked every
+    /// frame: Chrome first shows it under its hidden toolbar, so a bubble created after
+    /// `before` stays transparent until it is in the frame.
+    private func placePopup(appearingAfter before: WindowSnapshot, anchor: NSPoint, sourceHost: NSWindow? = nil,
+                            deadline: Date = Date().addingTimeInterval(3), shownAt: Date? = nil) {
+        for w in NSApp.windows where !before.all.contains(ObjectIdentifier(w)) && w.alphaValue == 1
+                                     && ExtensionPopupCandidate.mayBecomePopup(w) {
+            w.alphaValue = 0
+            hiddenBubbles.add(w)
+        }
+        // Sharing badges and tooltips can also become visible during startup. A popup
+        // must belong to a Chromium page in the browser containing the resolved anchor.
+        let popup = NSApp.windows.first(where: { candidate in
+            guard !before.visible.contains(ObjectIdentifier(candidate)),
+                  let owner = sourceHost?.parent ?? candidate.parent?.parent,
+                  owner.frame.contains(anchor) else { return false }
+            return ExtensionPopupCandidate.matches(candidate, owner: owner, sourceHost: sourceHost,
+                                                   isPageHost: CraCEFRuntime.isPageWindow)
+        })
+        // Hidden windows that showed up as something else (a tooltip) are not kept hidden.
+        for w in hiddenBubbles.allObjects where w.isVisible && w !== popup {
+            w.alphaValue = 1
+            hiddenBubbles.remove(w)
+        }
+        var shownAt = shownAt
+        if let popup {
+            let since = shownAt ?? Date()
+            shownAt = since
+            // At Chrome's minimum (a 25×25 page) the page has not reported its size yet: a hidden
+            // bubble waits a moment for it rather than showing a stub that then grows.
+            let unsized = popup.frame.width <= 25 + 2 * ExtensionPopupWindow.bubbleInset
+            if !unsized || popup.alphaValue > 0 || Date().timeIntervalSince(since) > 0.25 {
+                HitchMonitor.mark("extension present window=\(popup.windowNumber) frame=\(NSStringFromRect(popup.frame)) parent=\(popup.parent?.windowNumber ?? -1)")
+                // For scenarios: a popup Chrome made but never showed (its hidden window off screen) never gets here.
+                CraLog.note("extension popup shown")
+                placingOwnPopup = false
+                Perf.time(.extensionPopup) { ExtensionPopupWindow.present(popup, anchor: anchor) }
+                revealHiddenBubbles()
+                return
+            }
+        }
+        // No popup yet (still loading), or an action without one (onClicked): keep looking for 3 s.
+        guard Date() < deadline else {
+            HitchMonitor.mark("extension placement-expired source=\(sourceHost?.windowNumber ?? -1)")
+            placingOwnPopup = false
+            revealHiddenBubbles()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.008) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.placePopup(appearingAfter: before, anchor: anchor, sourceHost: sourceHost, deadline: deadline, shownAt: shownAt)
+            }
+        }
+    }
+
+    private func revealHiddenBubbles() {
+        for w in hiddenBubbles.allObjects { w.alphaValue = 1 }
+        hiddenBubbles.removeAllObjects()
+    }
+
+    // MARK: Targets
+
+    private enum Failure: Error { case protocolError(String), noTabTarget, turnedOff }
+
+    /// Extensions.getExtensions lists the default profile's unpacked extensions (also the
+    /// --load-extension ones) with their live state; Web Store ones are not in it.
+    private func isTurnedOff(_ extensionID: String) async -> Bool {
+        let list = (try? await call("Extensions.getExtensions"))?["extensions"] as? [[String: Any]] ?? []
+        return list.first { $0["id"] as? String == extensionID }?["enabled"] as? Bool == false
+    }
+
+    /// The tab target that holds this browser's page: attach to each tab target and let it
+    /// auto-attach its page (the protocol has no direct page → tab link). Cached per browser.
+    private func tabTarget(for browser: CraBrowser) async throws -> String {
+        if let cached = tabTargets[ObjectIdentifier(browser)], cached.browser === browser { return cached.tabTarget }
+        let info = try await pageCall(browser, "Target.getTargetInfo")
+        guard let page = info["targetInfo"] as? [String: Any], let pageID = page["targetId"] as? String else { throw Failure.noTabTarget }
+        let url = page["url"] as? String
+        let tabs = (try await call("Target.getTargets", ["filter": [["type": "tab"]]])["targetInfos"] as? [[String: Any]]) ?? []
+        // Same URL first: usually the only one that needs checking.
+        let ordered = tabs.filter { $0["url"] as? String == url } + tabs.filter { $0["url"] as? String != url }
+        for tab in ordered {
+            guard let tabID = tab["targetId"] as? String else { continue }
+            if try await pageTarget(inTab: tabID) == pageID {
+                tabTargets[ObjectIdentifier(browser)] = CachedTab(browser: browser, tabTarget: tabID)
+                return tabID
+            }
+        }
+        throw Failure.noTabTarget
+    }
+
+    private func pageTarget(inTab tabID: String) async throws -> String? {
+        let attached = try await call("Target.attachToTarget", ["targetId": tabID, "flatten": true])
+        guard let session = attached["sessionId"] as? String else { return nil }
+        let page: String? = await withCheckedContinuation { cont in
+            childWaiters[session] = { cont.resume(returning: $0) }
+            Task {
+                _ = try? await self.call("Target.setAutoAttach", ["autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true],
+                                         session: session)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                MainActor.assumeIsolated { self?.childWaiters.removeValue(forKey: session)?(nil) }
+            }
+        }
+        _ = try? await call("Target.detachFromTarget", ["sessionId": session])
+        return page
+    }
+
+    private func handleEvent(_ method: String, params: String, sessionID: String?) {
+        if method == "Target.targetCreated" || method == "Target.targetInfoChanged" { popupPageCreated(params); return }
+        if method == "Extensions.actionUpdated" { actionUpdated(params); return }
+        if method == "Extensions.sidePanelRequested" { sidePanelRequested(params); return }
+        guard method == "Target.attachedToTarget", let sessionID, childWaiters[sessionID] != nil,
+              let p = try? JSONSerialization.jsonObject(with: Data(params.utf8)) as? [String: Any],
+              let info = p["targetInfo"] as? [String: Any], info["type"] as? String == "page" else { return }
+        childWaiters.removeValue(forKey: sessionID)?(info["targetId"] as? String)
+    }
+
+    /// Popup targets already seen (each is placed once).
+    private var seenPopupTargets: Set<String> = []
+
+    /// A target for an extension's popup URL that Cra's own `run` is not waiting for. Chrome
+    /// creates it blank ("other", no URL) and reports the URL in a later targetInfoChanged.
+    private func popupPageCreated(_ params: String) {
+        guard let p = try? JSONSerialization.jsonObject(with: Data(params.utf8)) as? [String: Any],
+              let info = p["targetInfo"] as? [String: Any], let target = info["targetId"] as? String,
+              let url = (info["url"] as? String).flatMap(URL.init(string:)), url.scheme == "chrome-extension",
+              let id = url.host, url.fragment == nil, info["type"] as? String != "service_worker" else { return }
+        guard let entry = ExtensionStore.shared.entries.first(where: { $0.extensionID == id }) else {
+            // For scenarios: a page of an extension Cra hasn't listed yet can't be told to be its popup.
+            if url.path.hasSuffix(".html"), !seenPopupTargets.contains(target) { CraLog.note("extension popup \(id): not listed yet") }
+            return
+        }
+        guard let popup = entry.popupPath, url.path == "/" + popup.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
+              seenPopupTargets.insert(target).inserted, !placingOwnPopup else { return }
+        guard let anchor = defaultAnchor(id) else {
+            CraLog.note("extension popup \(id): no place to show it from")
+            return
+        }
+        placePopup(appearingAfter: WindowSnapshot(), anchor: anchor)
+    }
+
+    // MARK: Live actions (GitHub #106)
+
+    /// Cra's live pages by tab, set by the app.
+    private var liveTabs: () -> [(tab: UUID, browser: CraBrowser)] = { [] }
+    private var watchingActions = false
+    /// Page target → Cra tab: Chromium names the tab an action change is for by its page.
+    private var tabsByPageTarget: [String: UUID] = [:]
+    /// Page targets that were no Cra page when last looked up (Chrome's own pages).
+    private var foreignPageTargets: Set<String> = []
+    private var updatesAwaitingTabs: [ExtensionActionUpdate] = []
+    private var sidePanelRequestsAwaitingTabs: [ExtensionSidePanelRequest] = []
+    private var resolvingPageTargets = false
+
+    /// Turns on Chromium's Extensions.actionUpdated (Cra's CEF patch): extensions' own icons
+    /// (chrome.action.setIcon), titles and badges, for every tab or for one, reach ExtensionStore.
+    /// Chromium first reports what each extension has set so far.
+    func watchActions(liveTabs: @escaping () -> [(tab: UUID, browser: CraBrowser)]) {
+        self.liveTabs = liveTabs
+        guard isAvailable, !watchingActions else { return }
+        watchingActions = true
+        Task { _ = try? await call("Extensions.setActionUpdatesEnabled", ["enabled": true]) }
+    }
+
+    private func actionUpdated(_ params: String) {
+        guard let update = ExtensionActionUpdate(params: Data(params.utf8)) else { return }
+        guard let target = update.targetID else { return ExtensionStore.shared.applyActionUpdate(update, tab: nil) }
+        if let tab = tabsByPageTarget[target] { return ExtensionStore.shared.applyActionUpdate(update, tab: tab) }
+        guard !foreignPageTargets.contains(target) else { return }
+        updatesAwaitingTabs.append(update)
+        resolvePageTargets()
+    }
+
+    // MARK: Side panels
+
+    /// Gets each side panel request with the Cra tab it is for (nil: no Cra tab, e.g. the panel
+    /// page itself or a Little Window). Chromium sends them while action updates are on
+    /// (scripts/cef-patches/extension-side-panels.patch).
+    var sidePanelHandler: ((ExtensionSidePanelRequest, UUID?) -> Void)?
+
+    private func sidePanelRequested(_ params: String) {
+        guard let request = ExtensionSidePanelRequest(params: Data(params.utf8)) else { return }
+        if let tab = tabsByPageTarget[request.targetID] { sidePanelHandler?(request, tab); return }
+        if foreignPageTargets.contains(request.targetID) { sidePanelHandler?(request, nil); return }
+        sidePanelRequestsAwaitingTabs.append(request)
+        resolvePageTargets()
+    }
+
+    /// Asks each live page for its target, then applies the updates that waited for one, in order.
+    private func resolvePageTargets() {
+        guard !resolvingPageTargets else { return }
+        resolvingPageTargets = true
+        Task {
+            var map: [String: UUID] = [:]
+            for (tab, browser) in liveTabs() {
+                guard let info = try? await pageCall(browser, "Target.getTargetInfo"),
+                      let target = (info["targetInfo"] as? [String: Any])?["targetId"] as? String else { continue }
+                map[target] = tab
+            }
+            tabsByPageTarget = map
+            resolvingPageTargets = false
+            let waiting = updatesAwaitingTabs
+            updatesAwaitingTabs = []
+            foreignPageTargets = []
+            let panelRequests = sidePanelRequestsAwaitingTabs
+            sidePanelRequestsAwaitingTabs = []
+            for request in panelRequests { sidePanelHandler?(request, map[request.targetID]) }
+            for update in waiting {
+                guard let target = update.targetID else { continue }
+                if let tab = map[target] {
+                    ExtensionStore.shared.applyActionUpdate(update, tab: tab)
+                } else {
+                    foreignPageTargets.insert(target)
+                }
+            }
+        }
+    }
+
+    // MARK: Protocol calls
+
+    // Chromium can leave a request unanswered (its target went away meanwhile). Without a
+    // deadline `placingOwnPopup` stayed set and no later shortcut popup was placed.
+    private func call(_ method: String, _ params: [String: Any] = [:], session: String? = nil) async throws -> [String: Any] {
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: params), as: UTF8.self)
+        return try await withCheckedThrowingContinuation { cont in
+            let reply = ExtensionProtocolReply<[String: Any]>(method: method, timeout: 5, onLateReply: { result in
+                // An attach that answers after its caller gave up still leaves a session open.
+                if method == "Target.attachToTarget", case let .success(object) = result,
+                   let session = object["sessionId"] as? String {
+                    CraCEFRuntime.sendBrowserDevToolsMethod("Target.detachFromTarget", params: #"{"sessionId":"\#(session)"}"#,
+                                                            sessionID: nil) { _, _ in }
+                }
+            }) { cont.resume(with: $0) }
+            CraCEFRuntime.sendBrowserDevToolsMethod(method, params: json, sessionID: session) { result, error in
+                MainActor.assumeIsolated { reply.resolve(Self.result(result, error: error, method: method)) }
+            }
+        }
+    }
+
+    private func pageCall(_ browser: CraBrowser, _ method: String) async throws -> [String: Any] {
+        try await withCheckedThrowingContinuation { cont in
+            let reply = ExtensionProtocolReply<[String: Any]>(method: method, timeout: 5) { cont.resume(with: $0) }
+            browser.sendDevToolsMethod(method, params: "{}") { result, error in
+                MainActor.assumeIsolated { reply.resolve(Self.result(result, error: error, method: method)) }
+            }
+        }
+    }
+
+    private nonisolated static func result(_ result: String?, error: String?, method: String) -> Result<[String: Any], Error> {
+        if let result, let obj = try? JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any] { return .success(obj) }
+        return .failure(Failure.protocolError(error ?? "bad reply to \(method)"))
+    }
+}

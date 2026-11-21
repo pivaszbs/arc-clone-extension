@@ -1,0 +1,143 @@
+name: Nightly
+
+# The slow test layers (docs/testing.md): every scenario on both sidebar backdrop paths
+# (the private CABackdropLayer one and NSVisualEffectView), fullscreen included; the harnesses
+# under AddressSanitizer, ThreadSanitizer and UBSan; the parser fuzzer; and on Mondays
+# mutation testing. Also by hand: Actions ▸ Nightly ▸ Run workflow.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Only these scenarios (space-separated names), in each backdrop's first job; empty runs all"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  scenarios:
+    name: Scenarios (backdrop=${{ matrix.backdrop }}, ${{ matrix.shard }}/4)
+    runs-on: macos-26
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      # Four jobs per backdrop share the list (CRA_SCENARIO_SHARD): one ran out of its hour after 118 of 321.
+      matrix:
+        backdrop: [layer, material]
+        # A run by hand for a few scenarios needs one job per backdrop, and nothing else holding the runners.
+        shard: ${{ fromJSON(github.event.inputs.scenarios != '' && '[1]' || '[1, 2, 3, 4]') }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache the engine
+        uses: actions/cache@v6
+        with:
+          path: vendor/engine
+          key: engine-${{ runner.arch }}-${{ hashFiles('scripts/fetch-engine.sh') }}
+
+      # Release, as users run it: the scenario budgets (the recorder's 0.1 % of a core above all)
+      # are a release build's. A debug build's recorder alone costs 0.16–0.22 %.
+      - name: Build (release, ad-hoc signed)
+        run: scripts/build.sh
+
+      # GitHub's macOS runners have one small 1x screen, where a scenario's 1200x800 window doesn't fit; the
+      # scenarios run on a virtual 1728x1117 Retina display instead (scripts/test-display.sh).
+      - name: Test display
+        run: scripts/test-display.sh
+
+      - name: Scenarios
+        env:
+          CRA_FLAGS: backdrop=${{ matrix.backdrop }}
+          CRA_TEST_SCREEN: Cra Test Display
+          ONLY: ${{ github.event.inputs.scenarios }}
+          CRA_SCENARIO_SCREEN: "1"
+          # Budgets and snapshots were set on a Mac; on this VM they go in the summary, and only
+          # what the app does fails the job (scripts/scenario.sh).
+          CRA_BUDGETS: report
+          CRA_SCENARIO_SHARD: ${{ matrix.shard }}/4
+        run: |
+          {
+            echo "## Scenarios, backdrop=${{ matrix.backdrop }}, shard ${{ matrix.shard }}/4"
+            echo
+            echo "| Scenario | Result | Longest stall / over 50 ms | Memory | Problems |"
+            echo "|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A fresh runner's first Cra launch pages CEF in from disk on the main thread (1.1–2.7 s
+          # at start-up, 3–6 Nov) whatever the scenario; one throwaway run first, so the start-up
+          # budget measures Cra, not the runner's cold disk.
+          scripts/scenario.sh solid-spaces > /dev/null 2>&1 || true
+          if [ -n "$ONLY" ]; then
+            # A run by hand for a few scenarios: the first job of each backdrop runs them, the others nothing.
+            [ "${{ matrix.shard }}" = 1 ] || exit 0
+            failed=()
+            for s in $ONLY; do scripts/scenario.sh "$s" || failed+=("$s"); done
+            [ ${#failed[@]} -eq 0 ] || { echo "Failed: ${failed[*]}"; exit 1; }
+          else
+            scripts/scenario.sh all
+          fi
+
+      - name: Keep logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scenarios-${{ matrix.backdrop }}-${{ matrix.shard }}
+          path: build/scenarios
+          if-no-files-found: ignore
+
+  sanitizers:
+    if: github.event.inputs.scenarios == ''
+    name: Harnesses under ${{ matrix.sanitizer }} sanitizer
+    runs-on: macos-26
+    # Thread sanitizer took 27-28 min on 19-20 Nov and hit 30 on a slower runner with every check passing.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread, undefined]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Harnesses
+        env:
+          CRA_TEST_SWIFTC_FLAGS: -sanitize=${{ matrix.sanitizer }}
+        run: |
+          for t in scripts/test-*.sh Tests/test-*.sh; do
+            case "$t" in scripts/test-update.sh|scripts/test.sh) continue ;; esac
+            echo "== $t"; bash "$t"
+          done
+
+  fuzz:
+    if: github.event.inputs.scenarios == ''
+    name: Parser fuzzing
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: 400 000 mutated inputs under AddressSanitizer
+        env:
+          CRA_FUZZ_ITERATIONS: "400000"
+          CRA_FUZZ_SEED: ${{ github.run_id }}
+        run: scripts/fuzz.sh
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crash
+          path: build/fuzz
+
+  mutation:
+    name: Mutation testing
+    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.scenarios == '') || github.event.schedule == '41 3 * * 1'
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      # About a thousand mutants are more than the job's hour: a shuffled sample (a new order each
+      # ISO week) runs until the time is up, and the score is over the ones it reached.
+      - name: Mutants of the pure code (70 % must be caught)
+        env:
+          CRA_MUTATION_MINUTES: "70"
+        run: scripts/mutate.py

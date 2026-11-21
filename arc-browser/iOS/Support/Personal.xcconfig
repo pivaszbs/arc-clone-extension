@@ -1,0 +1,14 @@
+// Signs the iPhone app with your own Apple team for a phone install (scripts/ios.sh device).
+// Each target keeps its own bundle ID under ARC_BUNDLE_ID, and drops the capabilities
+// (iCloud, app group, default browser) that only the upstream team's profile carries.
+PRODUCT_BUNDLE_IDENTIFIER = $(ARC_BUNDLE_ID)$(ARC_SUFFIX_$(TARGET_NAME))
+ARC_SUFFIX_Cra =
+ARC_SUFFIX_CraWidgets = .widgets
+ARC_SUFFIX_CraShare = .share
+ARC_SUFFIX_CraUITests = .uitests
+CODE_SIGN_ENTITLEMENTS = $(ARC_ENTITLEMENTS_$(TARGET_NAME))
+ARC_ENTITLEMENTS_Cra = Support/CraPersonal.entitlements
+ARC_ENTITLEMENTS_CraShare = Support/SharePersonal.entitlements
+ARC_ENTITLEMENTS_CraWidgets =
+ARC_ENTITLEMENTS_CraUITests =
+CODE_SIGN_STYLE = Automatic

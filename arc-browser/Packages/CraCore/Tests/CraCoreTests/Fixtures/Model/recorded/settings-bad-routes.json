@@ -1,0 +1,46 @@
+{
+  "autoArchive" : "twelveHours",
+  "autoArchiveEnabled" : true,
+  "autoPictureInPicture" : true,
+  "blockAdsAndTrackers" : true,
+  "chromeEngine" : true,
+  "defaultLinkDestination" : {
+    "littleWindow" : {
+
+    }
+  },
+  "developerHosts" : [
+
+  ],
+  "disabledDefaultDeveloperHosts" : [
+
+  ],
+  "edgeToEdgeContent" : false,
+  "folderPreviews" : true,
+  "hapticFeedbackOnReorder" : true,
+  "hasSeenImportPrompt" : false,
+  "httpsOnly" : false,
+  "linkRoutes" : [
+
+  ],
+  "newTabButtonAtTop" : true,
+  "newTabButtonDefaultMigrated" : true,
+  "newTabsAtTop" : true,
+  "openLinksInForeground" : false,
+  "peekInEveryTab" : false,
+  "peekLinksToOtherSites" : true,
+  "peekOnShiftClick" : true,
+  "perfHidesSiteNames" : false,
+  "perfRecording" : true,
+  "searchEngine" : "google",
+  "searchSuggestions" : true,
+  "showSpaceHeaderOnSingleSpace" : true,
+  "showStatusBar" : true,
+  "showToolbar" : false,
+  "tabSleepAfter" : "fourHours",
+  "tabSleepOnMemoryPressure" : false,
+  "tabSleepTimerEnabled" : true,
+  "toolbarDefaultMigrated" : true,
+  "toolbarShowsFullURL" : false,
+  "warnBeforeQuitting" : false
+}

@@ -1,0 +1,27 @@
+diff --git a/chrome/browser/extensions/api/tabs/tabs_api.cc b/chrome/browser/extensions/api/tabs/tabs_api.cc
+--- a/chrome/browser/extensions/api/tabs/tabs_api.cc
++++ b/chrome/browser/extensions/api/tabs/tabs_api.cc
+@@ -114,6 +114,9 @@
+ 
+ static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
+ 
++// Cra: CraSparePageKey (pages extensions don't see).
++#include "content/public/browser/cra_live_connection.h"
++
+ namespace extensions {
+ 
+ namespace tabs = api::tabs;
+@@ -673,6 +676,13 @@ base::ListValue TabsQueryFunction::BuildTabList(
+         continue;
+       }
+ 
++      // Cra: the blank page that keeps a profile's hidden window open, and a page made ahead for the next tab,
++      // aren't tabs to an extension.
++      if (tab->GetContents() &&
++          tab->GetContents()->GetUserData(content::CraSparePageKey())) {
++        continue;
++      }
++
+       if (!MatchesTab(tab, url_patterns)) {
+         continue;
+       }

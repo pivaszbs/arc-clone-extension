@@ -1,0 +1,80 @@
+{
+  "autoArchive" : "sevenDays",
+  "autoArchiveEnabled" : false,
+  "autoPictureInPicture" : false,
+  "blockAdsAndTrackers" : false,
+  "chromeEngine" : false,
+  "defaultLinkDestination" : {
+    "space" : {
+      "_0" : "A0000000-0000-0000-0000-000000000002"
+    }
+  },
+  "developerHosts" : [
+    "localhost"
+  ],
+  "disabledDefaultDeveloperHosts" : [
+
+  ],
+  "edgeToEdgeContent" : true,
+  "folderPreviews" : false,
+  "hapticFeedbackOnReorder" : false,
+  "hasSeenImportPrompt" : true,
+  "httpsOnly" : true,
+  "keepActiveSites" : [
+    {
+      "host" : "mail.example.com",
+      "id" : "F0000000-0000-0000-0000-000000000001",
+      "includesSubdomains" : false
+    },
+    {
+      "host" : "example.org",
+      "id" : "F0000000-0000-0000-0000-000000000002",
+      "includesSubdomains" : true
+    }
+  ],
+  "linkRoutes" : [
+    {
+      "destination" : {
+        "mostRecentSpace" : {
+
+        }
+      },
+      "id" : "E0000000-0000-0000-0000-000000000001",
+      "match" : "contains",
+      "text" : "meet.google.com"
+    },
+    {
+      "destination" : {
+        "littleWindow" : {
+
+        }
+      },
+      "id" : "E0000000-0000-0000-0000-000000000002",
+      "match" : "equals",
+      "text" : "example.com\/standup"
+    }
+  ],
+  "newDocumentApps" : {
+    "Default" : "googleDoc"
+  },
+  "newTabButtonAtTop" : false,
+  "newTabButtonDefaultMigrated" : true,
+  "newTabsAtTop" : false,
+  "openLinksInForeground" : false,
+  "peekInEveryTab" : true,
+  "peekLinksToOtherSites" : false,
+  "peekOnShiftClick" : false,
+  "perfHidesSiteNames" : true,
+  "perfRecording" : false,
+  "searchEngine" : "kagi",
+  "searchSuggestions" : false,
+  "showSpaceHeaderOnSingleSpace" : false,
+  "showStatusBar" : false,
+  "showToolbar" : true,
+  "tabSleepAfter" : "oneHour",
+  "tabSleepOnMemoryPressure" : true,
+  "tabSleepTimerEnabled" : false,
+  "toolbarDefaultMigrated" : true,
+  "toolbarShowsFullURL" : false,
+  "warnBeforeQuitting" : true
+}

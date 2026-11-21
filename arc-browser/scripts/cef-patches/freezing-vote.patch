@@ -1,0 +1,738 @@
+diff --git a/cef/BUILD.gn b/cef/BUILD.gn
+index 2018b0dc0..1045118b4 100644
+--- a/cef/BUILD.gn
++++ b/cef/BUILD.gn
+@@ -976,6 +976,7 @@ source_set("libcef_static") {
+     "//components/network_session_configurator/common",
+     "//components/pdf/browser",
+     "//components/pdf/renderer",
++    "//components/performance_manager",
+     "//components/plugins/renderer",
+     "//components/pref_registry",
+     "//components/printing/browser",
+@@ -984,6 +985,7 @@ source_set("libcef_static") {
+     "//components/proxy_config",
+     "//components/services/print_compositor/public/cpp",
+     "//components/services/print_compositor/public/mojom",
++    "//components/sessions",
+     "//components/update_client",
+     "//components/url_formatter",
+     "//components/user_prefs",
+diff --git a/cef/libcef/browser/devtools/devtools_controller.cc b/cef/libcef/browser/devtools/devtools_controller.cc
+--- a/cef/libcef/browser/devtools/devtools_controller.cc
++++ b/cef/libcef/browser/devtools/devtools_controller.cc
+@@ -4,12 +4,675 @@
+ 
+ #include "cef/libcef/browser/devtools/devtools_controller.h"
+ 
++#include <algorithm>
++#include <limits>
++
+ #include "base/json/json_reader.h"
++#include "base/base64.h"
++#include "base/feature_list.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/json/json_writer.h"
++#include "base/memory/ref_counted.h"
++#include "base/pickle.h"
++#include "base/scoped_observation.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/supports_user_data.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "partition_alloc/memory_reclaimer.h"
+ #include "cef/libcef/browser/devtools/devtools_util.h"
+ #include "cef/libcef/browser/thread_util.h"
++#include "chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.h"
++#include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_observer.h"
++#include "chrome/browser/translate/chrome_translate_client.h"
++#include "components/crx_file/id_util.h"
++#include "components/performance_manager/freezing/freezing_policy.h"
++#include "components/performance_manager/public/freezing/freezing.h"
++#include "components/performance_manager/public/performance_manager.h"
++#include "components/sessions/content/content_serialized_navigation_builder.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/session_constants.h"
++#include "components/translate/core/browser/translate_download_manager.h"
++#include "components/translate/core/browser/translate_manager.h"
++#include "components/translate/core/browser/translate_prefs.h"
++#include "content/browser/media/session/media_session_impl.h"
++#include "content/public/browser/cra_live_connection.h"
+ #include "content/public/browser/devtools_agent_host.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
++#include "content/public/browser/restore_type.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/common/content_features.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/install_approval.h"
++#include "extensions/browser/view_type_utils.h"
++#include "extensions/browser/webstore_installer.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/mojom/manifest.mojom-shared.h"
+ 
++namespace {
++
++// Cra: a page's freezing vote, held while the client asks for it, like Arc's
++// freeze token. Chromium's freezing policy freezes the page only while no
++// CannotFreezeReason applies (audible, capturing, Web Locks, WebRTC,
++// notification permission, ...).
++const char kCraFreezingVoteKey[] = "cra-freezing-vote";
++
++struct CraFreezingVote : public base::SupportsUserData::Data {
++  explicit CraFreezingVote(content::WebContents* contents) : vote(contents) {}
++  performance_manager::freezing::FreezingVote vote;
++};
++
++base::ListValue ReasonList(
++    const performance_manager::freezing::CannotFreezeReasonSet& reasons) {
++  base::ListValue list;
++  for (auto reason : reasons) {
++    list.Append(
++        performance_manager::freezing::CannotFreezeReasonToString(reason));
++  }
++  return list;
++}
++
++// Cra: the page's media session as Chromium routes it (the frame whose
++// navigator.mediaSession handlers answer), like Arc's media actions. Unlike a
++// wrapper around setActionHandler in the page, this sees every handler however
++// early the page registered it.
++struct CraMediaSessionActionName {
++  media_session::mojom::MediaSessionAction action;
++  const char* name;
++};
++constexpr CraMediaSessionActionName kCraMediaSessionActions[] = {
++    {media_session::mojom::MediaSessionAction::kPlay, "play"},
++    {media_session::mojom::MediaSessionAction::kPause, "pause"},
++    {media_session::mojom::MediaSessionAction::kPreviousTrack, "previoustrack"},
++    {media_session::mojom::MediaSessionAction::kNextTrack, "nexttrack"},
++    {media_session::mojom::MediaSessionAction::kSeekBackward, "seekbackward"},
++    {media_session::mojom::MediaSessionAction::kSeekForward, "seekforward"},
++    {media_session::mojom::MediaSessionAction::kSkipAd, "skipad"},
++    {media_session::mojom::MediaSessionAction::kStop, "stop"},
++    {media_session::mojom::MediaSessionAction::kToggleMicrophone,
++     "togglemicrophone"},
++    {media_session::mojom::MediaSessionAction::kToggleCamera, "togglecamera"},
++    {media_session::mojom::MediaSessionAction::kHangUp, "hangup"},
++    {media_session::mojom::MediaSessionAction::kPreviousSlide,
++     "previousslide"},
++    {media_session::mojom::MediaSessionAction::kNextSlide, "nextslide"},
++};
++
++// {"id":N,"method":"Cra.mediaSession"}: {"actions":[names],
++// "pictureInPicture":bool}, the actions the page has handlers for and whether
++// this page has the Picture in Picture window.
++// {"id":N,"method":"Cra.mediaSession","params":{"action":name}}: runs the
++// page's handler for it, as Chrome's media keys and global media controls do;
++// "handled" is false when the page has none.
++void HandleCraMediaSession(content::WebContents* contents,
++                           const base::DictValue* params,
++                           base::DictValue* result,
++                           std::string* error) {
++  auto* session = static_cast<content::MediaSessionImpl*>(
++      content::MediaSession::GetIfExists(contents));
++  auto* pip = PictureInPictureWindowManager::GetInstance();
++  const bool has_pip = pip->GetWebContents() == contents;
++  result->Set("pictureInPicture", has_pip);
++  const std::string* name = params ? params->FindString("action") : nullptr;
++  if (!name) {
++    base::ListValue actions;
++    for (const auto& entry : kCraMediaSessionActions) {
++      if (session && session->ShouldRouteAction(entry.action)) {
++        actions.Append(entry.name);
++      }
++    }
++    result->Set("actions", std::move(actions));
++    return;
++  }
++  const CraMediaSessionActionName* found = nullptr;
++  for (const auto& entry : kCraMediaSessionActions) {
++    if (*name == entry.name) {
++      found = &entry;
++    }
++  }
++  if (!found) {
++    *error = "unknown media session action";
++    return;
++  }
++  const bool routed = session && session->ShouldRouteAction(found->action);
++  if (routed) {
++    session->DidReceiveAction(found->action);
++  }
++  result->Set("handled", routed);
++}
++
++// Cra: Chrome's automatic Picture in Picture (AutoPictureInPictureTabHelper),
++// which a tab strip drives in Chrome and the client drives here.
++// {"id":N,"method":"Cra.autoPictureInPicture","params":{"tab":"hidden"}}: the
++// tab went out of sight. A page that registered an enterpictureinpicture media
++// session handler and uses the camera or microphone (a Google Meet call) has it
++// run, with the reason "contentoccluded" and the browser's authorization to
++// open its Picture in Picture window; {"asked":bool}. Chrome's per-site
++// automatic picture-in-picture permission applies, and nothing replaces a
++// Picture in Picture window that is already open ({"pictureInPicture":true}
++// when this page has it).
++// {"id":N,"method":"Cra.autoPictureInPicture","params":{"tab":"shown"}}: the
++// tab is in front again, which closes the window automatic Picture in Picture
++// opened, as Chrome does.
++void HandleCraAutoPictureInPicture(content::WebContents* contents,
++                                   const base::DictValue* params,
++                                   base::DictValue* result,
++                                   std::string* error) {
++  auto* helper = AutoPictureInPictureTabHelper::FromWebContents(contents);
++  const std::string* tab = params ? params->FindString("tab") : nullptr;
++  if (!helper) {
++    *error = "no automatic Picture in Picture for this page";
++    return;
++  }
++  if (tab && *tab == "shown") {
++    helper->OnTabBecameActive();
++    return;
++  }
++  if (!tab || *tab != "hidden") {
++    *error = "tab must be hidden or shown";
++    return;
++  }
++  result->Set("pictureInPicture",
++              PictureInPictureWindowManager::GetInstance()->GetWebContents() ==
++                  contents);
++  result->Set("asked", helper->CraOnTabHidden());
++}
++
++// {"id":N,"method":"Cra.setFreezingVote","params":{"vote":true|false}}: sets
++// or drops the vote. {"id":N,"method":"Cra.getFreezingState"}: whether the
++// page has Cra's vote, is frozen, and why the policy won't freeze it.
++// {"id":N,"method":"Cra.discard"}: discards the page in place, like Chrome's
++// TabLifecycleUnit with WebContentsDiscard on: its renderer goes, the
++// WebContents keeps its back/forward list and each entry's page state (scroll
++// position, form contents), and showing it loads the page again.
++// {"id":N,"method":"Cra.load"}: loads a discarded page now, as Chrome does
++// when its tab is selected, even while the window is covered.
++// Returns true for these; any other message returns false.
++bool HandleCraMethod(content::WebContents* contents,
++                     std::string_view message,
++                     int* message_id,
++                     base::DictValue* result,
++                     std::string* error);
++
++// Cra (GitHub #273): a tab's back and forward list across a relaunch, the way
++// Chrome's session service keeps it (and Arc, which maps its tabs to Chrome's
++// session tabs).
++// {"id":N,"method":"Cra.getHistory"}: the last committed entry and up to
++// sessions::gMaxPersistNavigationCount entries on each side of it, each a
++// SerializedNavigationEntry with its page state (scroll position, form
++// contents) pickled as a session command holds one, so no more than ~63 KB an
++// entry. {"history":base64 (an int count, then the entries),"index":the
++// current entry's position in it,"url":its address}; "history" is empty for a
++// page that has committed nothing.
++// {"id":N,"method":"Cra.restoreHistory","params":{"history":base64,
++// "index":i}}: puts such a list into a page that hasn't navigated yet, as
++// Chrome's session restore does (NavigationController::Restore), and loads
++// entry i. {"restored":count}.
++constexpr size_t kCraMaxHistoryEntrySize =
++    std::numeric_limits<uint16_t>::max() - 1024;
++
++void HandleCraGetHistory(content::WebContents* contents,
++                         base::DictValue* result) {
++  content::NavigationController& controller = contents->GetController();
++  const int current = controller.GetLastCommittedEntryIndex();
++  content::NavigationEntry* current_entry = controller.GetLastCommittedEntry();
++  std::vector<sessions::SerializedNavigationEntry> navigations;
++  int index = 0;
++  if (current >= 0 && current_entry && !current_entry->IsInitialEntry()) {
++    const int first =
++        std::max(current - sessions::gMaxPersistNavigationCount, 0);
++    const int last =
++        std::min(current + sessions::gMaxPersistNavigationCount,
++                 controller.GetEntryCount() - 1);
++    for (int i = first; i <= last; ++i) {
++      content::NavigationEntry* entry = controller.GetEntryAtIndex(i);
++      if (!entry || entry->IsInitialEntry()) {
++        continue;
++      }
++      if (i == current) {
++        index = static_cast<int>(navigations.size());
++      }
++      navigations.push_back(
++          sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(
++              i, entry));
++    }
++  }
++  std::string history;
++  if (!navigations.empty()) {
++    base::Pickle pickle;
++    pickle.WriteInt(static_cast<int>(navigations.size()));
++    for (const auto& navigation : navigations) {
++      navigation.WriteToPickle(kCraMaxHistoryEntrySize, &pickle);
++    }
++    history = base::Base64Encode(pickle.AsBytes());
++  }
++  result->Set("history", history);
++  result->Set("index", index);
++  result->Set("url", navigations.empty()
++                         ? std::string()
++                         : navigations[index].virtual_url().spec());
++}
++
++void HandleCraRestoreHistory(content::WebContents* contents,
++                             const base::DictValue* params,
++                             base::DictValue* result,
++                             std::string* error) {
++  const std::string* encoded = params ? params->FindString("history") : nullptr;
++  std::optional<int> index = params ? params->FindInt("index") : std::nullopt;
++  std::string bytes;
++  if (!encoded || !index || !base::Base64Decode(*encoded, &bytes)) {
++    *error = "needs history (base64) and index";
++    return;
++  }
++  base::Pickle pickle =
++      base::Pickle::WithUnownedBuffer(base::as_byte_span(bytes));
++  base::PickleIterator iterator(pickle);
++  int count = 0;
++  if (!iterator.ReadInt(&count) || count <= 0 ||
++      count > 2 * sessions::gMaxPersistNavigationCount + 1 || *index < 0 ||
++      *index >= count) {
++    *error = "unreadable history";
++    return;
++  }
++  std::vector<sessions::SerializedNavigationEntry> navigations(count);
++  for (int i = 0; i < count; ++i) {
++    if (!navigations[i].ReadFromPickle(&iterator)) {
++      *error = "unreadable history";
++      return;
++    }
++    navigations[i].set_index(i);
++  }
++  content::NavigationController& controller = contents->GetController();
++  content::NavigationEntry* committed = controller.GetLastCommittedEntry();
++  if (controller.GetEntryCount() > 1 || controller.GetPendingEntry() ||
++      (committed && !committed->IsInitialEntry())) {
++    *error = "the page has navigated already";
++    return;
++  }
++  std::vector<std::unique_ptr<content::NavigationEntry>> entries =
++      sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(
++          navigations, contents->GetBrowserContext());
++  controller.Restore(*index, content::RestoreType::kRestored, &entries);
++  controller.LoadIfNecessary();
++  result->Set("restored", count);
++}
++
++// A reply to a Cra.* method, in the protocol's shape. "id" comes first:
++// CEF's ProtocolParser only reads a result that starts with {"id":, and
++// JSONWriter would sort "error" ahead of it, so error replies never arrived.
++std::string CraReplyJson(int message_id,
++                         base::DictValue result,
++                         const std::string& error) {
++  std::string body;
++  if (error.empty()) {
++    base::JSONWriter::Write(result, &body);
++  } else {
++    base::DictValue error_dict;
++    error_dict.Set("code", -32000);
++    error_dict.Set("message", error);
++    base::JSONWriter::Write(error_dict, &body);
++  }
++  return "{\"id\":" + base::NumberToString(message_id) +
++         (error.empty() ? ",\"result\":" : ",\"error\":") + body + "}";
++}
++
++// The page that downloads the store's CRX, as WebstoreInstallWithPrompt has
++// one: never shown, so the download stays out of every window's UI. It lives
++// until the install is over, or until its profile goes away: a quit while an
++// install still ran (or never ended) destroyed the profile with the page open,
++// and Chromium stops on that ("BrowserContext is getting destroyed without
++// first closing all WebContents", GitHub #227). WebstoreInstaller holds the
++// page through a WeakPtr; an install cut off this way never replies, and the
++// client asks for it again on the next launch.
++struct CraWebStoreInstallPage
++    : public base::RefCountedThreadSafe<CraWebStoreInstallPage>,
++      public ProfileObserver {
++  explicit CraWebStoreInstallPage(Profile* profile)
++      : contents(content::WebContents::Create(
++            content::WebContents::CreateParams(profile))) {
++    profile_observation_.Observe(profile);
++  }
++  std::unique_ptr<content::WebContents> contents;
++
++  // ProfileObserver: first thing in ~ProfileImpl, before its user data (the
++  // list of the profile's WebContents) is checked and cleared.
++  void OnProfileWillBeDestroyed(Profile* profile) override {
++    profile_observation_.Reset();
++    contents.reset();
++  }
++
++ private:
++  friend class base::RefCountedThreadSafe<CraWebStoreInstallPage>;
++  ~CraWebStoreInstallPage() override = default;
++
++  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
++};
++
++// Cra (GitHub #203): {"id":N,"method":"Cra.installFromWebStore","params":
++// {"id":extension id,"manifest":{...}}} installs a Chrome Web Store item in
++// this page's profile the way the store's "Add to Chrome" does
++// (webstorePrivate.completeInstall): WebstoreInstaller fetches the signed CRX
++// from the store's update service and CrxInstaller checks it carries the
++// store's signature. It lands as INTERNAL and from the Web Store, updates and
++// is verified like any store install, which an unpacked copy (Arc's, Dia's,
++// Chrome's, loaded with --load-extension) never is. `manifest` is the copy
++// the person picked; the store's version may not ask for more permissions
++// (a loose check). No prompt: the client asks only for extensions the person
++// chose to bring over. Replies {"installed":true} once the extension is
++// installed, else an error; the download can take a while.
++// Returns false for any other message.
++bool StartCraWebStoreInstall(
++    content::WebContents* contents,
++    std::string_view message,
++    base::OnceCallback<void(std::string json)> send) {
++  if (message.find("\"Cra.installFromWebStore\"") == std::string_view::npos) {
++    return false;
++  }
++  std::optional<base::DictValue> dict =
++      base::JSONReader::ReadDict(message, base::JSON_PARSE_RFC);
++  if (!dict) {
++    return false;
++  }
++  const std::string* method = dict->FindString("method");
++  std::optional<int> message_id = dict->FindInt("id");
++  if (!method || !message_id || *method != "Cra.installFromWebStore") {
++    return false;
++  }
++  auto fail = [&](const std::string& error) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(send),
++                                  CraReplyJson(*message_id, base::DictValue(),
++                                               error)));
++    return true;
++  };
++  const base::DictValue* params = dict->FindDict("params");
++  const std::string* id = params ? params->FindString("id") : nullptr;
++  const base::DictValue* manifest =
++      params ? params->FindDict("manifest") : nullptr;
++  if (!id || !crx_file::id_util::IdIsValid(*id) || !manifest) {
++    return fail("needs a valid extension id and its manifest");
++  }
++  Profile* profile = Profile::FromBrowserContext(contents->GetBrowserContext());
++  if (!profile || profile->IsOffTheRecord()) {
++    return fail("not in an off-the-record profile");
++  }
++  const extensions::Extension* installed =
++      extensions::ExtensionRegistry::Get(profile)->GetInstalledExtension(*id);
++  if (installed &&
++      installed->location() == extensions::mojom::ManifestLocation::kInternal &&
++      installed->from_webstore()) {
++    base::DictValue result;
++    result.Set("installed", true);
++    result.Set("already", true);
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(send),
++                                  CraReplyJson(*message_id, std::move(result),
++                                               std::string())));
++    return true;
++  }
++  std::unique_ptr<extensions::InstallApproval> approval =
++      extensions::InstallApproval::CreateWithNoInstallPrompt(
++          profile, *id, manifest->Clone(), /*strict_manifest_check=*/false);
++  approval->skip_post_install_ui = true;
++  approval->use_app_installed_bubble = false;
++  auto page = base::MakeRefCounted<CraWebStoreInstallPage>(profile);
++  // One of the two callbacks runs; both hold the page and the reply.
++  auto split = base::SplitOnceCallback(std::move(send));
++  auto installer = base::MakeRefCounted<extensions::WebstoreInstaller>(
++      profile,
++      base::BindOnce(
++          [](scoped_refptr<CraWebStoreInstallPage>, int message_id,
++             base::OnceCallback<void(std::string)> send, const std::string&) {
++            base::DictValue result;
++            result.Set("installed", true);
++            std::move(send).Run(CraReplyJson(message_id, std::move(result),
++                                             std::string()));
++          },
++          page, *message_id, std::move(split.first)),
++      base::BindOnce(
++          [](scoped_refptr<CraWebStoreInstallPage>, int message_id,
++             base::OnceCallback<void(std::string)> send, const std::string& id,
++             const std::string& error,
++             extensions::WebstoreInstaller::FailureReason) {
++            LOG(WARNING) << "Cra: Web Store install of " << id
++                         << " failed: " << error;
++            std::move(send).Run(CraReplyJson(
++                message_id, base::DictValue(),
++                error.empty() ? std::string("install failed") : error));
++          },
++          page, *message_id, std::move(split.second)),
++      page->contents.get(), *id, std::move(approval),
++      extensions::WebstoreInstaller::INSTALL_SOURCE_OTHER);
++  installer->Start();
++  return true;
++}
++
++// Cra (GitHub #310): Arc's translate UI, which Cra draws itself. Every
++// method replies with the page's state (ChromeTranslateClient::
++// CraTranslateState); Cra.getTranslateState adds the languages Chrome can
++// translate to. Cra.translatePage translates to params.target, or to the
++// language Chrome would pick, as the bubble's Translate button does.
++// Cra.neverTranslateSite puts the page's host on Chrome's never-translate
++// list, or takes it off with params.never false.
++void HandleCraTranslate(content::WebContents* contents,
++                        const std::string& method,
++                        const base::DictValue* params,
++                        base::DictValue* result,
++                        std::string* error) {
++  ChromeTranslateClient* client =
++      ChromeTranslateClient::FromWebContents(contents);
++  translate::TranslateManager* manager =
++      client ? client->GetTranslateManager() : nullptr;
++  if (!manager) {
++    *error = "the page has no translate client";
++    return;
++  }
++  if (method == "Cra.translatePage") {
++    const std::string* target = params ? params->FindString("target") : nullptr;
++    std::optional<std::string> target_code;
++    if (target && !target->empty()) {
++      target_code = *target;
++    }
++    manager->ShowTranslateUI(std::nullopt, target_code,
++                             /*auto_translate=*/true,
++                             /*triggered_from_menu=*/true);
++  } else if (method == "Cra.revertTranslation") {
++    if (client->GetLanguageState().IsPageTranslated()) {
++      manager->RevertTranslation();
++    }
++  } else if (method == "Cra.neverTranslateSite") {
++    const GURL& url = contents->GetLastCommittedURL();
++    if (!url.has_host()) {
++      *error = "the page has no site";
++      return;
++    }
++    std::optional<bool> never =
++        params ? params->FindBool("never") : std::nullopt;
++    std::unique_ptr<translate::TranslatePrefs> prefs =
++        client->GetTranslatePrefs();
++    if (never.value_or(true)) {
++      prefs->AddSiteToNeverPromptList(url.host());
++    } else {
++      prefs->RemoveSiteFromNeverPromptList(url.host());
++    }
++  }
++  *result = client->CraTranslateState();
++  if (method == "Cra.getTranslateState") {
++    std::vector<std::string> codes;
++    translate::TranslateDownloadManager::GetSupportedLanguages(
++        /*translate_allowed=*/true, &codes);
++    base::ListValue languages;
++    for (const std::string& code : codes) {
++      languages.Append(code);
++    }
++    result->Set("languages", std::move(languages));
++  }
++}
++
++bool HandleCraMethod(content::WebContents* contents,
++                     std::string_view message,
++                     int* message_id,
++                     base::DictValue* result,
++                     std::string* error) {
++  if (message.find("\"Cra.") == std::string_view::npos) {
++    return false;
++  }
++  std::optional<base::DictValue> dict =
++      base::JSONReader::ReadDict(message, base::JSON_PARSE_RFC);
++  if (!dict) {
++    return false;
++  }
++  const std::string* method = dict->FindString("method");
++  std::optional<int> id = dict->FindInt("id");
++  if (!method || !id ||
++      (*method != "Cra.setFreezingVote" && *method != "Cra.getFreezingState" &&
++       *method != "Cra.discard" && *method != "Cra.load" &&
++       *method != "Cra.mediaSession" && *method != "Cra.autoPictureInPicture" &&
++       *method != "Cra.extensionSidePanel" && *method != "Cra.getHistory" &&
++       *method != "Cra.restoreHistory" && *method != "Cra.getTranslateState" &&
++       *method != "Cra.translatePage" && *method != "Cra.revertTranslation" &&
++       *method != "Cra.neverTranslateSite" &&
++       *method != "Cra.reclaimMemory" && *method != "Cra.setSpare")) {
++    return false;
++  }
++  *message_id = *id;
++  if (*method == "Cra.setSpare") {
++    // Cra: a page made ahead for the next tab that needs one, hidden from
++    // extensions' tabs and windows until Cra gives it a tab.
++    const base::DictValue* params = dict->FindDict("params");
++    if (params && params->FindBool("spare").value_or(false)) {
++      contents->SetUserData(content::CraSparePageKey(),
++                            std::make_unique<base::SupportsUserData::Data>());
++    } else {
++      contents->RemoveUserData(content::CraSparePageKey());
++    }
++    return true;
++  }
++  if (*method == "Cra.reclaimMemory") {
++    // Cra: closing tabs leaves the browser process's allocator holding the
++    // pages they freed (renderers reclaim theirs when they go to the
++    // background; the browser process never does). Off the UI thread: it
++    // walks every partition.
++    base::ThreadPool::PostTask(
++        FROM_HERE, {base::TaskPriority::BEST_EFFORT},
++        base::BindOnce(
++            [] { ::partition_alloc::MemoryReclaimer::Instance()->ReclaimAll(); }));
++    return true;
++  }
++  if (*method == "Cra.getTranslateState" || *method == "Cra.translatePage" ||
++      *method == "Cra.revertTranslation" ||
++      *method == "Cra.neverTranslateSite") {
++    HandleCraTranslate(contents, *method, dict->FindDict("params"), result,
++                       error);
++    return true;
++  }
++  if (*method == "Cra.getHistory") {
++    HandleCraGetHistory(contents, result);
++    return true;
++  }
++  if (*method == "Cra.restoreHistory") {
++    HandleCraRestoreHistory(contents, dict->FindDict("params"), result, error);
++    return true;
++  }
++  if (*method == "Cra.extensionSidePanel") {
++    // Cra (GitHub #265): the page is an extension's side panel, which Cra
++    // hosts in a tab of its own. Like Chrome's side panel it then has no tab:
++    // no sender.tab on its messages and ports, tabs.getCurrent() gives
++    // undefined, and runtime.getContexts() reports it as SIDE_PANEL. Sent
++    // before the panel page loads; the page stays one until it closes.
++    extensions::SetViewType(contents,
++                            extensions::mojom::ViewType::kExtensionSidePanel);
++    return true;
++  }
++  if (*method == "Cra.autoPictureInPicture") {
++    HandleCraAutoPictureInPicture(contents, dict->FindDict("params"), result,
++                                  error);
++    return true;
++  }
++  if (*method == "Cra.mediaSession") {
++    HandleCraMediaSession(contents, dict->FindDict("params"), result, error);
++    return true;
++  }
++  if (*method == "Cra.load") {
++    // Does nothing unless the page was discarded and hasn't loaded since.
++    contents->GetController().LoadIfNecessary();
++    return true;
++  }
++  if (*method == "Cra.discard") {
++    if (!base::FeatureList::IsEnabled(features::kWebContentsDiscard)) {
++      *error = "discarding needs the WebContentsDiscard feature";
++      return true;
++    }
++    if (!contents->WasDiscarded()) {
++      // First try to end the renderer, if it holds only this page
++      // (AttemptFastKillForDiscard).
++      content::RenderFrameHost* main_frame = contents->GetPrimaryMainFrame();
++      result->Set("processEnded",
++                  main_frame && main_frame->GetProcess()->FastShutdownIfPossible(
++                                    1u, /*skip_unload_handlers=*/false,
++                                    /*ignore_workers=*/false,
++                                    /*ignore_keep_alive=*/false,
++                                    /*ignore_pending_reuse=*/false,
++                                    /*use_outermost_main_frame_check=*/true));
++      contents->Discard(base::DoNothing());
++    }
++    // False when a navigation was about to commit: Chromium keeps the page.
++    result->Set("discarded", contents->WasDiscarded());
++    return true;
++  }
++  if (*method == "Cra.getFreezingState") {
++    result->Set("vote", !!contents->GetUserData(kCraFreezingVoteKey));
++    result->Set("liveConnection",
++                content::CraPageHasOpenedLiveConnection(contents));
++    const performance_manager::PageNode* page =
++        performance_manager::PerformanceManager::
++            GetPrimaryPageNodeForWebContents(contents)
++                .get();
++    if (page && performance_manager::PerformanceManager::GetGraph()
++                    ->GetRegisteredObjectAs<
++                        performance_manager::FreezingPolicy>()) {
++      result->Set("frozen", page->GetLifecycleState() ==
++                                performance_manager::mojom::LifecycleState::kFrozen);
++      auto details =
++          performance_manager::freezing::GetCanFreezeDetailsForPageNode(page);
++      result->Set("reasons", ReasonList(details.cannot_freeze_reasons));
++      result->Set("connectedReasons",
++                  ReasonList(details.cannot_freeze_reasons_connected_pages));
++    }
++    return true;
++  }
++  const base::DictValue* params = dict->FindDict("params");
++  const bool vote = params && params->FindBool("vote").value_or(false);
++  if (!vote) {
++    contents->RemoveUserData(kCraFreezingVoteKey);
++    return true;
++  }
++  if (contents->GetUserData(kCraFreezingVoteKey)) {
++    return true;
++  }
++  // FreezingVote CHECKs both: a page Chrome's tab helpers never saw has no
++  // page node.
++  auto* graph = performance_manager::PerformanceManager::GetGraph();
++  if (!performance_manager::PerformanceManager::
++          GetPrimaryPageNodeForWebContents(contents) ||
++      !graph ||
++      !graph->GetRegisteredObjectAs<
++          performance_manager::FreezingPolicy>()) {
++    *error = "freezing is not available for this page";
++    return true;
++  }
++  contents->SetUserData(kCraFreezingVoteKey,
++                        std::make_unique<CraFreezingVote>(contents));
++  return true;
++}
++
++}  // namespace
++
+ CefDevToolsController::CefDevToolsController(
+     content::WebContents* inspected_contents)
+     : inspected_contents_(inspected_contents), weak_ptr_factory_(this) {
+@@ -30,6 +693,38 @@
+ bool CefDevToolsController::SendDevToolsMessage(
+     const std::string_view& message) {
+   CEF_REQUIRE_UIT();
++  if (StartCraWebStoreInstall(
++          inspected_contents_, message,
++          base::BindOnce(
++              [](base::WeakPtr<CefDevToolsController> self, std::string json) {
++                if (self) {
++                  self->DispatchProtocolMessage(
++                      nullptr, base::as_bytes(base::span(json)));
++                }
++              },
++              weak_ptr_factory_.GetWeakPtr()))) {
++    return true;
++  }
++  int cra_message_id = 0;
++  base::DictValue cra_result;
++  std::string cra_error;
++  if (HandleCraMethod(inspected_contents_, message, &cra_message_id,
++                      &cra_result, &cra_error)) {
++    // Answered like a protocol method, after the caller has returned.
++    std::string json =
++        CraReplyJson(cra_message_id, std::move(cra_result), cra_error);
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::WeakPtr<CefDevToolsController> self, std::string json) {
++              if (self) {
++                self->DispatchProtocolMessage(
++                    nullptr, base::as_bytes(base::span(json)));
++              }
++            },
++            weak_ptr_factory_.GetWeakPtr(), std::move(json)));
++    return true;
++  }
+   if (!EnsureAgentHost()) {
+     return false;
+   }

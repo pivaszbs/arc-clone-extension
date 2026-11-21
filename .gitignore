@@ -3,6 +3,10 @@
 /dist-arc/
 /artifacts/
 /outputs/
+/arc-browser/vendor/
+/arc-browser/build/
+/arc-browser/.build/
+/arc-browser/Packages/CraCore/.build/
 .DS_Store
 .venv/
 __pycache__/

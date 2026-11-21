@@ -1,0 +1,298 @@
+import CraCore
+import Foundation
+import Testing
+
+struct SidebarModelTests {
+    static let space = UUID()
+
+    /// The sidebar row's title: the user's name, then the page title, then the host.
+    @Test func displayTitle() {
+        var tab = SidebarItem.tab("https://example.com/a", title: "Page", parent: nil)
+        #expect(tab.displayTitle == "Page")
+        tab.title = "Renamed"
+        #expect(tab.displayTitle == "Renamed")
+        tab.title = ""
+        #expect(tab.displayTitle == "Page", "an empty name is no name")
+        #expect(SidebarItem.tab("https://example.com/a", parent: nil).displayTitle == "example.com")
+        #expect(SidebarItem.tab("notes", parent: nil).displayTitle == "notes", "no host: the URL as typed")
+        #expect(SidebarItem.tab("about:blank", parent: nil).displayTitle == "New Tab")
+        #expect(SidebarItem.tab("", parent: nil).displayTitle == "New Tab")
+        #expect(SidebarItem.split(parent: nil).displayTitle == "Split View")
+        #expect(SidebarItem.folder("Reading", parent: nil).displayTitle == "Reading")
+        #expect(SidebarItem.container(.today(spaceID: Self.space)).displayTitle == "Untitled")
+    }
+
+    @Test func kinds() {
+        let parent = UUID()
+        let tab = SidebarItem.tab("https://example.com", parent: parent)
+        #expect(tab.isTab && !tab.isFolder && !tab.isSplit && tab.split == nil && tab.container == nil && tab.parentID == parent)
+        #expect(tab.tab?.faviconKey == "example.com" && tab.tab?.savedURL == "https://example.com")
+        var folder = SidebarItem.folder("F", parent: nil)
+        #expect(folder.isFolder && !folder.isLiveFolder && folder.tab == nil && !folder.isEmptyTab)
+        folder.liveFolder = LiveFolderData()
+        #expect(folder.isLiveFolder)
+        let split = SidebarItem.split(parent: nil)
+        #expect(split.isSplit && split.split == SplitData())
+        let id = UUID()
+        let container = SidebarItem.container(.pinned(spaceID: Self.space), id: id)
+        #expect(container.id == id && container.container?.spaceID == Self.space)
+    }
+
+    /// Arc 1.173.1's Change Icon… on a split (#600): an emoji or an Icon-tab glyph, saved with the
+    /// split and only when set, so a split without one saves as before and older files load.
+    @Test(.bug("https://github.com/VictorKildahl/cra/issues/600"))
+    func splitIcon() throws {
+        var split = SplitData()
+        #expect(split.icon == .none)
+        split.icon = .emoji("😀")
+        #expect(split.emoji == "😀" && split.symbol == nil && split.icon == .emoji("😀"))
+        split.icon = .symbol("star.fill")
+        #expect(split.emoji == nil && split.symbol == "star.fill" && split.icon == .symbol("star.fill"))
+        let saved = try JSONEncoder().encode(split)
+        #expect(try JSONDecoder().decode(SplitData.self, from: saved) == split)
+        split.icon = .none
+        let plain = try #require(String(data: JSONEncoder().encode(split), encoding: .utf8))
+        #expect(!plain.contains("emoji") && !plain.contains("symbol"), "no icon writes nothing new")
+        let old = Data(#"{"orientation":"vertical","widthFactors":[]}"#.utf8)
+        #expect(try JSONDecoder().decode(SplitData.self, from: old).icon == .none)
+    }
+
+    @Test func iconKeyPrefersTheUsersPick() {
+        var tab = TabData(url: "https://example.com", title: "E")
+        #expect(tab.iconKey == "example.com")
+        tab.customIconKey = "picked"
+        #expect(tab.iconKey == "picked")
+    }
+
+    /// The line under a tab's title (GitHub #88, #139): Arc's TabCellState.subtitle is a
+    /// developer-mode site's host (and port), else a pull request's author. Leaving a pinned
+    /// page shows none.
+    @Test(.bug("https://github.com/VictorKildahl/cra/issues/88"), .bug("https://github.com/VictorKildahl/cra/issues/139"))
+    func sidebarSubtitle() {
+        var tab = TabData(url: "https://www.youtube.com/watch?v=1", title: "Video")
+        #expect(tab.sidebarSubtitle(developerMode: false) == nil)
+        #expect(tab.sidebarSubtitle(developerMode: true) == "youtube.com", "developer mode: the host, without www.")
+        tab.savedURL = "https://example.com/"
+        #expect(tab.sidebarSubtitle(developerMode: false) == nil, "a pinned tab that left its site shows no host")
+        #expect(TabData(url: "http://127.0.0.1:8080/a").sidebarSubtitle(developerMode: true) == "127.0.0.1:8080", "with its port")
+        var pull = TabData(url: "https://github.com/o/r/pull/1")
+        pull.liveSubtitle = "octocat"
+        #expect(pull.sidebarSubtitle(developerMode: false) == "octocat")
+        #expect(pull.sidebarSubtitle(developerMode: true) == "github.com", "developer mode comes first in Arc")
+        #expect(TabData(url: "notes").sidebarSubtitle(developerMode: true) == nil, "no host, no line")
+    }
+
+    /// GitHub #139: a pinned tab that goes back to its page shows that page's name and favicon,
+    /// not the last page's, before it loads again.
+    @Test(.bug("https://github.com/VictorKildahl/cra/issues/139"))
+    func returningHomeShowsTheHomesNameAndIcon() throws {
+        var tab = TabData(url: "https://github.com/", title: "")
+        tab.noteTitle("GitHub", pinned: true)
+        #expect(tab.homeTitle == "GitHub")
+        tab.url = "https://gist.github.com/o/1"
+        tab.faviconKey = "gist.github.com"
+        tab.noteTitle("Developer bar: Console", pinned: true)
+        #expect(tab.homeTitle == "GitHub", "a page away from home is not the home")
+        tab.returnHome()
+        #expect(tab.url == "https://github.com/" && tab.savedTitle == "GitHub" && tab.faviconKey == "github.com")
+
+        var today = TabData(url: "https://example.com/", title: "")
+        today.noteTitle("Example", pinned: false)
+        #expect(today.homeTitle == nil, "only pinned tabs keep a home name")
+
+        var unseen = TabData(url: "https://a.com/", title: "A")
+        unseen.url = "https://a.com/b"
+        unseen.savedTitle = "B"
+        unseen.returnHome()
+        #expect(unseen.savedTitle == "B", "a home never seen keeps the last name until its page reports")
+
+        var pinning = TabData(url: "https://b.com/", title: "Bee")
+        pinning.url = "https://c.com/"
+        pinning.savedTitle = "Sea"
+        pinning.makeCurrentPageHome()
+        #expect(pinning.savedURL == "https://c.com/" && pinning.homeTitle == "Sea")
+
+        let data = try JSONEncoder().encode(tab)
+        #expect(try JSONDecoder().decode(TabData.self, from: data).homeTitle == "GitHub")
+        #expect(try !String(decoding: JSONEncoder().encode(today), as: UTF8.self).contains("homeTitle"), "not written when unknown")
+    }
+
+    @Test func containerKindsRoundTripAndNeedAKind() throws {
+        for kind in [ContainerKind.favorites(spaceID: Self.space), .pinned(spaceID: Self.space), .today(spaceID: Self.space)] {
+            #expect(try JSONDecoder().decode(ContainerKind.self, from: JSONEncoder().encode(kind)) == kind)
+            #expect(kind.spaceID == Self.space)
+        }
+        #expect(throws: DecodingError.self) { try JSONDecoder().decode(ContainerKind.self, from: Data("{}".utf8)) }
+        #expect(throws: DecodingError.self) { try JSONDecoder().decode(ContainerKind.self, from: Data(#"{"pinned": {}}"#.utf8)) }
+    }
+
+    @Test func freshSidebarHasOneSpaceWithItsContainers() throws {
+        let doc = SidebarDocument.fresh()
+        let space = try #require(doc.spaces.first)
+        #expect(doc.spaces.count == 1 && doc.spaceOrder == [space.id] && space.title == "Personal" && space.emoji == "🌱")
+        #expect(Set(doc.items.map(\.id)) == [space.favoritesContainerID, space.pinnedContainerID, space.todayContainerID])
+        #expect(doc.items.allSatisfy { $0.container?.spaceID == space.id })
+        #expect(doc.version == 1 && doc.favoritesContainerID == nil && doc.profiles == nil)
+    }
+
+    @Test func profileFolderName() {
+        let id = UUID()
+        #expect(BrowserProfile(id: id, name: "Work").directoryName == "Profile \(id.uuidString)")
+    }
+
+    @Test func thresholds() {
+        #expect(AutoArchiveThreshold.allCases.map(\.seconds) == [43_200, 86_400, 604_800, 2_592_000, 7_776_000, 15_552_000])
+        #expect(AutoArchiveThreshold.allCases.map(\.label) == ["12 hours", "24 hours", "7 days", "30 days", "90 days", "180 days"])
+        #expect(AutoArchiveThreshold.allCases.map(\.id) == AutoArchiveThreshold.allCases.map(\.rawValue))
+    }
+
+    @Test(arguments: [
+        (SearchEngine.google, "Google", "https://www.google.com/search?q=a%20b%26c", "https://www.google.com/complete/search?client=chrome&ie=utf-8&oe=utf-8&q=a%20b%26c"),
+        (.duckduckgo, "DuckDuckGo", "https://duckduckgo.com/?q=a%20b%26c", "https://duckduckgo.com/ac/?type=list&q=a%20b%26c"),
+        (.bing, "Bing", "https://www.bing.com/search?q=a%20b%26c", "https://api.bing.com/osjson.aspx?query=a%20b%26c"),
+        (.kagi, "Kagi", "https://kagi.com/search?q=a%20b%26c", "https://kagi.com/api/autosuggest?q=a%20b%26c"),
+    ])
+    func searchEngines(engine: SearchEngine, label: String, search: String, suggest: String) {
+        #expect(engine.label == label && engine.id == engine.rawValue)
+        #expect(engine.searchURL("a b&c") == search, "& is escaped so it stays in the query")
+        #expect(engine.suggestURL("a b&c")?.absoluteString == suggest)
+    }
+
+    @Test func developerModeIsPerSite() {
+        var settings = AppSettings()
+        #expect(AppSettings.siteKey(for: "https://www.Example.com/a") == "example.com")
+        #expect(AppSettings.siteKey(for: "notes") == nil)
+        settings.toggleDeveloperMode(url: "http://example.dev:3000/")
+        #expect(settings.isDeveloperMode(url: "http://example.dev:8080/other"))
+        #expect(!settings.isDeveloperMode(url: "https://example.com"))
+        #expect(!settings.isDeveloperMode(url: "notes"))
+        settings.toggleDeveloperMode(url: "http://example.dev/")
+        #expect(settings.developerHosts.isEmpty)
+        settings.toggleDeveloperMode(url: "notes")
+        #expect(settings.developerHosts.isEmpty, "no host, nothing to toggle")
+    }
+
+    /// #228 (Balajitechlabs): Arc turns Developer Mode on by itself for local servers, on any
+    /// port: localhost, 127.0.0.1 and *.localhost, not [::1]. ⌃D turns it off for that host, and
+    /// Arc remembers that in StorableDeveloperModeState.json's `disabledDefaultHosts`.
+    @Test(.bug("https://github.com/VictorKildahl/cra/issues/228"))
+    func localServersStartInDeveloperMode() throws {
+        var settings = AppSettings()
+        #expect(settings.isDeveloperMode(url: "http://localhost:3000/"))
+        #expect(settings.isDeveloperMode(url: "http://127.0.0.1:8080/api"))
+        #expect(settings.isDeveloperMode(url: "http://app.localhost:5173/"))
+        #expect(!settings.isDeveloperMode(url: "http://[::1]:3000/"))
+        #expect(!settings.isDeveloperMode(url: "http://localhost.example.com/"))
+        #expect(!settings.isDeveloperMode(url: "https://example.com"))
+        settings.toggleDeveloperMode(url: "http://localhost:5173/")
+        #expect(!settings.isDeveloperMode(url: "http://localhost:3000/"), "off for the host, every port")
+        #expect(settings.isDeveloperMode(url: "http://127.0.0.1:8080/"), "127.0.0.1 keeps its own")
+        let saved = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        #expect(!saved.isDeveloperMode(url: "http://localhost:3000/"), "turned off stays off")
+        settings.toggleDeveloperMode(url: "http://localhost/")
+        #expect(settings.isDeveloperMode(url: "http://localhost:3000/"))
+        #expect(settings.developerHosts.isEmpty && settings.disabledDefaultDeveloperHosts.isEmpty)
+        // Turned on by hand before it was a default: one ⌃D still turns it off.
+        settings.developerHosts = ["localhost"]
+        settings.toggleDeveloperMode(url: "http://localhost/")
+        #expect(!settings.isDeveloperMode(url: "http://localhost/"))
+    }
+
+    /// #326 (CallMeAl3x): the Site Control Center's Automatic Picture-In-Picture switch is per site
+    /// in Arc. Turning it off on music.youtube.com left youtube.com, every other site and Settings ▸
+    /// Tabs' "Enable Picture in Picture when you leave a video tab" (the default) as they were.
+    @Test(.bug("https://github.com/VictorKildahl/cra/issues/326"))
+    func automaticPictureInPictureIsPerSite() throws {
+        var settings = AppSettings()
+        #expect(settings.autoPictureInPicture)
+        #expect(settings.allowsAutoPictureInPicture(url: "https://music.youtube.com/watch?v=1"))
+        settings.toggleAutoPictureInPicture(url: "https://music.youtube.com/watch?v=1")
+        #expect(!settings.allowsAutoPictureInPicture(url: "https://music.youtube.com/playlist"), "off for that site")
+        #expect(settings.allowsAutoPictureInPicture(url: "https://www.youtube.com/watch?v=2"), "another site keeps it")
+        #expect(settings.autoPictureInPicture, "the setting for every site stays on")
+        let saved = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        #expect(!saved.allowsAutoPictureInPicture(url: "https://music.youtube.com/"), "turned off stays off")
+
+        // Off everywhere, a site can still be turned on, and the site turned off stays off.
+        settings.autoPictureInPicture = false
+        #expect(!settings.allowsAutoPictureInPicture(url: "https://www.youtube.com/"))
+        settings.toggleAutoPictureInPicture(url: "https://www.youtube.com/")
+        #expect(settings.allowsAutoPictureInPicture(url: "https://youtube.com/watch"))
+        #expect(!settings.allowsAutoPictureInPicture(url: "https://example.com/"))
+        #expect(!settings.allowsAutoPictureInPicture(url: "https://music.youtube.com/"))
+        #expect(!settings.autoPictureInPicture)
+
+        // A site switched back to the setting follows it again; music.youtube.com's own choice stays.
+        settings.toggleAutoPictureInPicture(url: "https://www.youtube.com/")
+        #expect(settings.autoPictureInPictureSites == ["music.youtube.com": false])
+        settings.autoPictureInPicture = true
+        #expect(!settings.allowsAutoPictureInPicture(url: "https://music.youtube.com/"), "its own choice outlasts the setting")
+        settings.toggleAutoPictureInPicture(url: "https://music.youtube.com/")
+        #expect(settings.autoPictureInPictureSites.isEmpty)
+        settings.toggleAutoPictureInPicture(url: "notes")
+        #expect(settings.autoPictureInPictureSites.isEmpty && settings.autoPictureInPicture, "no host, nothing to toggle")
+    }
+
+    /// #185: Developer Mode from the Site Control Center showed nothing with the toolbar hidden
+    /// (Cra's default). Arc shows its developer bar above that site's pages anyway.
+    @Test(.bug("https://github.com/VictorKildahl/cra/issues/185"))
+    func developerBarShowsWithTheToolbarHidden() {
+        var settings = AppSettings()
+        #expect(!settings.showToolbar)
+        #expect(!settings.showsBar(above: "https://example.com/a"))
+        #expect(!settings.showsBar(above: nil), "no tab, no bar")
+        settings.toggleDeveloperMode(url: "https://example.com/")
+        #expect(settings.showsBar(above: "https://example.com/a"))
+        #expect(!settings.showsBar(above: "https://other.org/"), "only the site in Developer Mode")
+        #expect(!settings.showsBar(above: ""), "an empty tab has no site")
+        settings.showToolbar = true
+        #expect(settings.showsBar(above: "https://other.org/") && settings.showsBar(above: nil))
+    }
+
+    /// The toolbar shows the host only, Arc's default, unless Show Full URL is on (#88).
+    @Test(.bug("https://github.com/VictorKildahl/cra/issues/88"))
+    func toolbarShowsTheHostOnlyUnlessAsked() throws {
+        #expect(!AppSettings().toolbarShowsFullURL, "Arc's default: the host only")
+        let decode = { (json: String) in try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8)) }
+        #expect(try !decode("{}").toolbarShowsFullURL, "settings from before the option keep Arc's default")
+        #expect(try decode(#"{"toolbarShowsFullURL": true}"#).toolbarShowsFullURL)
+        var settings = AppSettings()
+        settings.toolbarShowsFullURL = true
+        #expect(try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings)).toolbarShowsFullURL)
+    }
+
+    @Test func littleWindowSwitchIsTheDefaultDestination() {
+        var settings = AppSettings()
+        #expect(settings.openExternalLinksInLittleWindow)
+        settings.openExternalLinksInLittleWindow = false
+        #expect(settings.defaultLinkDestination == .mostRecentSpace)
+        settings.openExternalLinksInLittleWindow = true
+        #expect(settings.defaultLinkDestination == .littleWindowInUse)
+    }
+
+    @Test func incognitoWindowsAreNeverSaved() {
+        let normal = WindowSession(focusedSpaceID: Self.space)
+        let prefs = WindowPrefs(sidebarWidth: 300, windows: [normal, WindowSession(isIncognito: true)])
+        #expect(prefs.withoutIncognito.windows == [normal] && prefs.withoutIncognito.sidebarWidth == 300)
+    }
+
+    @Test func archivedItemIsKnownByItsItem() {
+        let item = SidebarItem.tab("https://example.com", parent: nil)
+        let archived = ArchivedItem(archivedAt: Date(), reason: .manual, sourceSpaceID: nil, wasPinned: false, item: item)
+        #expect(archived.id == item.id && archived.fromLittleWindow == nil && archived.sourceFolderID == nil && archived.sourceIndex == nil)
+    }
+
+    @Test func memberwiseValues() {
+        let date = Date(timeIntervalSince1970: 0)
+        let entry = HistoryEntry(url: "https://example.com", title: "E", lastVisit: date, visitCount: 2)
+        #expect(entry.visitCount == 2 && entry.lastVisit == date)
+        let ranking = RankingData(commandUsage: ["newTab": 1])
+        #expect(ranking.commandUsage["newTab"] == 1 && ranking.recentlySwitchedToTabs.isEmpty && ranking.queriesToSelected.isEmpty)
+        let doc = SidebarDocument(spaceOrder: [], spaces: [], items: [])
+        #expect(doc.version == 1)
+        let theme = SpaceTheme.presets[0]
+        let space = Space(id: Self.space, title: "S", emoji: "", theme: theme, favoritesContainerID: UUID(), pinnedContainerID: UUID(),
+                          todayContainerID: UUID(), createdAt: date, symbol: "star")
+        #expect(space.symbol == "star" && space.profileID == nil)
+    }
+}

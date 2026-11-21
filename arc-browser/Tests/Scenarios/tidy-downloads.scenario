@@ -1,0 +1,32 @@
+home
+env CRA_TIDY_FAKE_MODEL=1
+seed settings.json {"hasSeenImportPrompt": true, "toolbarDefaultMigrated": true, "tidyDownloads": true}
+seed windows.json {"sidebarWidth": 266}
+# A long original name is truncated in a narrow sidebar. Its animated strike must end
+# inside the card's right padding; the short name below should only be struck through its text.
+cra://open?url=file://${FIXTURES}/Pages/downloads.html
+expect-log loaded file:
+cra://debug?cdp=Input.dispatchMouseEvent&params={"type":"mousePressed","x":36,"y":24,"button":"left","clickCount":1}
+cra://debug?cdp=Input.dispatchMouseEvent&params={"type":"mouseReleased","x":36,"y":24,"button":"left","clickCount":1}
+expect-log Tidy Downloads: renamed a download
+wait 1
+snapshot DownloadRenameCard download-rename-long
+cra://debug?cdp=Input.dispatchMouseEvent&params={"type":"mousePressed","x":36,"y":56,"button":"left","clickCount":1}
+cra://debug?cdp=Input.dispatchMouseEvent&params={"type":"mouseReleased","x":36,"y":56,"button":"left","clickCount":1}
+expect-log Tidy Downloads: renamed a download \(11
+# The completed rename belongs to its window, so closing its source tab must retain the card.
+# Reopen and check a unique DOM marker; file-load logs intentionally omit paths/queries.
+cra://action/closeTab
+cra://open?url=file://${FIXTURES}/Pages/downloads.html?qa=dock
+wait 1
+cra://debug?cdp=Runtime.evaluate&params=%7B%22expression%22%3A%22location.search%3D%3D%3D%27%3Fqa%3Ddock%27%26%26document.querySelectorAll%28%27a%27%29.length%3D%3D%3D3%3F%27tidy-downloads-dock-ready%27%3A%27not-ready%27%22%7D
+expect-log Cra cdp Runtime.evaluate .*"value":"tidy-downloads-dock-ready"
+snapshot DownloadRenameCard download-rename-short
+# After the rename card leaves, the download preview still sits over the Library button.
+# The Library button must not clip it: the bin reaches past the glyph's top and right edges.
+cra://debug?cdp=Input.dispatchMouseEvent&params={"type":"mousePressed","x":36,"y":88,"button":"left","clickCount":1}
+cra://debug?cdp=Input.dispatchMouseEvent&params={"type":"mouseReleased","x":36,"y":88,"button":"left","clickCount":1}
+wait 9
+# A background copy may or may not have been made active: draw the bin as in front (not dimmed).
+cra://debug?appActive=1
+snapshot SpaceDockView download-preview-dock

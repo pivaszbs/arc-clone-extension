@@ -1,0 +1,208 @@
+name: Release
+
+# Cut a release by pushing a tag: git tag v0.1.0 && git push origin v0.1.0
+# Signing and notarization run when the secrets below exist; otherwise the
+# job publishes an ad-hoc build with install steps from release-notes-unsigned.md.
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#   MACOS_CERTIFICATE_P12        base64 of the Developer ID Application .p12
+#   MACOS_CERTIFICATE_PASSWORD   password of that .p12
+#   MACOS_SIGN_IDENTITY          e.g. "Developer ID Application: Victor Kildahl (TEAMID)"
+#   APPLE_ID                     Apple ID used for notarization
+#   APPLE_TEAM_ID                10-character team id
+#   APPLE_APP_PASSWORD           app-specific password for that Apple ID
+#   APPLE_API_KEY_P8             optional, preferred: an App Store Connect API key (.p8 text) with the
+#   APPLE_API_KEY_ID             Developer role, its key id and the issuer id. notarize.sh uses it in
+#   APPLE_API_ISSUER             place of the Apple ID, which breaks with a revoked app password.
+#   SPARKLE_PRIVATE_KEY          EdDSA key that signs updates (generate_keys --account cra -x),
+#                                required: installed copies only accept updates it signed
+#   MACOS_PROVISIONING_PROFILE   optional, base64 of the Developer ID provisioning profile
+#                                for dk.kildahl.cra: turns on passkeys (docs/release.md)
+#   CRA_GOOGLE_API_KEY           optional, Google API key limited to the Safe Browsing API:
+#                                turns on Safe Browsing (docs/release.md)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build (without the v)
+        required: true
+        default: 0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build, sign, notarize (${{ matrix.arch }})
+    # The SDK a release links against decides AppKit's behaviour, so build on the macOS
+    # (and SDK) local builds use: macos-15's 15.5 SDK rounded the page window's corners.
+    # Intel is cross-compiled on the same Apple silicon runner, with the same SDK.
+    runs-on: macos-26
+    strategy:
+      # One CPU stopping (Apple's notary queue running past the wait) doesn't cancel the other's
+      # notarization: each job's rerun resumes on its own.
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    env:
+      CRA_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+      CRA_ARCHS: ${{ matrix.arch }}
+      # The secrets context is not allowed in step `if`s, so resolve it once here.
+      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+    outputs:
+      signed: ${{ steps.cert.outputs.signed }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Normalise version
+        run: echo "CRA_VERSION=${CRA_VERSION#v}" >> "$GITHUB_ENV"
+
+      # build.sh keeps the runner's own CPU in vendor/engine and the other one in vendor/engine-<arch>.
+      - name: Cache the engine
+        uses: actions/cache@v6
+        with:
+          path: ${{ matrix.arch == 'arm64' && 'vendor/engine' || format('vendor/engine-{0}', matrix.arch) }}
+          key: engine-${{ matrix.arch }}-${{ hashFiles('scripts/fetch-engine.sh') }}
+
+      - name: Import signing certificate
+        id: cert
+        if: ${{ env.HAS_CERT == 'true' }}
+        env:
+          P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.MACOS_PROVISIONING_PROFILE }}
+        run: |
+          if [ -n "$PROFILE_BASE64" ]; then
+            echo "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/Cra.provisionprofile"
+            echo "CRA_PROVISIONING_PROFILE=$RUNNER_TEMP/Cra.provisionprofile" >> "$GITHUB_ENV"
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      # Notarization by App Store Connect API key (a Developer-role team key) when its secrets are set:
+      # it doesn't break when an app-specific password is revoked or the Apple ID is locked, which
+      # stopped 0.1.47's rerun with HTTP 401. Without them notarize.sh uses the Apple ID below.
+      - name: Notary API key
+        env:
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          if [ -n "$API_KEY_P8" ] && [ -n "$API_KEY_ID" ] && [ -n "$API_ISSUER" ]; then
+            printf '%s\n' "$API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+            chmod 600 "$RUNNER_TEMP/AuthKey.p8"
+            { echo "NOTARY_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8"; echo "NOTARY_API_KEY_ID=$API_KEY_ID"; echo "NOTARY_API_ISSUER=$API_ISSUER"; } >> "$GITHUB_ENV"
+            echo "Notarizing with API key $API_KEY_ID"
+          else
+            echo "No API key secrets: notarizing with the Apple ID"
+          fi
+
+      # A rerun of a job that stopped while Apple was still checking (its wait ran out, or the job was
+      # cancelled) gets the signed app, DMG and submission id the failed attempt kept, so release.sh
+      # waits for that submission instead of building and submitting again.
+      - name: Pick up a pending notarization
+        id: pending
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: pending-${{ env.CRA_VERSION }}-${{ matrix.arch }}
+          path: build/pending
+
+      - name: Build, sign, notarize, package
+        env:
+          CRA_RESUME: ${{ steps.pending.outcome == 'success' && 'build/pending' || '' }}
+          CRA_SIGN_IDENTITY: ${{ steps.cert.outputs.signed == 'true' && secrets.MACOS_SIGN_IDENTITY || '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          CRA_GOOGLE_API_KEY: ${{ secrets.CRA_GOOGLE_API_KEY }}
+          # The repository variable CRA_ALLOW_OLD_ENGINE=1 ships the pinned engine past release.sh's check
+          # (docs/release.md). Delete the variable after the release.
+          CRA_ALLOW_OLD_ENGINE: ${{ vars.CRA_ALLOW_OLD_ENGINE }}
+        run: scripts/release.sh
+
+      - name: Keep a pending notarization
+        if: ${{ failure() || cancelled() }}
+        run: scripts/keep-pending.sh build/keep
+
+      - name: Upload the pending notarization
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: pending-${{ env.CRA_VERSION }}-${{ matrix.arch }}
+          path: build/keep
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Cra-${{ env.CRA_VERSION }}-${{ matrix.arch }}
+          path: build/dist/*
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      CRA_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Normalise version
+        run: echo "CRA_VERSION=${CRA_VERSION#v}" >> "$GITHUB_ENV"
+
+      # Both jobs' files in one folder; each wrote a SHA256SUMS.txt for its own CPU.
+      - name: Collect artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: Cra-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums for both CPUs
+        run: |
+          cd dist
+          for f in Cra.dmg Cra.zip appcast.xml appcast-stable.xml Cra-Intel.dmg Cra-Intel.zip appcast-intel.xml appcast-stable-intel.xml; do
+            [ -f "$f" ] || { echo "Missing $f" >&2; exit 1; }
+          done
+          sha256sum Cra*.zip Cra*.dmg > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Cra-${{ env.CRA_VERSION }}
+          path: dist/*
+
+      - name: Publish GitHub release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED: ${{ needs.build.outputs.signed == 'true' }}
+        run: |
+          NOTES="$RUNNER_TEMP/notes.md"
+          echo "Cra ${CRA_VERSION} for macOS 14 and later, on Apple silicon and Intel." > "$NOTES"
+          echo >> "$NOTES"
+          # Unsigned builds stay regular releases: releases/latest (the website and
+          # scripts/install.sh) skips pre-releases.
+          if [ "$SIGNED" = "true" ]; then
+            echo "Download \`Cra.dmg\` (Apple silicon) or \`Cra-Intel.dmg\` (Intel) below, open it and drag Cra to Applications." >> "$NOTES"
+          else
+            cat .github/release-notes-unsigned.md >> "$NOTES"
+          fi
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "Cra ${CRA_VERSION}" --notes-file "$NOTES" --verify-tag

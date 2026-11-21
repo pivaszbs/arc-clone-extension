@@ -1,0 +1,2378 @@
+import AppKit
+import CraCEF
+
+/// One live Chromium browser for a tab. Tabs that have not been opened since
+/// launch have no runtime; archiving a tab destroys its runtime.
+@MainActor
+final class TabRuntime {
+    let tabID: UUID
+    let browser: CraBrowser
+    var progress: Double = 0
+    /// The toolbar's colour as read off the page (ToolbarSampler), "" until read.
+    var themeColor: String = ""
+    /// The page finished a load that hasn't been read for the toolbar yet: it loaded behind,
+    /// where it paints nothing, so it is read when it comes on screen (#629).
+    var toolbarSamplePending = false
+    /// Chrome's bars over the page (the Chromium engine's; CEF draws its own): Cra's card draws them.
+    var infoBars: [PageInfoBar] = []
+    /// What the page paints behind its content ("#RRGGBB", "" until reported).
+    var backgroundColor: String = ""
+    /// Cra popped this tab's video out because the user left the tab (Arc's
+    /// auto Picture in Picture); coming back brings the video home.
+    var autoPictureInPicture = false
+    var pendingAutoPictureInPicture = false
+    /// When Cra last ran the page's own `enterpictureinpicture` handler on leaving the tab (a
+    /// Google Meet call opens its Document Picture in Picture window); coming back closes it.
+    var sessionPictureInPictureAt: Date?
+    /// The tab switcher's thumbnail, taken while the page was last on screen.
+    var snapshot: NSImage?
+    var snapshotWork: DispatchWorkItem?
+    /// The page's back and forward list saved after it settles (PageHistory, #273).
+    var historyWork: ScheduledWork?
+    /// The page probe for this time on screen, until it has run (BrowserManager.scheduleProbe).
+    var probeWork: DispatchWorkItem?
+    /// Cra votes to freeze the page (BrowserManager.freezeIdleTabs); Chromium decides.
+    var freezeVoted = false
+    /// When the page last went off screen (nil while shown); tab sleeping counts from here.
+    var hiddenAt: Date?
+    /// The `hiddenAt` its page window last drew for, so Chromium's evicted frame let go (HiddenFrameRelease, #195).
+    var hiddenFrameReleasedFor: Date?
+    /// When the page last started or stopped playing sound; tab sleeping waits as long after it.
+    var audibleAt: Date?
+    /// Immediate sound state for music notes; the speaker's audible state has a 2 s hold.
+    var soundPlaying = false
+    /// The sidebar player's card from the page's media session (#411), on an engine that reports it.
+    var playerCard = PlayerCardSession()
+    /// The card's removal after its media session ended, until it runs or is called off.
+    var playerCardRemoval: ScheduledWork?
+    /// Tab sleeping discarded the page in place (Cra.discard): Chromium keeps its history and
+    /// scroll position and loads it again when the tab is shown.
+    var discarded = false
+    /// Invalidates a pending sleep probe even when navigation returns to the same URL.
+    var navigationRevision: UInt = 0
+    /// A page that refused to sleep isn't asked again before this (nil: ask on the next pass).
+    var sleepProbeAfter: Date?
+    /// Why the page last refused to sleep ("" when it didn't), so the log says it once.
+    var sleepRefusal: String?
+    /// Why tab sleeping last passed the page over without asking it (nil: it didn't), so the log
+    /// and the recorder say it once (#214).
+    var sleepHold: TabSleepPolicy.Hold?
+    /// Whether this page's DevTools are open, closing or asked for (DevToolsToggle).
+    var devTools = DevToolsToggle()
+    /// Loads of an extension's page Chromium blocked because the extension wasn't up yet
+    /// (ExtensionPageRetry); back to 0 once a page loads.
+    var extensionPageRetries = 0
+    /// Which ask of the page for its next Widevine request is the live one (BrowserManager.watchProtectedVideo).
+    var protectedVideoWatch: UInt = 0
+    /// The page is on its way to WebKit for a protected video (its sign-in is being copied).
+    var movingToWebKit = false
+    /// The next of those loads (LiveScheduler runs work only while its handle is kept).
+    var extensionPageRetry: ScheduledWork?
+    /// Chromium's translate state for the page (#310), for Arc's translate button and popover.
+    var translation: PageTranslation?
+    /// Pop-ups Chromium's blocker held back on the page (#357), for the blocked pop-ups button.
+    var blockedPopups = BlockedPopups()
+    /// Chrome-style hosting: the page's own window (nil until created, or for Alloy).
+    var hostWindow: NSWindow? { browser.hostWindow }
+    /// The window the page shows in: its Chrome window over the card (CEF's Chrome-style hosting) or the Cra window
+    /// whose card holds its view (the Chromium engine, which has no window per page).
+    var pageWindow: NSWindow? { hostWindow?.parent ?? hostWindow ?? browser.containerView.window }
+    /// The page's views in its card: what EmbeddedPages moved out of its Chrome window (the page's input view last),
+    /// else the page's own view (the Chromium engine puts it in the card itself).
+    var pageViews: [NSView] {
+        if let host = hostWindow { return EmbeddedPages.pageViews(of: host) ?? [] }
+        return [browser.containerView]
+    }
+    /// Where the page is on screen, or nil while it isn't shown: its Chrome window's frame, else its view's.
+    var pageScreenFrame: NSRect? {
+        if let host = hostWindow { return host.isVisible ? host.frame : nil }
+        let view = browser.containerView
+        guard let window = view.window, window.isVisible, !view.isHiddenOrHasHiddenAncestor else { return nil }
+        return window.convertToScreen(view.convert(view.bounds, to: nil))
+    }
+    init(tabID: UUID, browser: CraBrowser) {
+        self.tabID = tabID
+        self.browser = browser
+    }
+}
+
+@MainActor
+protocol BrowserManagerDelegate: AnyObject {
+    func browserManagerDidUpdate(_ tabID: UUID)
+    /// The status bubble's text (a hovered link's URL, "" when the pointer leaves it) and the tab whose page shows it.
+    func browserManager(statusMessage: String, tabID: UUID?)
+    func browserManager(findState state: AskOnPage.FindState)
+    func browserManager(findAction action: CraFindAction)
+    func browserManager(download: CraDownloadInfo)
+    func browserManager(fullscreen: Bool, tabID: UUID)
+    /// Arc's toast for what a page took (its full screen, the pointer): ExclusiveAccessNotice.
+    func browserManager(exclusiveAccessToast toast: ExclusiveAccessNotice.Toast, tabID: UUID)
+    func browserManagerDevToolsHost(for tabID: UUID) -> NSView?
+    /// A DevTools pane appeared or closed; the shell decides whether to show the dock.
+    func browserManagerDevToolsChanged()
+    /// A call's tab sharing changed on one of the pages (CraBrowser.isBeingShared, canShareInstead).
+    func browserManagerTabSharingChanged()
+    /// Chrome's docked frontend moved its page placeholder (streamed while its splitter is dragged).
+    func browserManagerDevToolsPageBoundsChanged()
+    /// Chrome-style hosting: page windows appeared/changed; the shell re-attaches and orders them.
+    func browserManagerPageWindowsChanged(focus: Bool)
+    func browserManagerHandleKey(_ event: NSEvent) -> Bool
+    func browserManagerHandleUnhandledKey(_ event: NSEvent) -> Bool
+    func browserManagerFocusedBrowser(_ tabID: UUID)
+    /// The page closed itself (window.close()).
+    func browserManagerPageClosedTab(_ tabID: UUID)
+    /// An extension asked for this tab to be in front (chrome.tabs.update with active: true),
+    /// or with byPage the page did (window.focus(), clients.focus() from a notification click).
+    func browserManagerActivationRequested(_ tabID: UUID, byPage: Bool)
+    /// Arc's toast for the page's translation (#310): done, failed, or back to the original.
+    func browserManagerTranslationToast(_ tabID: UUID, text: String)
+    /// Arc's Peek: a link the user clicked (or Shift-clicked) in `tabID`, whose page is at
+    /// `pageURL`. Return true when it opens in a Peek instead.
+    func browserManagerOpensPeek(url: String, fromTab tabID: UUID, pageURL: String, shiftClick: Bool, newTab: Bool) -> Bool
+    /// Arc's ⌥⌘-click: a link clicked in `tabID` with both keys down, the switch on. Return true when it opens
+    /// in a Little Window (after Chromium's call returns).
+    func browserManagerOpensLittleWindow(url: String, fromTab tabID: UUID) -> Bool
+    /// The page's context menu: Open Link in New Window, Little Window or Incognito Window.
+    func browserManagerOpenLink(_ url: String, in kind: CraLinkWindow, space: UUID?, fromIncognito: Bool)
+    /// The page's context menu: Open Link in Split View, a pane beside `tabID`'s (#257).
+    func browserManagerOpenLinkInSplit(_ url: String, fromTab tabID: UUID)
+    /// The page's context menu on an image: Capture Image… (page points from the top left).
+    func browserManagerCaptureImage(at point: NSPoint, tabID: UUID)
+    /// A page made tab `tabID` behind it (a ⌘-click, a middle click, Open Link in New Tab, a Peek's
+    /// ⌘-click): Arc says so in its toast while the sidebar is hidden (BackgroundTabToast, #543).
+    func browserManagerOpenedInBackground(_ tabID: UUID)
+    /// A page of a mixed site (YouTube) asked for Widevine and waits for an answer, or it moved on
+    /// from the page that did: the window shows the prompt while that page is in front, and takes
+    /// it down otherwise (PageEngines.videoPages).
+    func browserManagerProtectedVideoPromptChanged(_ tabID: UUID)
+}
+
+extension BrowserManagerDelegate {
+    func browserManagerProtectedVideoPromptChanged(_ tabID: UUID) {}
+}
+
+/// A page's permission request on its way to Cra's card (#371); `completion` answers it in Chromium.
+private struct PermissionRequest {
+    let tabID: UUID
+    let browser: CraBrowser
+    let origin: String
+    /// What cra.log calls the site: its host, or "(incognito)".
+    let logName: String
+    let kinds: UInt
+    let completion: (Bool) -> Void
+}
+
+/// Creates, shows, hides and tears down CEF browsers inside a container view.
+@MainActor
+final class BrowserManager: NSObject, @preconcurrency CraBrowserDelegate, WebKitPageDelegate {
+    let store: SidebarStore
+    let favicons: FaviconCache
+    let container: NSView
+    weak var delegate: BrowserManagerDelegate?
+    private(set) var runtimes: [UUID: TabRuntime] = [:]
+    /// The focused pane's tab (the one toolbar actions and DevTools apply to).
+    private(set) var visibleTabID: UUID?
+    /// Stops an Ask snapshot from surviving a focus switch away and back to the same document.
+    private(set) var askOnPageFocusRevision: UInt = 0
+    private(set) var findState = AskOnPage.FindState()
+    private var findOwner: AskOnPageContext?
+    /// One current document's type probe, never page text or a URL-wide cache.
+    var askOnPageDocument: AskOnPageDocumentSnapshot?
+    var askOnPageQuoteOperation: AskOnPageQuoteOperation?
+    var askOnPageDocumentRead: (id: UUID, context: AskOnPageContext)?
+    /// Every tab on screen, in pane order (one entry outside split view).
+    private(set) var visibleTabIDs: [UUID] = []
+    /// Tabs whose page tab sleeping closed and that haven't been shown since.
+    private(set) var sleptTabs: Set<UUID> = []
+    /// Split view: the view a tab's Alloy-hosted Chromium view should live in.
+    var paneHost: ((UUID) -> NSView?)?
+    /// The browser window this manager shows pages in (tabs it opens are selected there).
+    var windowID: UUID?
+    /// A tab's live page held by another window's manager, handed over (see `release`).
+    var takeRuntimeFromOtherWindow: ((UUID) -> TabRuntime?)?
+    /// A live page arriving from another browser window brings its running downloads' source.
+    var pageAdopted: ((UUID, UUID) -> Void)?
+    /// The window's sidebar player (Arc's "now playing"), fed with this manager's pages.
+    var nowPlaying: NowPlaying?
+    /// A tab's page closed (the tab closed or went to sleep), with what Chromium kept for it.
+    var pageClosed: (UUID) -> Void = { _ in }
+    private var byBrowser: [ObjectIdentifier: UUID] = [:]
+    /// Pages' permission requests that haven't asked yet: their tab is behind, or another
+    /// request's card is up (PermissionAsk, #286).
+    private var waitingPermissions: [PermissionRequest] = []
+    /// The request whose card is up.
+    private var permissionSheet: (request: PermissionRequest, dialog: PermissionPopover)?
+    /// CEF's client holds its owner weakly; keep retired browsers alive until teardown finishes.
+    private var closingBrowsers: [ObjectIdentifier: CraBrowser] = [:]
+
+    /// Tab sleeping's clock: a test advances it instead of waiting out the idle threshold.
+    let clock: Scheduler
+
+    init(store: SidebarStore, favicons: FaviconCache, container: NSView, clock: Scheduler? = nil) {
+        self.store = store
+        self.favicons = favicons
+        self.container = container
+        self.clock = clock ?? LiveScheduler.shared
+        super.init()
+        PageMiddleClick.install()
+        documentObserver = NotificationCenter.default.addObserver(forName: SidebarStore.documentReplaced, object: store, queue: nil) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reassertLivePages() }
+        }
+    }
+
+    deinit { if let documentObserver { NotificationCenter.default.removeObserver(documentObserver) } }
+
+    private var documentObserver: NSObjectProtocol?
+
+    /// A synced sidebar (SettingsSyncService) replaced the document, with the other Mac's address
+    /// and title for each tab. A page here did not move: its tab shows what the page shows, as the
+    /// bar did before (seen with the other Mac's address over this page, 13 Nov 2026). A tab asleep
+    /// has no page and takes the synced address. In the replacement itself, so the sync service's
+    /// hashes have it and nothing goes back to the other Mac for it.
+    func reassertLivePages() {
+        for (id, rt) in runtimes where !rt.discarded {
+            let url = rt.browser.currentURL
+            guard !url.isEmpty, url != "about:blank", !url.hasPrefix("data:text/html;base64,") else { continue }
+            let title = rt.browser.currentTitle
+            store.updateTab(id, url: url, title: title.isEmpty ? nil : title)
+        }
+    }
+
+    func runtime(for tabID: UUID) -> TabRuntime? { runtimes[tabID] }
+
+    /// A shown page that is not in its pane: show placed it before the window had made the
+    /// pane's card. A link opened in a new tab is shown from inside the page's pop-up request,
+    /// before the window lays out the tab, and its page waited outside the card for good: the
+    /// tab stayed blank (GitHub #469). The window shows its panes again until each page is in.
+    func waitsForItsPane(_ tabID: UUID) -> Bool {
+        guard let rt = runtimes[tabID], rt.browser.hostWindow == nil, let host = paneHost?(tabID) else { return false }
+        return rt.browser.containerView.superview !== host
+    }
+    /// The tab whose page the download being reported came from (set only during that report).
+    private(set) var downloadSourceTab: UUID?
+    var visibleRuntime: TabRuntime? { visibleTabID.flatMap { runtimes[$0] } }
+
+    @discardableResult
+    func ensureRuntime(for tabID: UUID) -> TabRuntime? {
+        if let r = runtimes[tabID] { return r }
+        // An empty split pane has no page yet (Arc shows the tinted card and the command bar).
+        guard let item = store.item(tabID), let tab = item.tab, !item.isEmptyTab else { return nil }
+        // The page moves between windows with its history and state, never loads twice.
+        if let rt = takeRuntimeFromOtherWindow?(tabID) {
+            transferDownloadSource(rt.browser, tab: tabID)
+            rt.browser.delegate = self
+            add(rt)
+            if inRightProfile(rt) { log(tabID, "moves its page in from another window"); return rt }
+            release(tabID)?.browser.close()
+        }
+        log(tabID, "opens a page for \(site(tab.url, tabID))")
+        if sleptTabs.remove(tabID) != nil { Perf.begin(.tabWake, tabID.uuidString) }
+        // Chromium, or WebKit for a DRM service (ProtectedMediaSites), with the back and forward
+        // list the tab had (PageHistory, #273): after a relaunch or a close, Back goes where it went.
+        let incognito = store.isIncognito(item: tabID)
+        let history = incognito ? nil : PageHistoryStore.shared.load(tabID)
+        let profilePath = store.profilePath(item: tabID)
+        // The profile's spare page if there is one (SparePages): made ahead, so this click doesn't
+        // wait for CEF to make the page's window.
+        let fill = PageEngines.spareFill(url: tab.url, incognito: incognito, history: history, tab: tabID)
+        let browser = Perf.time(.pageCreate) { () -> CraBrowser in
+            if fill.canTake, let spare = SparePages.shared.take(profilePath: profilePath) {
+                spare.delegate = self
+                spare.takeSpare(withURL: tab.url, history: fill.history)
+                log(tabID, "takes a spare page")
+                return spare
+            }
+            return PageEngines.makeBrowser(frame: container.bounds, url: tab.url, delegate: self, incognito: incognito,
+                                           profilePath: profilePath, history: history, tab: tabID)
+        }
+        if !incognito { SparePages.shared.refill(profilePath: profilePath, frame: container.bounds, clock: clock) }
+        return register(browser: browser, tabID: tabID)
+    }
+
+    /// Take over a live browser from elsewhere (a Little Window being promoted
+    /// to a tab): it keeps its history, scroll position and page state.
+    @discardableResult
+    func adopt(_ browser: CraBrowser, for tabID: UUID, from origin: String = "a Little Window's") -> TabRuntime {
+        transferDownloadSource(browser, tab: tabID)
+        if let host = browser.hostWindow, let parent = host.parent { parent.removeChildWindow(host) }
+        browser.containerView.removeFromSuperview()
+        browser.delegate = self
+        let rt = register(browser: browser, tabID: tabID)
+        log(tabID, "takes over \(origin) page")
+        store.updateTab(tabID, url: browser.currentURL, title: browser.currentTitle)
+        return rt
+    }
+
+    private func transferDownloadSource(_ browser: CraBrowser, tab: UUID) {
+        guard let previous = browser.delegate as? BrowserManager, previous !== self,
+              let previousWindow = previous.windowID else { return }
+        pageAdopted?(tab, previousWindow)
+    }
+
+    /// Popup host: a browser shell its opener's engine will fill with window.open content, or
+    /// Chromium with an extension's chrome.tabs.create (no opener of this window's).
+    func makePopupHost(for tabID: UUID, opener: CraBrowser?) -> CraBrowser {
+        let browser = PageEngines.makeBrowser(frame: container.bounds, url: nil, delegate: self, incognito: store.isIncognito(item: tabID),
+                                              profilePath: store.profilePath(item: tabID), opener: opener)
+        register(browser: browser, tabID: tabID)
+        return browser
+    }
+
+    @discardableResult
+    private func register(browser: CraBrowser, tabID: UUID) -> TabRuntime {
+        browser.userInfo = tabID.uuidString
+        let rt = TabRuntime(tabID: tabID, browser: browser)
+        rt.hiddenAt = clock.now
+        if let t = store.item(tabID)?.tab {
+            if t.muted { browser.setAudioMuted(true) }
+            // A slept or restored page's toolbar keeps its colour while it loads (Arc).
+            rt.themeColor = t.themeColor ?? ""
+        }
+        add(rt)
+        return rt
+    }
+
+    private func add(_ rt: TabRuntime) {
+        let v = rt.browser.containerView
+        v.frame = container.bounds
+        v.autoresizingMask = [.width, .height]
+        v.isHidden = true
+        container.addSubview(v)
+        runtimes[rt.tabID] = rt
+        byBrowser[ObjectIdentifier(rt.browser)] = rt.tabID
+        // CEF creates the page window inside CraBrowser's init, before the tab is known here,
+        // so didCreateHostWindow could not place it: a background tab's window stayed shown.
+        if rt.browser.hostWindow != nil { delegate?.browserManagerPageWindowsChanged(focus: false) }
+    }
+
+    /// Gives up a tab's live page so another window can show it. Its DevTools close:
+    /// their window belongs to this one.
+    func release(_ tabID: UUID) -> TabRuntime? {
+        invalidateAskOnPageDocument(for: tabID)
+        if findOwner?.tabID == tabID { stopFinding(false) }
+        guard let rt = runtimes.removeValue(forKey: tabID) else { return nil }
+        nowPlaying?.remove(tabID)
+        nowPlaying?.pictureInPicture.remove(tabID)
+        byBrowser[ObjectIdentifier(rt.browser)] = nil
+        // A page in full screen leaves it with its tab (#636), as in Chrome and Arc: ⌘W on a video in full
+        // screen, or the tab dragged to another window. Chromium's own word for a closing page comes once
+        // the tab is no longer this window's, so the window the video took full screen never came back.
+        if fullscreenTabs.remove(tabID) != nil {
+            rt.browser.exitFullscreen()
+            delegate?.browserManager(fullscreen: false, tabID: tabID)
+        }
+        rt.snapshotWork?.cancel()
+        rt.snapshotWork = nil
+        rt.probeWork?.cancel()
+        rt.probeWork = nil
+        rt.historyWork?.cancel()
+        rt.historyWork = nil
+        rt.playerCardRemoval?.cancel()
+        rt.playerCardRemoval = nil
+        if rt.browser.hasDevTools { rt.browser.closeDevTools() }
+        devToolsViews[tabID] = nil
+        devToolsPlaceholders[tabID] = nil
+        devToolsDockedState[tabID] = nil
+        if visibleTabID == tabID { visibleTabID = nil; askOnPageFocusRevision &+= 1 }
+        visibleTabIDs.removeAll { $0 == tabID }
+        handOffPermissions(of: tabID, browser: rt.browser)
+        if let host = rt.hostWindow {
+            // Embedded page views live in the pane card, outside their host window.
+            // Detach them now; their cached identity remains available for a handoff.
+            if EmbeddedPages.isHost(host), let views = EmbeddedPages.pageViews(of: host) {
+                for view in views where view.superview !== host.contentView { view.removeFromSuperview() }
+            }
+            host.parent?.removeChildWindow(host)
+            host.orderOut(nil)
+        }
+        rt.browser.containerView.removeFromSuperview()
+        delegate?.browserManagerDevToolsChanged()
+        return rt
+    }
+
+    func show(_ tabID: UUID?, focus: Bool) {
+        show(tabID.map { [$0] } ?? [], focused: tabID, focus: focus)
+    }
+
+    /// Show several tabs at once (split view); `focused` gets keyboard focus.
+    func show(_ tabIDs: [UUID], focused: UUID?, focus: Bool) {
+        let started = Perf.now()
+        let previousFocus = visibleTabID
+        let newSet = Set(tabIDs)
+        for previous in visibleTabIDs where !newSet.contains(previous) {
+            runtimes[previous]?.hiddenAt = clock.now
+            // Where the page was scrolled to goes with its history.
+            saveHistory(previous)
+            if tabIDs.contains(where: { !visibleTabIDs.contains($0) && isSplitCopy($0, of: previous) }) {
+                hibernate(previous)
+            } else {
+                leaveTab(previous)
+            }
+        }
+        let wasVisible = Set(visibleTabIDs)
+        var shown: [UUID] = []
+        // A tab without a page gets one here, timed as pageCreate: tabSwitch leaves it out (#136).
+        var creating = 0.0
+        for id in tabIDs {
+            let made = runtimes[id] == nil ? Perf.now() : nil
+            guard let rt = ensureRuntime(for: id) else { shown.append(id); continue }
+            if let made { creating += Perf.ms(since: made) }
+            if !wasVisible.contains(id) {
+                wake(id, rt)
+                returnToTab(rt)
+                // A page can change its colours while hidden. One still loading reports them as it
+                // paints; asked now, before its styles arrive, it would answer white.
+                if !rt.browser.isLoading { rt.browser.probeBackgroundColor() }
+            }
+            rt.hiddenAt = nil
+            rt.sleepProbeAfter = nil
+            if rt.freezeVoted { setFreezingVote(rt, false) }
+            let v = rt.browser.containerView
+            // Alloy hosting only: the Chromium view moves into its pane. Chrome-style
+            // pages live in their own windows; re-parenting their view makes Chrome
+            // spawn stock windows.
+            if rt.browser.hostWindow == nil, let host = paneHost?(id), v.superview !== host {
+                v.removeFromSuperview()
+                host.addSubview(v)
+            }
+            v.frame = v.superview?.bounds ?? container.bounds
+            v.isHidden = false
+            shown.append(id)
+        }
+        for (id, other) in runtimes where !newSet.contains(id) {
+            other.browser.containerView.isHidden = true
+            if other.browser.hostWindow == nil, other.browser.containerView.superview !== container {
+                other.browser.containerView.removeFromSuperview()
+                container.addSubview(other.browser.containerView)
+            }
+        }
+        visibleTabIDs = shown
+        if let np = nowPlaying, np.onScreen != Set(shown) { np.onScreen = Set(shown) }
+        visibleTabID = focused.flatMap { newSet.contains($0) ? $0 : nil } ?? shown.first
+        if visibleTabID != previousFocus {
+            askOnPageFocusRevision &+= 1
+            invalidateAskOnPageDocument()
+            stopFinding(false)
+        }
+        if wasVisible != Set(shown) {
+            HitchMonitor.mark("page-shown")
+            if let rt = visibleRuntime {
+                Perf.visibleSite(rt.browser.isIncognito ? nil : SiteNames.siteHost(of: rt.browser.currentURL))
+                Perf.phase("firstPageShown")
+            }
+        }
+        if focus, let f = visibleTabID, let rt = runtimes[f] { rt.browser.setFocused(true) }
+        for id in shown where !wasVisible.contains(id) {
+            if let rt = runtimes[id] {
+                // A loading page gets its thumbnail once it has loaded: a capture now would be of
+                // a half-painted page, in the busiest second of its load (#136).
+                if !rt.browser.isLoading { scheduleSnapshot(id) }
+                if rt.toolbarSamplePending, !rt.browser.isLoading { sampleToolbarColor(id) }
+                log(id, "shown: \(site(rt.browser.currentURL, id, rt.browser))\(rt.browser.isLoading ? ", loading" : "")\(rt.browser.isCreated ? "" : ", page not created yet")")
+                // A loading page is probed once it has loaded (didChangeLoading), or says it never did.
+                scheduleProbe(id, rt, after: rt.browser.isLoading ? 12 : 3)
+            }
+        }
+        syncDevToolsVisibility()
+        delegate?.browserManagerPageWindowsChanged(focus: focus)
+        if wasVisible != Set(shown) { Perf.time(.tabSwitch, ms: Perf.ms(since: started) - creating) }
+        stepAsideIfHidden()
+        askNextPermission()
+    }
+
+    // MARK: Diagnostics
+
+    /// Tab ids are cut to 8 characters, enough to follow one tab through the log.
+    private func log(_ id: UUID, _ message: String) { CraLog.note("tab \(id.uuidString.prefix(8)) \(message)") }
+
+    /// The page's own profile when there is one: an incognito tab can leave the store before a late line.
+    private func site(_ url: String, _ id: UUID, _ browser: CraBrowser? = nil) -> String {
+        browser?.isIncognito ?? store.isIncognito(item: id) ? "(incognito)" : CraLog.host(url)
+    }
+
+    /// A moment after a tab comes on screen and its page has loaded, the log gets what the page
+    /// holds and where Cra put it: for the tab that "shows a white page until reloaded", the line
+    /// that says why. Not sooner: the probe runs in the page, which is busiest while it loads (#136).
+    private func scheduleProbe(_ id: UUID, _ rt: TabRuntime, after delay: TimeInterval) {
+        rt.probeWork?.cancel()
+        let work = DispatchWorkItem { [weak self, weak rt] in
+            guard let self, let rt, self.runtimes[id] === rt else { return }
+            rt.probeWork = nil
+            guard self.visibleTabIDs.contains(id) else { return }
+            PageProbe.run(rt.browser) { [weak self] probe in
+                guard let self, self.runtimes[id] === rt else { return }
+                self.log(id, "page \(self.site(rt.browser.currentURL, id, rt.browser))\(rt.browser.isLoading ? " still loading" : ""): \(probe) \(PageProbe.viewState(rt))")
+            }
+        }
+        rt.probeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    // MARK: Tab switcher thumbnails
+
+    /// Chromium renders nothing for a hidden page, so thumbnails are taken while a tab is
+    /// on screen: a moment after it appears or finishes loading, and when the switcher opens.
+    // MARK: Page history
+
+    /// The tab's back and forward list goes to its file a second after the page settles, so a
+    /// burst of loads (redirects, pushState) writes once.
+    private func scheduleHistorySave(_ id: UUID) {
+        guard let rt = runtimes[id], !rt.browser.isIncognito else { return }
+        rt.historyWork?.cancel()
+        rt.historyWork = clock.after(1) { [weak self] in self?.saveHistory(id) }
+    }
+
+    /// Asks the page for its back and forward list and saves it as the tab's (PageHistory, #273),
+    /// as Chrome's session service and Arc keep it: Chromium's serialized entries, or WKWebView's
+    /// interactionState. Incognito pages and easels keep none; a page with nothing committed
+    /// leaves the last saved list. `now` writes before `completion` (quit).
+    func saveHistory(_ id: UUID, now: Bool = false, completion: (() -> Void)? = nil) {
+        guard let rt = runtimes[id], !rt.browser.isIncognito, PageEngines.savesHistory(rt.browser), rt.browser.isCreated,
+              !rt.browser.isClosed, store.item(id)?.isTab == true else { completion?(); return }
+        rt.historyWork?.cancel()
+        rt.historyWork = nil
+        if let page = rt.browser as? WebKitBrowser {
+            if let state = page.savedInteractionState {
+                PageHistoryStore.shared.save(PageHistory(engine: .webKit, url: page.currentURL, state: state, savedAt: clock.now), for: id, now: now)
+            }
+            completion?()
+            return
+        }
+        rt.browser.sendDevToolsMethod("Cra.getHistory", params: "{}") { [weak self, weak rt] result, _ in
+            MainActor.assumeIsolated {
+                defer { completion?() }
+                guard let self, let rt, self.runtimes[id] === rt, let result,
+                      let reply = try? JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any],
+                      let encoded = reply["history"] as? String, let state = Data(base64Encoded: encoded), !state.isEmpty,
+                      let url = reply["url"] as? String else { return }
+                PageHistoryStore.shared.save(PageHistory(engine: .chromium, url: url, state: state, index: reply["index"] as? Int ?? 0,
+                                                         savedAt: self.clock.now), for: id, now: now)
+            }
+        }
+    }
+
+    /// Every page's list, written before `completion` (quit).
+    func saveAllHistory(completion: @escaping () -> Void) {
+        let group = DispatchGroup()
+        for id in runtimes.keys {
+            group.enter()
+            saveHistory(id, now: true) { group.leave() }
+        }
+        group.notify(queue: .main, execute: completion)
+    }
+
+    func browser(_ browser: CraBrowser, didRestoreHistoryEntries count: Int, error: String?) {
+        guard let id = tabID(of: browser) else { return }
+        if let error { log(id, "opens without its history: \(error)") } else { log(id, "opens with \(count) \(count == 1 ? "page" : "pages") of history") }
+    }
+
+    private func scheduleSnapshot(_ id: UUID, after delay: TimeInterval = 1) {
+        guard let rt = runtimes[id] else { return }
+        rt.snapshotWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.captureSnapshot(id) }
+        rt.snapshotWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// The width-to-height ratio a tab's thumbnail is taken at: the switcher's card, or a split
+    /// pane's place on its split's card (#554). The window sets it.
+    var snapshotAspect: (UUID) -> CGFloat? = { _ in nil }
+
+    /// The visible viewport, cropped to the switcher's thumbnail shape from the top.
+    /// No `clip`: a clipped screenshot makes Chromium emulate the clip's size and scale on
+    /// the live page, which drew the page shrunk into its corner for a few frames, a
+    /// second after every tab switch and page load. Without one it copies the frame
+    /// already on screen, and the crop and downscale happen here instead.
+    func captureSnapshot(_ id: UUID, completion: (() -> Void)? = nil) {
+        guard let rt = runtimes[id], visibleTabIDs.contains(id) else { completion?(); return }
+        let thumb = TabSwitcherMetrics.thumbnail
+        let aspect = snapshotAspect(id) ?? thumb.width / thumb.height
+        rt.browser.sendDevToolsMethod("Page.captureScreenshot", params: #"{"format":"jpeg","quality":80,"optimizeForSpeed":true}"#) { [weak self, weak rt] shot, _ in
+            DispatchQueue.global(qos: .utility).async {
+                let image = shot.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+                    .flatMap { $0["data"] as? String }.flatMap { Data(base64Encoded: $0) }.flatMap { Self.thumbnail(fromViewport: $0, aspect: aspect) }
+                DispatchQueue.main.async {
+                    if let image, let rt, self?.runtimes[id] === rt { rt.snapshot = image }
+                    completion?()
+                }
+            }
+        }
+    }
+
+    /// The top of the viewport at `aspect` (width to height), centred horizontally, at most
+    /// twice the thumbnail's width and height in pixels.
+    nonisolated private static func thumbnail(fromViewport data: Data, aspect: CGFloat) -> NSImage? {
+        guard aspect > 0, let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let full = CGImageSourceCreateImageAtIndex(source, 0, nil), full.width > 0, full.height > 0 else { return nil }
+        let thumb = TabSwitcherMetrics.thumbnail
+        let w = CGFloat(full.width), h = CGFloat(full.height)
+        let cw = min(w, h * aspect), ch = cw / aspect
+        guard let crop = full.cropping(to: CGRect(x: ((w - cw) / 2).rounded(), y: 0, width: cw.rounded(), height: ch.rounded())) else { return nil }
+        let outW = Int(min(cw, thumb.width * 2, thumb.height * 2 * aspect).rounded()), outH = Int((CGFloat(outW) / aspect).rounded())
+        guard outW > 0, outH > 0,
+              let ctx = CGContext(data: nil, width: outW, height: outH, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(crop, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+        return ctx.makeImage().map { NSImage(cgImage: $0, size: NSSize(width: outW, height: outH)) }
+    }
+
+    func browser(_ browser: CraBrowser, didCreateHostWindow window: NSWindow) {
+        delegate?.browserManagerPageWindowsChanged(focus: tabID(of: browser) == visibleTabID)
+    }
+
+    /// The tab whose page `loadBehind` is making, while it makes it.
+    private var makingBehind: UUID?
+
+    /// Makes the page of `tabID`, a tab opened behind the page in front, hidden until its tab is shown, so a
+    /// video on it waits (#552; Arc 1.173.1, and Chromium's own ⌘-click tabs).
+    @discardableResult
+    private func loadBehind(_ tabID: UUID) -> TabRuntime? {
+        makingBehind = tabID
+        defer { makingBehind = nil }
+        return ensureRuntime(for: tabID)
+    }
+
+    /// Only a page `loadBehind` makes starts hidden. Every other page starts shown, as Chromium makes it:
+    /// a tab in front or selected later, an agent's tab that is never shown, a spare (the tab that takes it
+    /// asks again, as it takes it).
+    func browserStartsHidden(_ browser: CraBrowser) -> Bool { makingBehind != nil }
+
+    func unload(_ tabID: UUID) {
+        // CEF closes asynchronously. Retire ownership first so reopening the tab
+        // creates a new browser, and late callbacks cannot mutate its replacement.
+        guard let rt = release(tabID) else { return }
+        log(tabID, "closes its page")
+        Perf.cancel(.pageLoad, tabID.uuidString)
+        Perf.cancel(.tabWake, tabID.uuidString)
+        pageClosed(tabID)
+        rt.browser.containerView.isHidden = true
+        closingBrowsers[ObjectIdentifier(rt.browser)] = rt.browser
+        rt.browser.close()
+        delegate?.browserManagerDidUpdate(tabID)
+        delegate?.browserManagerPageWindowsChanged(focus: false)
+        scheduleMemoryReclaim()
+    }
+
+    /// Slept pages beyond the window's budget close, oldest hidden first, a few a pass (RetainedPageBudget,
+    /// #616): tab sleeping ended their renderers, but their browsers, hidden windows and thumbnails stayed for
+    /// the whole session. A closed one loads again when shown, with its back/forward list, as a slept one does.
+    @discardableResult
+    func closeSleptPages(budget: Int = RetainedPageBudget.perWindow, limit: Int = RetainedPageBudget.perPass) -> Int {
+        let pages = runtimes.values.map { rt in
+            let b = rt.browser
+            return RetainedPageBudget.Page(id: rt.tabID, discarded: rt.discarded, hiddenAt: rt.hiddenAt,
+                                           visible: visibleTabIDs.contains(rt.tabID),
+                                           busy: b.isAudible || b.isInPictureInPicture || b.isCapturingMedia || b.isLoading || b.hasDevTools)
+        }
+        let ids = RetainedPageBudget.unloads(pages, budget: budget, limit: limit)
+        guard !ids.isEmpty else { return 0 }
+        for id in ids { unload(id) }
+        CraLog.note("slept pages: \(ids.count) closed beyond the \(budget) a window keeps, \(runtimes.count) pages left")
+        return ids.count
+    }
+
+    private var memoryReclaimWork: ScheduledWork?
+    /// Chromium's browser process returns what closed pages freed, once closing has settled and
+    /// nobody is typing (MemoryReclaim). Any page can carry the call: it acts on the whole process.
+    private func scheduleMemoryReclaim(after delay: TimeInterval = MemoryReclaim.settle) {
+        memoryReclaimWork?.cancel()
+        memoryReclaimWork = clock.after(delay) { [weak self] in
+            guard let self else { return }
+            let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+            guard MemoryReclaim.runsNow(secondsSinceInput: idle) else {
+                self.scheduleMemoryReclaim(after: MemoryReclaim.retry)
+                return
+            }
+            guard let carrier = self.runtimes.values.first(where: { $0.browser.isCreated && !$0.browser.isClosed })?.browser else { return }
+            carrier.sendDevToolsMethod("Cra.reclaimMemory", params: "{}") { _, error in
+                if let error { CraLog.note("memory reclaim: \(error)") }
+            }
+        }
+    }
+
+    // MARK: Tab sleeping
+
+    /// The pages `policy` picks (by default Arc's: out of sight 4 hours, not one of the 10 tabs
+    /// used last) are discarded like Arc's: Chromium ends the page and keeps its back/forward list
+    /// and scroll position, and loads it again when the tab is shown. Pages that are loading,
+    /// playing sound, recording, in Picture in Picture or DevTools, holding text the user typed,
+    /// asking before they close (their own onbeforeunload), in a call (even with the camera and
+    /// microphone off) or using a device stay awake, and are asked again only after
+    /// `refusalBackoff`; those don't count toward the policy's limit. The log says once why a page
+    /// stays awake. Pages on a site Settings keeps active are never asked by the clock and come
+    /// last under memory pressure (TabSleepPolicy.candidates, #458).
+    func sleepIdleTabs(_ policy: TabSleepPolicy) {
+        let now = clock.now
+        let cutoff = now.addingTimeInterval(-policy.hiddenFor)
+        var asked = 0, waiting = 0
+        var held: [TabSleepPolicy.Hold: Int] = [:]
+        let pass = SleepPass(reason: policy.reason, done: sleepPassLogged)
+        for id in policy.candidates(sleepPages, visible: visibleTabIDs, protectedRecent: protectedRecentTabs, now: now) {
+            guard let rt = runtimes[id] else { continue }
+            if let hold = sleepHold(rt, before: cutoff) {
+                held[hold, default: 0] += 1
+                passOver(rt, hold)
+                continue
+            }
+            rt.sleepHold = nil
+            guard rt.sleepProbeAfter.map({ $0 <= now }) ?? true else {
+                waiting += 1
+                continue
+            }
+            if let limit = policy.limit, asked >= limit { break }
+            asked += 1
+            let b = rt.browser
+            let url = b.currentURL
+            let navigationRevision = rt.navigationRevision
+            // Cra's isolated world sees typed text and media; the page's own onbeforeunload is only
+            // visible from the page's world, so that's asked second.
+            b.evaluate(inIsolatedWorld: PageScript.world, params: Self.sleepProbe) { [weak self, weak rt] result, _ in
+                DispatchQueue.main.async {
+                    guard let self, let rt, self.stillSleepable(id, rt, url, navigationRevision, cutoff) else { return }
+                    let refusal = Self.sleepRefusal(result)
+                    guard refusal.isEmpty else { return self.keepAwake(rt, url, refusal, pass) }
+                    rt.browser.sendDevToolsMethod("Runtime.evaluate", params: Self.beforeUnloadProbe) { [weak self, weak rt] result, _ in
+                        DispatchQueue.main.async {
+                            guard let self, let rt, self.stillSleepable(id, rt, url, navigationRevision, cutoff) else { return }
+                            let refusal = Self.sleepRefusal(result)
+                            guard refusal.isEmpty else { return self.keepAwake(rt, url, refusal, pass) }
+                            // Chromium knows about calls, devices and capture that the page's own
+                            // world can't show; an older CEF without Cra's methods doesn't say.
+                            rt.browser.sendDevToolsMethod("Cra.getFreezingState", params: "{}") { [weak self, weak rt] result, _ in
+                                DispatchQueue.main.async {
+                                    guard let self, let rt, self.stillSleepable(id, rt, url, navigationRevision, cutoff) else { return }
+                                    let refusal = TabSleepPolicy.refusal(freezingReasons: Self.freezingReasons(result))
+                                    guard refusal.isEmpty else { return self.keepAwake(rt, url, refusal, pass) }
+                                    self.discard(id, rt, url, policy, pass)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A pressure sweep that asks nothing says why (#237); the minute's timer pass, with
+        // nothing old enough most of the time, stays quiet.
+        if asked == 0, policy.reason == .memoryPressure {
+            let why = policy.nothingToClose(sleepPages, visible: visibleTabIDs, held: held, waiting: waiting, now: now)
+            CraLog.note("tab sleep for memory pressure closes nothing: \(why)")
+        }
+    }
+
+    /// One pass's closed pages, logged as one line once the last of its pages has answered and
+    /// its callbacks let it go (#237: a sweep of twelve pages wrote twelve identical lines).
+    private final class SleepPass {
+        var log: TabSleepPolicy.PassLog
+        let done: (TabSleepPolicy.PassLog) -> Void
+        init(reason: TabSleepPolicy.Reason, done: @escaping (TabSleepPolicy.PassLog) -> Void) {
+            log = TabSleepPolicy.PassLog(reason: reason)
+            self.done = done
+        }
+        deinit { done(log) }
+    }
+
+    /// Where a finished pass's lines go: cra.log (a test reads them here).
+    var sleepPassLogged: (TabSleepPolicy.PassLog) -> Void = { for line in $0.lines { CraLog.note(line) } }
+
+    /// Chrome's in-place discard (Cra.discard, which needs WebContentsDiscard). A CEF without it
+    /// answers an error: the page closes instead, and its tab loads the URL again when shown.
+    private func discard(_ id: UUID, _ rt: TabRuntime, _ url: String, _ policy: TabSleepPolicy, _ pass: SleepPass) {
+        rt.browser.sendDevToolsMethod("Cra.discard", params: "{}") { [weak self, weak rt] result, error in
+            DispatchQueue.main.async {
+                guard let self, let rt, self.runtimes[id] === rt, !self.visibleTabIDs.contains(id) else { return }
+                let reply = error == nil ? Self.jsonObject(result) : nil
+                let discarded = reply?["discarded"] as? Bool == true
+                // Chromium keeps a page whose navigation was about to commit; ask again later.
+                // A split's copy can't wait: the hidden page would play on. It closes instead.
+                if error == nil, !discarded, policy.reason != .splitCopy { return self.keepAwake(rt, url, "navigating", pass) }
+                self.sleptTabs.insert(id)
+                Perf.count(.tabSlept, policy.reason.rawValue)
+                if !rt.browser.isIncognito {
+                    pass.log.closed(host: CraLog.host(url), hiddenFor: self.clock.now.timeIntervalSince(rt.hiddenAt ?? self.clock.now),
+                                    discarded: discarded, processEnded: reply?["processEnded"] as? Bool == true)
+                }
+                guard discarded else { return self.unload(id) }
+                rt.discarded = true
+                rt.soundPlaying = false
+                rt.sleepRefusal = nil
+                // Its page is gone, as a closed one's is: the card would play nothing (#275).
+                self.nowPlaying?.remove(id)
+                if rt.freezeVoted { self.setFreezingVote(rt, false) }
+                self.delegate?.browserManagerDidUpdate(id)
+            }
+        }
+    }
+
+    /// A hidden page whose process ran away (PerfCEF, past PerfRunawaySleep.bytes) sleeps at once,
+    /// without the probes a timer pass asks first, as Chrome's urgent discarding: a page holding
+    /// gigabytes costs the whole Mac more than what it would keep. Shown pages, Picture in Picture
+    /// and calls stay. Returns whether it was asked.
+    @discardableResult
+    func sleepRunaway(_ id: UUID) -> Bool {
+        guard let rt = runtimes[id], !rt.discarded, !visibleTabIDs.contains(id), !rt.browser.isInPictureInPicture,
+              !rt.browser.isCapturingMedia, rt.browser.isCreated, !rt.browser.isClosed else { return false }
+        discard(id, rt, rt.browser.currentURL, .runaway, SleepPass(reason: .runaway, done: sleepPassLogged))
+        return true
+    }
+
+    /// An MCP client works in the page (MCPServer): that counts as use, so sleeping and freezing
+    /// wait as they do after the user looks at a tab, and a discarded page loads again.
+    func touchedByAgent(_ id: UUID) {
+        guard let rt = runtimes[id] else { return }
+        if rt.hiddenAt != nil { rt.hiddenAt = clock.now }
+        if rt.freezeVoted { setFreezingVote(rt, false) }
+        wake(id, rt)
+    }
+
+    /// Shown again: Chromium loads a discarded page when it becomes visible; Cra.load starts it
+    /// now, as Chrome does on selecting the tab, so a covered window doesn't wait.
+    private func wake(_ id: UUID, _ rt: TabRuntime) {
+        guard rt.discarded else { return }
+        rt.discarded = false
+        if sleptTabs.remove(id) != nil { Perf.begin(.tabWake, id.uuidString) }
+        log(id, "loads its discarded page again")
+        rt.browser.sendDevToolsMethod("Cra.load", params: "{}") { _, _ in }
+    }
+
+    private static func jsonObject(_ s: String?) -> [String: Any]? {
+        s?.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    }
+
+    /// Cra.getFreezingState's reasons for the page and the pages connected to it.
+    private static func freezingReasons(_ result: String?) -> [String] {
+        guard let json = jsonObject(result) else { return [] }
+        return (json["reasons"] as? [String] ?? []) + (json["connectedReasons"] as? [String] ?? [])
+    }
+
+    private func stillSleepable(_ id: UUID, _ rt: TabRuntime, _ url: String, _ revision: UInt, _ cutoff: Date) -> Bool {
+        runtimes[id] === rt && rt.navigationRevision == revision && rt.browser.currentURL == url && canSleep(rt, before: cutoff)
+    }
+
+    /// Asked again after the back-off; the log names the site once per reason (never an incognito
+    /// one), and the recorder counts the page once per reason and its later refusals as retries (#214).
+    private func keepAwake(_ rt: TabRuntime, _ url: String, _ refusal: String, _ pass: SleepPass) {
+        rt.sleepProbeAfter = clock.now.addingTimeInterval(Self.refusalBackoff)
+        pass.log.refused(refusal)
+        guard rt.sleepRefusal != refusal else { return Perf.count(.sleepRetry, refusal) }
+        Perf.count(.sleepRefusal, refusal)
+        if !rt.browser.isIncognito { CraLog.note("tab sleep keeps \(CraLog.host(url)) awake: \(refusal)") }
+        rt.sleepRefusal = refusal
+    }
+
+    /// A candidate held awake before its page is asked (loading, DevTools…): said once per reason,
+    /// so a sweep that comes late can be explained from cra.log and the recorder (#214).
+    private func passOver(_ rt: TabRuntime, _ hold: TabSleepPolicy.Hold) {
+        guard rt.sleepHold != hold else { return }
+        rt.sleepHold = hold
+        Perf.count(.sleepSkip, hold.rawValue)
+        if !rt.browser.isIncognito { CraLog.note("tab sleep passes over \(CraLog.host(rt.browser.currentURL)): \(hold.rawValue)") }
+    }
+
+    static let refusalBackoff: TimeInterval = 10 * 60
+
+    /// Arc's WebContentLifecycleOptimization freezes a page out of sight for `timeToFreezeTab`
+    /// (30 minutes), unless it is one of the 10 tabs used last or has a media player open, by
+    /// voting for it in Chromium's freezing policy (its freeze token). The policy freezes it only
+    /// while nothing it knows forbids that: sound now or lately, capture, a Web Lock or IndexedDB
+    /// lock, a device, a WebRTC connection, notification permission. Showing the tab drops the
+    /// vote. Needs the CEF patch behind "Cra.setFreezingVote" (cef-patches/freezing-vote.patch);
+    /// an older CEF answers that the method doesn't exist and nothing freezes (GitHub #136).
+    func freezeIdleTabs(hiddenLongerThan seconds: TimeInterval) {
+        let cutoff = clock.now.addingTimeInterval(-seconds)
+        let recent = recentlyShown
+        for (id, rt) in runtimes {
+            let b = rt.browser
+            // A site the user keeps active keeps running too, as in Chrome, whose freezing reads the
+            // same list (#458); one listed after its vote drops the vote on the next pass.
+            let vote = !recent.contains(id) && !rt.discarded && rt.hiddenAt.map { $0 < cutoff } == true && b.isCreated && !b.isClosed
+                && !(nowPlaying?.entries.contains { $0.id == id } ?? false) && !keptActive(rt)
+            if vote != rt.freezeVoted { setFreezingVote(rt, vote) }
+        }
+    }
+
+    private func setFreezingVote(_ rt: TabRuntime, _ vote: Bool) {
+        rt.freezeVoted = vote
+        log(rt.tabID, vote ? "votes to freeze its page" : "drops its freezing vote")
+        rt.browser.sendDevToolsMethod("Cra.setFreezingVote", params: vote ? #"{"vote":true}"# : #"{"vote":false}"#) { _, error in
+            guard let error, vote, !Self.loggedFreezingError else { return }
+            Self.loggedFreezingError = true
+            DispatchQueue.main.async { CraLog.note("tab freezing unavailable: \(error)") }
+        }
+    }
+
+    private static var loggedFreezingError = false
+
+    /// cra://debug?freezingState=1: each page's freezing state as Chromium has it, for scenarios.
+    /// The title comes from the browser side, which a frozen page doesn't hold up.
+    func logFreezingStates() {
+        for rt in runtimes.values where rt.browser.isCreated && !rt.browser.isClosed {
+            let title = rt.browser.currentTitle, url = rt.browser.currentURL
+            rt.browser.sendDevToolsMethod("Cra.getFreezingState", params: "{}") { result, error in
+                let r = (result?.data(using: .utf8)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                let line = "freezing state \(url) title=\(title): frozen=\(r["frozen"] as? Bool ?? false)"
+                    + " liveConnection=\(r["liveConnection"] as? Bool ?? false)"
+                    + " reasons=\((r["reasons"] as? [String] ?? []).joined(separator: ","))\(error.map { " error=\($0)" } ?? "")"
+                DispatchQueue.main.async { CraLog.note(line) }
+            }
+        }
+    }
+
+    /// Arc never freezes or discards the pages of the 10 tabs used last, however long ago that
+    /// was (TabSleepPolicy.protectedRecentTabs, GitHub #136).
+    var protectedRecentTabs = TabSleepPolicy.protectedRecentTabs
+
+    private var sleepPages: [TabSleepPolicy.Page] {
+        // A discarded page has given its memory back, like a closed one: it holds none of the 10 places.
+        runtimes.values.filter { !$0.discarded }.map {
+            TabSleepPolicy.Page(id: $0.tabID, hiddenAt: $0.hiddenAt, audibleAt: $0.audibleAt, keptActive: keptActive($0))
+        }
+    }
+
+    /// Settings ▸ Tabs ▸ "Always keep these sites active" lists the page's site (#458). Incognito
+    /// pages too: the list names sites, not a profile's data.
+    private func keptActive(_ rt: TabRuntime) -> Bool { store.settings.keepsActive(url: rt.browser.currentURL) }
+
+    /// The tabs on screen now, then the ones hidden most recently, up to `protectedRecentTabs`.
+    private var recentlyShown: Set<UUID> {
+        TabSleepPolicy.recentlyShown(sleepPages, visible: visibleTabIDs, count: protectedRecentTabs)
+    }
+
+    private func canSleep(_ rt: TabRuntime, before cutoff: Date) -> Bool { sleepHold(rt, before: cutoff) == nil }
+
+    private func sleepHold(_ rt: TabRuntime, before cutoff: Date) -> TabSleepPolicy.Hold? {
+        let b = rt.browser
+        return TabSleepPolicy.hold(.init(discarded: rt.discarded, hiddenAt: rt.hiddenAt, audibleAt: rt.audibleAt,
+                                         visible: visibleTabIDs.contains(rt.tabID), created: b.isCreated, closed: b.isClosed,
+                                         loading: b.isLoading, pictureInPicture: b.isInPictureInPicture,
+                                         capturing: b.isCapturingMedia, audible: b.isAudible, devTools: b.hasDevTools),
+                                   before: cutoff)
+    }
+
+    /// In Cra's isolated world: "" when the page has nothing to lose, else why it must stay: text
+    /// the user typed that is still there on the same URL (PageScript records trusted input;
+    /// values a framework set, or text submitted by a navigation, don't count). Whether it plays
+    /// is Chromium's to say, as in Chrome and Arc (`audible`, `audibleAt`): a video Chromium
+    /// suspends in a hidden tab still reads `paused == false` here, and kept every YouTube tab
+    /// awake all night (#275).
+    private static let sleepProbe: String = {
+        let js = """
+        (() => {
+          const edited = e => e.isContentEditable ? e.textContent.trim() !== ''
+            : e.type === 'checkbox' || e.type === 'radio' ? e.checked !== e.defaultChecked
+            : e.tagName === 'SELECT' ? [...e.options].some(o => o.selected !== o.defaultSelected)
+            : (e.value ?? '') !== '';
+          for (const [e, href] of window.__cra?.typed ?? []) {
+            if (!e.isConnected || href !== location.href) { window.__cra.typed.delete(e); continue; }
+            if (edited(e)) return 'typed';
+          }
+          return '';
+        })()
+        """
+        return evaluateParams(js, userGesture: false)
+    }()
+
+    /// In the page's world (leaves nothing behind): the page's own onbeforeunload. Listeners a
+    /// framework adds with addEventListener don't count: nearly every app registers one, and the
+    /// user never sees most of them fire.
+    private static let beforeUnloadProbe = evaluateParams("typeof window.onbeforeunload === 'function' ? 'beforeunload' : ''", userGesture: false)
+
+    /// The probe's answer; anything but a clean "" (an exception, no reply) refuses.
+    private static func sleepRefusal(_ result: String?) -> String {
+        guard let data = result?.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return "no reply" }
+        guard json["exceptionDetails"] == nil else { return "probe failed" }
+        guard let value = (json["result"] as? [String: Any])?["value"] as? String else { return "no reply" }
+        return value
+    }
+
+    /// Drop runtimes whose tabs no longer exist (archived, deleted). A page can't change
+    /// its Chromium profile: one whose tab moved to a space with another profile, or whose
+    /// space switched profiles, closes and loads its URL again there when shown.
+    func pruneMissingTabs() {
+        for id in runtimes.keys where store.item(id)?.isTab != true {
+            unload(id)
+            PageEngines.videoPages.forget(tab: id)
+        }
+        sleptTabs = sleptTabs.filter { store.item($0)?.isTab == true }
+        for (id, rt) in runtimes where store.item(id)?.isTab == true && !inRightProfile(rt) {
+            release(id)?.browser.close()
+        }
+    }
+
+    private func inRightProfile(_ rt: TabRuntime) -> Bool {
+        rt.browser.isIncognito || rt.browser.profilePath == store.profilePath(item: rt.tabID)
+    }
+
+    func closeAll() { for id in Array(runtimes.keys) { unload(id) } }
+
+    func layoutVisible() {
+        for id in visibleTabIDs {
+            guard let v = runtimes[id]?.browser.containerView else { continue }
+            v.frame = v.superview?.bounds ?? container.bounds
+        }
+    }
+
+    func tabID(of browser: CraBrowser) -> UUID? {
+        guard let id = byBrowser[ObjectIdentifier(browser)], runtimes[id]?.browser === browser else { return nil }
+        return id
+    }
+
+    /// The tab on screen whose page `view` (Chromium's page view or one inside it) belongs to:
+    /// in its pane's card (EmbeddedPages), in its own Chrome window, or in its Alloy container.
+    func visibleTabID(ofPageView view: NSView) -> UUID? {
+        visibleTabIDs.first { id in
+            guard let rt = runtimes[id] else { return false }
+            if view.isDescendant(of: rt.browser.containerView) { return true }
+            guard let host = rt.hostWindow else { return false }
+            return view.window === host || (EmbeddedPages.pageViews(of: host)?.contains { view.isDescendant(of: $0) } ?? false)
+        }
+    }
+
+    // MARK: Delete browsing data
+
+    /// Chrome's Settings page (its Delete browsing data dialog) runs in Chromium; the command
+    /// bar's history is Cra's. Hear the dialog's "Delete data" and clear the same history here.
+    /// One wait per page (a second load finds the first); the page answers once, then it waits
+    /// again.
+    private func watchClearBrowsingData(_ browser: CraBrowser) {
+        let js = """
+        (() => {
+          if (typeof chrome === 'undefined' || typeof chrome.send !== 'function') return null;
+          return window.__craClearBrowsingData ??= new Promise(resolve => {
+            const send = chrome.send;
+            chrome.send = function (name, args) {
+              if (name === 'clearBrowsingData') {
+                chrome.send = send;
+                window.__craClearBrowsingData = null;
+                resolve(JSON.stringify((args ?? []).slice(1)));
+              }
+              return send.apply(this, arguments);
+            };
+          });
+        })()
+        """
+        let params: [String: Any] = ["expression": js, "returnByValue": true, "awaitPromise": true]
+        let json = String(data: try! JSONSerialization.data(withJSONObject: params), encoding: .utf8)!
+        browser.sendDevToolsMethod("Runtime.evaluate", params: json) { [weak self, weak browser] result, _ in
+            DispatchQueue.main.async {
+                guard let self, let browser, let message = Self.stringResult(result) else { return }
+                if let range = BrowsingDataClear.historyRange(messageJSON: message, now: self.clock.now) { self.store.clearHistory(range) }
+                if browser.currentURL.hasPrefix("chrome://settings") { self.watchClearBrowsingData(browser) }
+            }
+        }
+    }
+
+    // MARK: Picture in Picture
+
+    /// Arc: "Enable Picture in Picture when you leave a video tab". The request
+    /// goes out as the page is hidden, so the video keeps playing in the
+    /// floating window; the page answers through didChangePictureInPicture.
+    /// It goes through the protocol's user gesture like the player's button:
+    /// the key press that lends the page activation raced the page going
+    /// hidden, and PiP sometimes never opened.
+    ///
+    /// A call goes first through Chrome's own automatic Picture in Picture
+    /// (AutoPictureInPictureTabHelper, which Arc uses for Google Meet), driven by Cra's tab switch
+    /// since CEF has no tab strip for it to watch (`Cra.autoPictureInPicture`). A page that uses
+    /// the camera or microphone and registered an `enterpictureinpicture` media session handler
+    /// has it run, and Chromium lets it open its Picture in Picture window without a gesture:
+    /// Meet's "Automatic picture-in-picture" opens a Document Picture in Picture window of the
+    /// call, which no `<video>` request can (GitHub #198). Chrome's per-site permission for
+    /// automatic picture-in-picture applies. Any other page gets the video request; `video: false`
+    /// skips that (a silent page when the window goes out of sight). The Site Control Center turns
+    /// it off or on for one site (#326).
+    private func leaveTab(_ tabID: UUID, video: Bool = true) {
+        guard let rt = runtimes[tabID], store.settings.allowsAutoPictureInPicture(url: rt.browser.currentURL),
+              !rt.browser.isInPictureInPicture else { return }
+        rt.pendingAutoPictureInPicture = true
+        guard rt.browser.isCapturingMedia, !(rt.browser is WebKitBrowser) else {
+            if video { requestPictureInPicture(tabID, automatic: true) }
+            return
+        }
+        let asked = clock.now
+        rt.browser.sendDevToolsMethod("Cra.autoPictureInPicture", params: #"{"tab":"hidden"}"#) { [weak self, weak rt] result, _ in
+            DispatchQueue.main.async {
+                guard let self, let rt, self.runtimes[tabID] === rt else { return }
+                let answer = Self.jsonObject(result) ?? [:]
+                if answer["asked"] as? Bool == true {
+                    self.log(tabID, "asks the page for Picture in Picture")
+                    rt.sessionPictureInPictureAt = asked
+                    // Back on the tab before Chromium answered.
+                    if !rt.pendingAutoPictureInPicture { self.returnToTab(rt) }
+                    rt.pendingAutoPictureInPicture = false
+                } else if answer["pictureInPicture"] as? Bool == true {
+                    rt.pendingAutoPictureInPicture = false
+                } else if video, rt.pendingAutoPictureInPicture {
+                    self.requestPictureInPicture(tabID, automatic: true)
+                } else {
+                    rt.pendingAutoPictureInPicture = false
+                }
+            }
+        }
+    }
+
+    /// A split pane that stands in for a pinned tab: the Today copy `createSplit` and
+    /// `addToSplit` make of a pinned or favorite tab, which loads the page anew.
+    private func isSplitCopy(_ paneID: UUID, of tabID: UUID) -> Bool {
+        guard let split = store.splitContaining(paneID), !split.children.contains(tabID) else { return false }
+        return store.paneID(for: tabID, in: split) == paneID
+    }
+
+    /// A pinned tab whose page the split's copy now shows (⌥Return in the command bar on a pinned
+    /// YouTube tab): Arc puts the pinned tab to sleep rather than opening its video in Picture in
+    /// Picture, so one video plays, in the split (reported on X, 4 Nov). The page is discarded in
+    /// place like any sleeping tab, and loads again when the pinned tab is selected.
+    private func hibernate(_ tabID: UUID) {
+        guard let rt = runtimes[tabID], !rt.browser.isInPictureInPicture else { return }
+        log(tabID, "sleeps: its split copy shows the page")
+        discard(tabID, rt, rt.browser.currentURL, .splitCopy, SleepPass(reason: .splitCopy, done: sleepPassLogged))
+    }
+
+    /// The window is out of sight: covered by another app, on another desktop or in the Dock.
+    private(set) var windowCovered = false
+
+    /// Arc's presentPipForOccludedWindow: a window out of sight and not key leaves its video tabs
+    /// the way a tab switch does (a four-finger swipe to another desktop, another app on top), and
+    /// the video comes back when the window is key again. Only pages playing sound get the video
+    /// request: it wants an unmuted video playing, and a page without one in its main frame gets
+    /// the activation nudge, which an app switch shouldn't send to every page. A call (camera or
+    /// microphone in use) has its own `enterpictureinpicture` handler run (Meet, #198).
+    func windowVisibilityChanged(covered: Bool) {
+        guard covered != windowCovered else { return }
+        windowCovered = covered
+        for id in visibleTabIDs {
+            guard let rt = runtimes[id] else { continue }
+            if covered {
+                // A WebKit page's own fullscreen window covers this one: that is the video on
+                // screen, not out of sight. Asked then, WebKit's Picture in Picture got stuck in its
+                // transition and never opened for that video again.
+                if rt.browser.isAudible || rt.browser.isCapturingMedia, !PageEngines.isInOwnFullscreen(rt.browser) {
+                    leaveTab(id, video: rt.browser.isAudible)
+                }
+            } else if rt.autoPictureInPicture || rt.pendingAutoPictureInPicture || rt.sessionPictureInPictureAt != nil {
+                returnToTab(rt)
+            }
+        }
+    }
+
+    func browser(_ browser: CraBrowser, didChangePictureInPicturePlayback playing: Bool) {
+        PictureInPictureChrome.shared.isPlaying = playing
+    }
+
+    func browser(_ browser: CraBrowser, didChangePictureInPictureTime position: Double, duration: Double) {
+        guard browser.isInPictureInPicture else { return }
+        PictureInPictureChrome.shared.time = (position, duration)
+    }
+
+    /// Picture in Picture's "back to tab": select the tab, bring its window up
+    /// and put the video back in the page (also when the tab was already selected).
+    private func bringToFront(_ tabID: UUID) {
+        store.selectTab(tabID, window: windowID)
+        container.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        runtimes[tabID]?.browser.exitPictureInPicture()
+    }
+
+    /// A WebKit page's video is in the system's Picture in Picture window, whose ↖ button is its
+    /// "back to tab": the tab comes to the front, in its window, as Back to Tab on Cra's own
+    /// window does for a Chromium page. Until then the button did nothing: WebKit asks for the page
+    /// to be shown before it moves the video, and with the tab still hidden the window stayed up
+    /// (#585). WebKit puts the video back itself.
+    func webKitPageReturnsFromPictureInPicture(_ browser: CraBrowser) {
+        guard let id = tabID(of: browser) else { return }
+        log(id, "Picture in Picture: back to tab")
+        runtimes[id]?.pendingAutoPictureInPicture = false
+        store.selectTab(id, window: windowID)
+        container.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Back on the tab: the video comes home. Arc closes its Picture in Picture
+    /// window whenever the tab it came from is in front again, however it was
+    /// opened (observed on 1.168: the window went away the moment its source
+    /// window became key).
+    private func returnToTab(_ rt: TabRuntime) {
+        rt.pendingAutoPictureInPicture = false
+        if rt.browser.isInPictureInPicture { rt.browser.exitPictureInPicture() }
+        if let asked = rt.sessionPictureInPictureAt {
+            rt.sessionPictureInPictureAt = nil
+            closeAutomaticPictureInPicture(rt, again: clock.now.timeIntervalSince(asked) < 2)
+        }
+    }
+
+    /// Chrome closes the window automatic Picture in Picture opened when its tab is in front
+    /// again, and the page takes its content back as the window goes (Meet's call returns to the
+    /// tab). A window the page was still opening (the user came straight back) is closed once it
+    /// Arc's Minimize on the Picture in Picture window: the video leaves the window and plays on
+    /// in its tab, without going to it, and the sidebar's player has the tab with its Picture in
+    /// Picture button, which brings the video back out (#434). A tab without a card (on CEF the
+    /// card follows sound, so a muted video has none; the engine takes it away 2.5 s after the media
+    /// session ends, #411) gets one here, or Minimize would leave it with no way back but its tab.
+    func minimizePictureInPicture(_ id: UUID) {
+        guard let rt = runtimes[id], rt.browser.isInPictureInPicture else { return }
+        log(id, "minimizes Picture in Picture, keeps playing")
+        if let np = nowPlaying {
+            if np.entries.contains(where: { $0.id == id }) {
+                np.update(id) { $0.hasVideo = true }
+            } else {
+                np.entries.append(.init(id: id, playing: rt.browser.isPictureInPicturePlaying, hasVideo: true))
+            }
+        }
+        rt.browser.exitPictureInPicture()
+    }
+
+    /// is up, a second later, if the tab is still in front.
+    private func closeAutomaticPictureInPicture(_ rt: TabRuntime, again: Bool) {
+        rt.browser.sendDevToolsMethod("Cra.autoPictureInPicture", params: #"{"tab":"shown"}"#) { _, _ in }
+        guard again else { return }
+        clock.after(1) { [weak self, weak rt] in
+            guard let self, let rt, self.visibleTabIDs.contains(rt.tabID), !self.windowCovered else { return }
+            rt.browser.sendDevToolsMethod("Cra.autoPictureInPicture", params: #"{"tab":"shown"}"#) { _, _ in }
+        }
+    }
+
+    func browser(_ browser: CraBrowser, didChangePictureInPicture active: Bool) {
+        guard let id = tabID(of: browser), let rt = runtimes[id] else { return }
+        if let np = nowPlaying, np.pictureInPicture.contains(id) != active {
+            if active { np.pictureInPicture.insert(id) } else { np.pictureInPicture.remove(id) }
+        }
+        log(id, active ? "enters Picture in Picture" : "leaves Picture in Picture")
+        // WebKit's video goes to the system's own Picture in Picture window, with its own controls.
+        if browser is WebKitBrowser {
+        } else if active {
+            // The floating window's hover controls act on this tab.
+            PictureInPictureChrome.shared.actions = PictureInPictureActions(
+                backToTab: { [weak self] in self?.bringToFront(id) },
+                togglePlayback: { [weak browser] in browser?.togglePictureInPicturePlayback() },
+                skip: { [weak browser] s in browser?.skipPictureInPicture(by: s) },
+                seek: { [weak browser] s in browser?.seekPictureInPicture(to: s) },
+                close: { [weak browser] in browser?.closePictureInPicture() },
+                minimize: { [weak self] in self?.minimizePictureInPicture(id) })
+            PictureInPictureChrome.shared.isPlaying = browser.isPictureInPicturePlaying
+            PictureInPictureChrome.shared.time = (0, 0)   // the page says where its video is right after
+            PictureInPictureChrome.shared.address = PictureInPictureLayout.address(of: browser.currentURL)
+            PictureInPictureChrome.shared.videoEntered()
+        } else {
+            PictureInPictureChrome.shared.videoLeft()
+        }
+        if active {
+            rt.autoPictureInPicture = rt.pendingAutoPictureInPicture
+            rt.pendingAutoPictureInPicture = false
+            // The request from leaving the tab landed after the user came back.
+            if rt.autoPictureInPicture, id == visibleTabID, !windowCovered { browser.exitPictureInPicture() }
+        } else {
+            rt.autoPictureInPicture = false
+        }
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    // MARK: CraBrowserDelegate
+
+    func browser(_ browser: CraBrowser, didChangeTitle title: String) {
+        guard let id = tabID(of: browser) else { return }
+        store.updateTab(id, title: title)
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    func browser(_ browser: CraBrowser, didChangeMediaCapture capturing: Bool) {
+        guard let id = tabID(of: browser) else { return }
+        log(id, capturing ? "uses the camera or microphone" : "stopped using the camera and microphone")
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    func browserDidChangeTabSharing(_ browser: CraBrowser) {
+        guard tabID(of: browser) != nil else { return }
+        delegate?.browserManagerTabSharingChanged()
+    }
+
+    func browser(_ browser: CraBrowser, didChangeAudible audible: Bool) {
+        guard let id = tabID(of: browser) else { return }
+        runtimes[id]?.audibleAt = clock.now
+        // The media session makes and plays the card where the engine reports it (#411).
+        if let np = nowPlaying, !browser.reportsMediaSession {
+            if np.entries.contains(where: { $0.id == id }) {
+                np.update(id) { $0.playing = audible }
+            } else if audible && !browser.hasUncontrollableSound {
+                np.entries.append(.init(id: id, playing: true))
+            }
+            if audible { refreshMediaControls(id) }
+        }
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    /// Music notes follow sound immediately; the speaker and player cards keep the audible hold.
+    /// A card paused then resumed within that hold also needs the immediate start event.
+    func browser(_ browser: CraBrowser, didChangeInfoBars infoBars: [[String: Any]]) {
+        guard let id = tabID(of: browser), let rt = runtimes[id] else { return }
+        let bars = infoBars.compactMap { PageInfoBar($0) }
+        guard bars != rt.infoBars else { return }
+        rt.infoBars = bars
+        log(id, bars.isEmpty ? "info bars gone" : "info bars: \(bars.map { $0.message }.joined(separator: " | "))")
+        delegate?.browserManagerPageWindowsChanged(focus: false)
+    }
+
+    func browser(_ browser: CraBrowser, didChangeSoundPlaying playing: Bool) {
+        guard let id = tabID(of: browser), let rt = runtimes[id] else { return }
+        let changed = rt.soundPlaying != playing
+        rt.soundPlaying = playing
+        let followsSound = !browser.reportsMediaSession
+        let resumesCard = followsSound && playing && nowPlaying?.entries.contains(where: { $0.id == id && !$0.playing }) == true
+        if resumesCard { nowPlaying?.update(id) { $0.playing = true } }
+        // A ding made no card (#411); media starting within its hold has no audible edge of its own.
+        let startsCard = followsSound && playing && browser.isAudible && !browser.hasUncontrollableSound
+            && nowPlaying?.entries.contains(where: { $0.id == id }) == false
+        if startsCard {
+            nowPlaying?.entries.append(.init(id: id, playing: true))
+            refreshMediaControls(id)
+        }
+        guard changed || resumesCard || startsCard else { return }
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    /// Chromium's media session (#411): the card is made and plays while the session is controllable
+    /// and active, shows paused while it is suspended, and leaves 2.5 s after it ends, as Chrome's
+    /// media controls do. A ding or Web Audio leaves it as it is (PlayerCardSession).
+    func browser(_ browser: CraBrowser, didChangeMediaSessionState state: CraMediaSessionState, controllable: Bool) {
+        guard let id = tabID(of: browser), let rt = runtimes[id] else { return }
+        let session: PlayerCardSession.State
+        switch state {
+        case .active: session = .active
+        case .ducking: session = .ducking
+        case .suspended: session = .suspended
+        default: session = .inactive
+        }
+        let change = rt.playerCard.update(session, controllable: controllable)
+        guard let np = nowPlaying else { return }
+        switch change {
+        case .none:
+            return
+        case .show(let playing):
+            rt.playerCardRemoval?.cancel()
+            rt.playerCardRemoval = nil
+            if np.entries.contains(where: { $0.id == id }) {
+                np.update(id) { $0.playing = playing }
+            } else if playing {
+                np.entries.append(.init(id: id, playing: true))
+            } else {
+                return
+            }
+            if playing { refreshMediaControls(id) }
+        case .removeLater:
+            guard np.entries.contains(where: { $0.id == id }), rt.playerCardRemoval == nil else { return }
+            np.update(id) { $0.playing = false }
+            rt.playerCardRemoval = clock.after(PlayerCardSession.endedDelay) { [weak self, weak rt] in
+                guard let self, let rt, self.runtimes[id] === rt else { return }
+                rt.playerCardRemoval = nil
+                self.nowPlaying?.remove(id)
+                self.delegate?.browserManagerDidUpdate(id)
+            }
+        }
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    // MARK: Now playing
+
+    /// Play/pause, previous and next for the sidebar player. The page's own media session
+    /// handlers go first (YouTube, Spotify and SoundCloud skip tracks that way), else the page's
+    /// media elements.
+    func performNowPlaying(_ id: UUID, _ action: NowPlaying.Action) {
+        let op: String
+        switch action {
+        case .togglePlayback: op = "toggle"
+        case .previous: op = "previoustrack"
+        case .next: op = "nexttrack"
+        case .dismiss: op = "pause"; nowPlaying?.remove(id)
+        case .pictureInPicture:
+            requestPictureInPicture(id, automatic: false)
+            return
+        case .setVolume(let v):
+            nowPlaying?.update(id) { $0.volume = v }
+            let js = "(v => { if (window.__cra) window.__cra.volume = v; document.querySelectorAll('video,audio').forEach(m => m.volume = v); })(\(max(0, min(1, v))))"
+            runtimes[id]?.browser.evaluate(inIsolatedWorld: PageScript.world, params: Self.evaluateParams(js, userGesture: false)) { _, _ in }
+            return
+        case .toggleMute, .show: return
+        }
+        guard let rt = runtimes[id] else { nowPlaying?.remove(id); return }
+        if rt.browser is WebKitBrowser { return performWebKitNowPlaying(id, rt, op) }
+        // Chromium routes the page's own media session handlers (YouTube, Spotify and SoundCloud
+        // skip tracks that way), as Arc does: `Cra.mediaSession` runs the handler the way
+        // Chrome's media keys do, and a page without one has its media elements played or paused.
+        let run = { [weak self, weak rt] (op: String) in
+            guard let rt else { return }
+            rt.browser.sendDevToolsMethod("Cra.mediaSession", params: Self.jsonObjectString(["action": op])) { result, _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if Self.jsonObject(result)?["handled"] as? Bool == true {
+                        if op == "play" || op == "pause" { self.nowPlaying?.update(id) { $0.playing = op == "play" } }
+                    } else if op == "play" || op == "pause" {
+                        self.mediaElements(id, rt, op)
+                    }
+                }
+            }
+        }
+        guard op == "toggle" else { return run(op) }
+        mediaElements(id, rt, "state") { playing in run(playing ? "pause" : "play") }
+    }
+
+    /// The page's media elements: "state" reads whether any plays, "play" plays the one that
+    /// played last (or the first), "pause" pauses them all. No user gesture: the page has been
+    /// playing, so it already has its activation.
+    private func mediaElements(_ id: UUID, _ rt: TabRuntime, _ op: String, then: ((Bool) -> Void)? = nil) {
+        let js = """
+        ((op) => {
+          const media = [...document.querySelectorAll('video,audio')];
+          const playing = media.some(m => !m.paused && !m.ended);
+          if (op === 'pause') media.forEach(m => m.pause());
+          else if (op === 'play') (media.find(m => m.currentTime > 0 && !m.ended) ?? media[0])?.play();
+          return op === 'pause' ? 'paused' : op === 'play' || playing ? 'playing' : 'paused';
+        })(\(Self.jsonString(op)))
+        """
+        rt.browser.evaluate(inIsolatedWorld: PageScript.world, params: Self.evaluateParams(js, userGesture: false)) { [weak self] result, _ in
+            DispatchQueue.main.async {
+                guard let state = Self.stringResult(result) else { return }
+                if let then { return then(state == "playing") }
+                self?.nowPlaying?.update(id) { $0.playing = state == "playing" }
+            }
+        }
+    }
+
+    /// A WebKit page: its media session handlers through PageScript's wrapper.
+    private func performWebKitNowPlaying(_ id: UUID, _ rt: TabRuntime, _ op: String) {
+        let js = """
+        ((op) => {
+          const cra = window.__cra, has = cra ? cra.query() : [];
+          const media = [...document.querySelectorAll('video,audio')];
+          const playing = media.some(m => !m.paused && !m.ended);
+          if (op === 'toggle') op = playing ? 'pause' : 'play';
+          if (has.includes(op)) cra.send(op);
+          else if (op === 'pause') media.forEach(m => m.pause());
+          else if (op === 'play') (media.find(m => m.currentTime > 0 && !m.ended) ?? media[0])?.play();
+          return op === 'pause' ? 'paused' : op === 'play' ? 'playing' : playing ? 'playing' : 'paused';
+        })(\(Self.jsonString(op)))
+        """
+        // No user gesture: the page has been playing, so it already has its activation, and the
+        // page's own handlers shouldn't get a fresh one from Cra (PageScript).
+        rt.browser.evaluate(inIsolatedWorld: PageScript.world, params: Self.evaluateParams(js, userGesture: false)) { [weak self] result, _ in
+            DispatchQueue.main.async {
+                guard let state = Self.stringResult(result) else { return }
+                self?.nowPlaying?.update(id) { $0.playing = state == "playing" }
+            }
+        }
+    }
+
+    /// The player's Picture in Picture button, and leaving a video tab. The tab is (about to be) off
+    /// screen, so the key press that lends a page user activation for the context menu's Picture in
+    /// Picture doesn't reliably reach it; the protocol's user gesture does. Only a player in an
+    /// iframe falls back to the page path. Leaving a tab takes only an audible, playing video of
+    /// some size, as the page path does (muted ones are hover previews or GIF-like loops).
+    ///
+    /// The gesture goes only to a page that has such a video: a first look runs without one. A
+    /// user gesture is a page's licence to open pop-ups for the next few seconds, and leaving any
+    /// tab handed one out, so a page could open a window as it was left (#357).
+    ///
+    /// Which video, and what a page's `disablePictureInPicture` means to the ask, is
+    /// `PictureInPictureRequest`'s: Netflix's player sets it, and on a WebKit page the video is taken
+    /// all the same. An ask that opens nothing says why in the log.
+    private func requestPictureInPicture(_ id: UUID, automatic: Bool) {
+        guard let browser = runtimes[id]?.browser else { return }
+        let webKit = browser is WebKitBrowser
+        func evaluate(_ request: Bool, then: @escaping (String?) -> Void) {
+            let script = PictureInPictureRequest.script(engine: webKit ? .webKit : .chromium, automatic: automatic, request: request)
+            let params: [String: Any] = ["expression": script, "returnByValue": true, "awaitPromise": true, "userGesture": request]
+            let json = String(data: try! JSONSerialization.data(withJSONObject: params), encoding: .utf8)!
+            browser.sendDevToolsMethod("Runtime.evaluate", params: json) { result, _ in
+                DispatchQueue.main.async { then(Self.stringResult(result)) }
+            }
+        }
+        // What follows a page that opened nothing: a Chromium page's frames get the engine's request
+        // (a player in an iframe). A WebKit page has no such request, but asked for (the menu, the
+        // player's button), WebKit's own toggle follows, as Safari's menu does it: the page's request
+        // can be turned down there for want of a user gesture (#585). Leaving a tab takes only what
+        // the page's request took. Only an ask that nothing follows is logged.
+        let finish = { [weak self, weak browser] (raw: String?) in
+            let answer = PictureInPictureRequest.Answer(raw)
+            let follows = webKit ? WebKitPictureInPicture.followsPageAnswer(raw, automatic: automatic)
+                                 : PictureInPictureRequest.step(after: answer) == .frames
+            if follows { browser?.requestPictureInPicture(automatic: automatic); return }
+            if let line = PictureInPictureRequest.logLine(answer, automatic: automatic) { self?.log(id, line) }
+        }
+        evaluate(false) { look in
+            guard PictureInPictureRequest.step(after: .init(look)) == .request else { return finish(look) }
+            evaluate(true, then: finish)
+        }
+    }
+
+    /// The Mac woke (#275): Chromium's audio service can end in the night without telling a tab
+    /// it went quiet, so every card reads its tab's sound again, and a playing one its buttons.
+    func systemDidWake() {
+        guard let np = nowPlaying else { return }
+        for entry in np.entries {
+            guard let rt = runtimes[entry.id], !rt.discarded else { np.remove(entry.id); continue }
+            let audible = rt.browser.isAudible
+            np.update(entry.id) { $0.playing = audible }
+            if audible { refreshMediaControls(entry.id) }
+        }
+    }
+
+    /// Which track buttons the page answers (media session handlers), and whether it has a video.
+    private func refreshMediaControls(_ id: UUID) {
+        guard let browser = runtimes[id]?.browser else { return }
+        let webKit = browser is WebKitBrowser
+        let js = """
+        (() => { const has = \(webKit ? "window.__cra?.query() ?? []" : "[]");
+          return (has.includes('previoustrack') ? 'p' : '') + (has.includes('nexttrack') ? 'n' : '') + (document.querySelector('video') ? 'v' : ''); })()
+        """
+        browser.evaluate(inIsolatedWorld: PageScript.world, params: Self.evaluateParams(js, userGesture: false)) { [weak self] result, _ in
+            DispatchQueue.main.async {
+                guard let has = Self.stringResult(result) else { return }
+                self?.nowPlaying?.update(id) {
+                    $0.hasVideo = has.contains("v")
+                    if webKit { $0.hasPrevious = has.contains("p"); $0.hasNext = has.contains("n") }
+                }
+            }
+        }
+        guard !webKit else { return }
+        browser.sendDevToolsMethod("Cra.mediaSession", params: "{}") { [weak self] result, _ in
+            DispatchQueue.main.async {
+                guard let actions = Self.jsonObject(result)?["actions"] as? [String] else { return }
+                self?.nowPlaying?.update(id) { $0.hasPrevious = actions.contains("previoustrack"); $0.hasNext = actions.contains("nexttrack") }
+            }
+        }
+    }
+
+    private static func jsonObjectString(_ object: [String: Any]) -> String {
+        String(data: try! JSONSerialization.data(withJSONObject: object), encoding: .utf8)!
+    }
+
+    private static func evaluateParams(_ js: String, userGesture: Bool) -> String {
+        let params: [String: Any] = ["expression": js, "returnByValue": true, "userGesture": userGesture]
+        return String(data: try! JSONSerialization.data(withJSONObject: params), encoding: .utf8)!
+    }
+
+    private static func jsonString(_ s: String) -> String {
+        String(data: try! JSONSerialization.data(withJSONObject: [s]), encoding: .utf8)!.dropFirst().dropLast().description
+    }
+
+    private static func stringResult(_ result: String?) -> String? {
+        guard let data = result?.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], json["exceptionDetails"] == nil else { return nil }
+        return (json["result"] as? [String: Any])?["value"] as? String
+    }
+
+    func browser(_ browser: CraBrowser, didChangeURL url: String) {
+        guard let id = tabID(of: browser) else { return }
+        if findOwner?.tabID == id { stopFinding(false) }
+        runtimes[id]?.navigationRevision &+= 1
+        invalidateAskOnPageDocument(for: id)
+        // A quiet page that navigates leaves the player; a playlist moving on keeps its card.
+        if !browser.isAudible { nowPlaying?.remove(id) }
+        // Our own error page is a data: URL; keep the real address in the model.
+        if url.hasPrefix("data:text/html;base64,") { return }
+        // A restored page has no address yet when it is shown.
+        if id == visibleTabID { Perf.visibleSite(browser.isIncognito ? nil : SiteNames.siteHost(of: url)) }
+        store.updateTab(id, url: url)
+        // A page's own address change (pushState) adds an entry without a load.
+        scheduleHistorySave(id)
+        if !browser.isIncognito { LiveFolderManager.shared.pageChanged(tab: id, to: url) }
+        protectedVideoPageChanged(id, browser, url: url)
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    func browser(_ browser: CraBrowser, didChangeLoading loading: Bool, canGoBack: Bool, canGoForward: Bool) {
+        guard let id = tabID(of: browser) else { return }
+        if loading, findOwner?.tabID == id { stopFinding(false) }
+        if loading {
+            runtimes[id]?.navigationRevision &+= 1
+            invalidateAskOnPageDocument(for: id)
+        }
+        HitchMonitor.mark(loading ? "load-start" : "load-end")
+        if loading { Perf.begin(.pageLoad, id.uuidString) } else {
+            Perf.end(.pageLoad, id.uuidString)
+            Perf.end(.tabWake, id.uuidString)
+        }
+        if !loading { runtimes[id]?.progress = 0 }
+        if !loading { scheduleHistorySave(id) }
+        // Two seconds on, the page (a video player especially) has settled before it is captured.
+        if !loading { scheduleSnapshot(id, after: 2) }
+        if let rt = runtimes[id] { rt.toolbarSamplePending = !loading }
+        if !loading { sampleToolbarColor(id) }
+        if !loading, let rt = runtimes[id], rt.probeWork != nil { scheduleProbe(id, rt, after: 3) }
+        if !loading, id == visibleTabID { Perf.phase("firstPageLoaded") }
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    /// The window's loading bar pulses until the page commits, then sweeps (LoadingIndicator).
+    func browser(_ browser: CraBrowser, didChangeCommittedLoad committed: Bool) {
+        if committed { AppLinkPrompt.pageLoaded(browser) }
+        guard let id = tabID(of: browser) else { return }
+        // Start-up phases: firstPageShown, then the page's navigation committed, then loaded.
+        if committed, id == visibleTabID { Perf.phase("firstPageCommitted") }
+        if committed {
+            shareTheme(id, with: browser)
+            applyBoost(to: browser, clearing: false)
+            if let css = store.cookieBannerCSS(item: id) { adopt(css, as: "__craCookieBanners", in: browser) }
+        }
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    /// Arc's "Allow websites to get your theme data": the space's palette as `--arc-palette-*` and
+    /// `--arc-background-*` variables on the page's root (ArcThemeData), in the scheme its pages see.
+    /// A stylesheet adopted from Cra's world, so the page's markup shows no trace of it, as in Arc.
+    private func shareTheme(_ id: UUID, with browser: CraBrowser) {
+        let systemDark = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        guard let css = store.themeDataCSS(item: id, systemDark: systemDark) else { return }
+        adopt(css, as: "__craArcTheme", in: browser)
+    }
+
+    /// Arc's Boosts: the site's boost for this page (set by the app; BoostStore), nil for none. `engineTints`:
+    /// the page's engine draws the tint (`tint`, Boost.Colorize.engineString), so `css` leaves it out (#602).
+    static var boostFor: ((_ url: String, _ engineTints: Bool) -> (css: String, js: String, tint: String?)?)?
+
+    /// The page's boost: its stylesheet adopted like the theme data, its script run in the page.
+    /// An emptied boost clears what an earlier one adopted. On Cra's Chromium engine its colours go to the engine,
+    /// which draws every colour but the page's images through them, as in Arc (#602); WebKit and CEF pages keep the
+    /// stylesheet's filter.
+    func applyBoost(to browser: CraBrowser, clearing: Bool = true) {
+        let engineTints = EngineFramework.isChromiumEngine && !(browser is WebKitBrowser)
+        let boost = Self.boostFor?(browser.currentURL, engineTints)
+        // A new document has nothing adopted: no call unless there is a boost to put on it.
+        guard boost != nil || clearing else { return }
+        adopt(boost?.css ?? "", as: "__craBoost", in: browser)
+        if engineTints { browser.setBoostTint(boost?.tint) }
+        if let js = boost?.js, !js.isEmpty { browser.executeJavaScript(js) }
+    }
+
+    /// Every page on `host` gets its boost again (the editor's changes, live).
+    func reapplyBoosts(host: String) {
+        for rt in runtimes.values where URL(string: rt.browser.currentURL)?.host.map(Boost.siteHost).map({ $0 == host || $0.hasSuffix("." + host) }) == true {
+            applyBoost(to: rt.browser)
+        }
+    }
+
+    /// A stylesheet adopted by the page's document from Cra's world, kept under `name` there so a
+    /// later commit of the same document replaces it.
+    private func adopt(_ css: String, as name: String, in browser: CraBrowser) {
+        guard let literal = String(data: (try? JSONSerialization.data(withJSONObject: [css], options: [])) ?? Data(), encoding: .utf8) else { return }
+        let script = "(()=>{let s=window.\(name);if(!s){s=window.\(name)=new CSSStyleSheet();"
+            + "document.adoptedStyleSheets=[...document.adoptedStyleSheets,s];}s.replaceSync(\(literal)[0]);})()"
+        guard let params = try? JSONSerialization.data(withJSONObject: ["expression": script]),
+              let json = String(data: params, encoding: .utf8) else { return }
+        browser.evaluate(inIsolatedWorld: PageScript.world, params: json) { _, _ in }
+    }
+
+    func browser(_ browser: CraBrowser, didChangeProgress progress: Double) {
+        guard let id = tabID(of: browser) else { return }
+        runtimes[id]?.progress = progress
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    func browser(_ browser: CraBrowser, didFinishLoadingURL url: String, title: String, statusCode: Int) {
+        // CEF ends the load of the page a discard just closed: nothing loaded, and nothing was visited (#214).
+        guard let id = tabID(of: browser), runtimes[id]?.discarded != true else { return }
+        log(id, "loaded \(site(url, id, browser)) (HTTP \(statusCode))")
+        if statusCode != 0 { runtimes[id]?.extensionPageRetries = 0 }
+        watchProtectedVideo(id, browser)
+        guard !browser.isIncognito else { return }
+        // The profile's extensions are up: imported Web Store copies become store installs (#203).
+        ExtensionStore.shared.installFromWebStore(using: browser, profile: store.profileDirectoryName(item: id))
+        if url.hasPrefix("chrome://settings") { watchClearBrowsingData(browser) }
+        store.recordVisit(url: url, title: title.isEmpty ? (store.item(id)?.tab?.savedTitle ?? "") : title, profile: store.profileID(item: id))
+    }
+
+    /// A restored tab's extension page, asked for before --load-extension loaded the extension,
+    /// loads again once it is up (ExtensionPageRetry).
+    func browser(_ browser: CraBrowser, didFailLoadingURL url: String, errorCode: Int) {
+        guard let id = tabID(of: browser), let rt = runtimes[id] else { return }
+        let profile = store.profileDirectoryName(item: id)
+        // Which extension the request went through, if any: a slow or failed first page is then a
+        // network wait or a proxy that is down, told apart from a render (#136).
+        log(id, "\(site(url, id, browser)) failed to load: net error \(errorCode), proxy \(ExtensionStore.shared.proxyLine(inProfile: profile))")
+        guard !browser.isIncognito else { return }
+        guard let wait = ExtensionPageRetry.delay(url: url, errorCode: errorCode, attempt: rt.extensionPageRetries, isOn: { ext in
+            ExtensionStore.shared.entries(inProfile: profile).contains { $0.extensionID == ext }
+        }) else { return }
+        rt.extensionPageRetries += 1
+        log(id, "loads \(site(url, id, browser)) again in \(wait) s: the extension wasn't loaded yet")
+        rt.extensionPageRetry = clock.after(wait) { [weak self, weak browser] in
+            // Still this tab's page, and nobody has gone elsewhere meanwhile.
+            guard let self, let browser, self.runtimes[id]?.browser === browser, browser.currentURL == url else { return }
+            browser.loadURL(url)
+        }
+    }
+
+    func browser(_ browser: CraBrowser, didLoadFavicon image: NSImage, forURL iconURL: String) {
+        guard let id = tabID(of: browser), let tab = store.item(id)?.tab else { return }
+        guard let site = FaviconKey.key(for: tab.url) ?? tab.faviconKey.map(FaviconKey.siteKey(of:)) else { return }
+        let key = FaviconKey.key(site: site, tabID: id)
+        let persist = !browser.isIncognito
+        favicons.store(image, forKey: site, persist: persist)
+        favicons.store(image, forKey: key, persist: persist)
+        store.setFaviconKey(id, key)
+    }
+
+    /// Arc's toolbar colour (#629): the page's top-right corner once its load ends, not its
+    /// theme-color. A page behind paints nothing, so it waits until it is on screen (show).
+    private func sampleToolbarColor(_ id: UUID) {
+        guard let rt = runtimes[id], rt.toolbarSamplePending, !rt.discarded, visibleTabIDs.contains(id) else { return }
+        rt.toolbarSamplePending = false
+        let revision = rt.navigationRevision
+        ToolbarSampler.sample(rt.browser) { [weak self, weak rt] hex in
+            // A reading that lands after the page moved on isn't the new page's colour.
+            guard let self, let rt, self.runtimes[id] === rt, rt.navigationRevision == revision, !rt.browser.isLoading else { return }
+            self.browser(rt.browser, didReportThemeColor: hex)
+        }
+    }
+
+    /// The page's toolbar colour: ToolbarSampler's reading (engines no longer pass theme-color
+    /// here), or an Easel's fixed bar.
+    func browser(_ browser: CraBrowser, didReportThemeColor hex: String) {
+        // The blank document a discard leaves answers the load end's probe with white (#237).
+        guard let id = tabID(of: browser), runtimes[id]?.discarded != true else { return }
+        runtimes[id]?.themeColor = hex
+        store.setThemeColor(id, hex)
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    func browser(_ browser: CraBrowser, didReportBackgroundColor hex: String) {
+        guard let id = tabID(of: browser), let rt = runtimes[id], !rt.discarded, rt.backgroundColor != hex else { return }
+        rt.backgroundColor = hex
+        delegate?.browserManagerDidUpdate(id)
+    }
+
+    func browser(_ browser: CraBrowser, didChangeStatusMessage message: String) {
+        delegate?.browserManager(statusMessage: message, tabID: tabID(of: browser))
+    }
+
+    /// Runs synchronously at field/programmatic edits, before any deferred UI observation.
+    @discardableResult
+    func prepareFind(_ query: String, matchCase: Bool = false, purpose: AskOnPage.FindPurpose = .ordinary) -> AskOnPage.FindRequest? {
+        guard let owner = findPageContext() else { stopFinding(false); return nil }
+        if findOwner != owner { stopFinding(false); findOwner = owner }
+        let previous = findState
+        let request = findState.begin(query, matchCase: matchCase, purpose: purpose)
+        if previous.request != request { retireAskOnPageQuote() }
+        if previous != findState { delegate?.browserManager(findState: findState) }
+        return request
+    }
+
+    func find(_ query: String, forward: Bool, matchCase: Bool = false, purpose: AskOnPage.FindPurpose = .ordinary) {
+        guard !query.replacingOccurrences(of: "\r", with: "").isEmpty else { stopFinding(true); return }
+        guard let request = prepareFind(query, matchCase: matchCase, purpose: purpose), let browser = visibleRuntime?.browser else { return }
+        browser.findText(query, forward: forward, matchCase: matchCase, findNext: true,
+                         generation: request.id, quote: purpose == .quote)
+    }
+
+    func stopFinding(_ clearSelection: Bool) {
+        retireAskOnPageQuote()
+        let browser = findOwner.flatMap { owner in
+            runtimes[owner.tabID].flatMap { ObjectIdentifier($0) == owner.runtime ? $0.browser : nil }
+        }
+        findOwner = nil
+        findState.clear()
+        browser?.stopFinding(clearSelection)
+        delegate?.browserManager(findState: findState)
+    }
+
+    func canAskFind(query: String, enabled: Bool, forward: Bool) -> Bool {
+        guard findOwner != nil else { return false }
+        guard findOwner == findPageContext() else { stopFinding(false); return false }
+        return findState.canAsk(query: query, enabled: enabled, forward: forward)
+    }
+
+    func browser(_ browser: CraBrowser, didFindMatches count: Int, activeMatch: Int, generation: UUID, quote: Bool, identifier: Int, finalUpdate: Bool) {
+        guard let id = tabID(of: browser), id == visibleTabID, findOwner != nil else { return }
+        guard findOwner == findPageContext() else { stopFinding(false); return }
+        guard findState.accept(generation, quote: quote, identifier: identifier, count: count, activeMatch: activeMatch, finalUpdate: finalUpdate) else { return }
+        delegate?.browserManager(findState: findState)
+    }
+
+    func browser(_ browser: CraBrowser, requestsFindAction action: CraFindAction) {
+        guard let id = tabID(of: browser), id == visibleTabID else { return }
+        // OnChromeCommand is intercepted before Chromium's own FindBarController can search.
+        delegate?.browserManager(findAction: action)
+    }
+
+    /// The tabs whose pages are in their own full screen (a video's): they leave it when they go (#636).
+    private var fullscreenTabs: Set<UUID> = []
+
+    func browser(_ browser: CraBrowser, didChangeFullscreen fullscreen: Bool) {
+        guard let id = tabID(of: browser) else { return }
+        if fullscreen { fullscreenTabs.insert(id) } else { fullscreenTabs.remove(id) }
+        delegate?.browserManager(fullscreen: fullscreen, tabID: id)
+    }
+
+    /// Each tab's notices from Chrome (full screen, pointer and keyboard locks): ExclusiveAccessNotices.
+    private var exclusiveAccessNotices: [UUID: ExclusiveAccessNotices] = [:]
+
+    func browser(_ browser: CraBrowser, exclusiveAccessNotice notice: CraExclusiveAccessNotice, force: Bool) {
+        guard let id = tabID(of: browser), let notice = ExclusiveAccessNotice(rawValue: notice.rawValue) else { return }
+        var notices = exclusiveAccessNotices[id] ?? ExclusiveAccessNotices()
+        let toast = notices.update(notice, force: force, inLittleWindow: false)
+        exclusiveAccessNotices[id] = notice == .none ? nil : notices
+        if let toast { delegate?.browserManager(exclusiveAccessToast: toast, tabID: id) }
+    }
+
+    func browser(_ browser: CraBrowser, requestsNewTabWithURL url: String, inBackground background: Bool) {
+        if background, middleClickAddsPane(url, in: browser) { return }
+        openLinkTab(url, from: tabID(of: browser), inBackground: background)
+    }
+
+    /// A link middle-clicked in a split's pane opens as a pane beside it, with Settings ▸ Links ▸
+    /// "Middle-click a link in a split adds a pane" on (GitHub #498, not in Arc). Chromium asks for
+    /// a tab behind the page, as for a ⌘-click; the page's last middle click tells them apart.
+    private func middleClickAddsPane(_ url: String, in browser: CraBrowser) -> Bool {
+        guard let id = tabID(of: browser), middleClickMakesPane(url, in: browser, tab: id) else { return false }
+        // After Chromium's call returns: the pane makes a page of its own.
+        DispatchQueue.main.async { [weak self] in self?.delegate?.browserManagerOpenLinkInSplit(url, fromTab: id) }
+        return true
+    }
+
+    /// Whether the link `browser`'s page (tab `id`) asks to open behind it is a middle click that adds a
+    /// pane (`LinkSplitClick.middleClickAddsPane`); the click is used up when it is.
+    private func middleClickMakesPane(_ url: String, in browser: CraBrowser, tab id: UUID) -> Bool {
+        let click = PageMiddleClick.last(in: browser.containerView)
+        guard LinkSplitClick.middleClickAddsPane(url, enabled: store.settings.splitMiddleClickAddsPane,
+                                                 panes: store.paneTabIDs(for: id).count, limit: store.splitPaneLimit,
+                                                 clickAge: click.age, modifiers: click.modifiers) else { return false }
+        PageMiddleClick.taken()
+        CraLog.note("middle click: pane for a link in a split")
+        return true
+    }
+
+    func browser(_ browser: CraBrowser, requestsCaptureOfImageAt point: NSPoint) {
+        guard let id = tabID(of: browser) else { return }
+        delegate?.browserManagerCaptureImage(at: point, tabID: id)
+    }
+
+    func browser(_ browser: CraBrowser, requestsWindowWithURL url: String, kind: CraLinkWindow) {
+        guard let id = tabID(of: browser) else { return }
+        delegate?.browserManagerOpenLink(url, in: kind, space: store.spaceID(ofItem: id), fromIncognito: browser.isIncognito)
+    }
+
+    func browser(_ browser: CraBrowser, requestsSplitPaneWithURL url: String) {
+        guard let id = tabID(of: browser) else { return }
+        delegate?.browserManagerOpenLinkInSplit(url, fromTab: id)
+    }
+
+    /// An Option-clicked link, which Chromium downloads, opens in Split View as in Arc (#298).
+    func browser(_ browser: CraBrowser, opensSplitForDownloadURL url: String, clickModifiers: UInt, clickAge: TimeInterval) -> Bool {
+        guard let id = tabID(of: browser),
+              LinkSplitClick.opensSplit(downloadOf: url, clickModifiers: clickModifiers, clickAge: clickAge) else { return false }
+        // After Chromium's call returns: the pane makes a page of its own.
+        DispatchQueue.main.async { [weak self] in self?.delegate?.browserManagerOpenLinkInSplit(url, fromTab: id) }
+        return true
+    }
+
+    /// A link that asks for a new tab, from `source`'s page or from a Peek over it (#202): a
+    /// Today tab in `source`'s space, else the window's.
+    func openLinkTab(_ url: String, from source: UUID?, inBackground background: Bool) {
+        // cra:// is Cra's scripting scheme (DevTools Protocol, key presses); a page must not drive it.
+        if url.lowercased().hasPrefix("cra:") { return }
+        let sourceSpace = source.flatMap { store.spaceID(ofItem: $0) }
+        // Links from a today tab open right below it (Arc), a split's below the split; otherwise at
+        // the top. With "Open background tabs below the current tab" on, one behind the page goes
+        // after the tabs `source` opened before (#532). Back on the new tab, with no page behind,
+        // closes it and shows `source` again (#273).
+        let slot = source.flatMap {
+            store.linkTabSlot(below: $0, afterEarlierLinks: background && store.settings.backgroundTabsBelowCurrent)
+        }
+        let tab = store.createTab(url: url, in: sourceSpace, select: !background,
+                                  parent: slot?.parent, index: slot?.index, window: windowID, referrer: source)
+        if background {
+            store.markUnread(tab.id, true)
+            loadBehind(tab.id)  // load it so the title and favicon fill in
+            delegate?.browserManagerOpenedInBackground(tab.id)
+        }
+    }
+
+    func browser(_ browser: CraBrowser, popupHostForURL url: String, inBackground background: Bool) -> CraBrowser? {
+        if url.lowercased().hasPrefix("cra:") { return nil }
+        let source = tabID(of: browser)
+        // The page opened a pop-up Chromium blocked before (a shared folder's next click): the
+        // blocked pop-ups button no longer offers it (#357).
+        if let source, runtimes[source]?.blockedPopups.markOpened(url: url) == true { delegate?.browserManagerDidUpdate(source) }
+        // A middle click in a split's pane with Split View's switch on: the page Chromium made is a new pane
+        // beside it, the opened page keeping its opener as a tab's does (#498).
+        if background, let source, middleClickMakesPane(url, in: browser, tab: source),
+           let pane = store.openLinkInSplit(url, from: source, window: windowID) {
+            let host = makePopupHost(for: pane.id, opener: browser)
+            show(pane.id, focus: true)
+            return host
+        }
+        let sourceSpace = source.flatMap { store.spaceID(ofItem: $0) }
+        // A ⌘-click or middle click goes where new tabs go, or with "Open background tabs below the
+        // current tab" on right below `source`, after the tabs it opened before (#532).
+        let slot = background && store.settings.backgroundTabsBelowCurrent
+            ? source.flatMap { store.linkTabSlot(below: $0, afterEarlierLinks: true) } : nil
+        let tab = store.createTab(url: url, in: sourceSpace, select: !background, parent: slot?.parent, index: slot?.index,
+                                  window: windowID, referrer: source)
+        if background { store.markUnread(tab.id, true) }
+        let host = makePopupHost(for: tab.id, opener: browser)
+        if background { delegate?.browserManagerOpenedInBackground(tab.id) } else { show(tab.id, focus: true) }
+        return host
+    }
+
+    /// A page about to navigate where the other engine has to show it (ProtectedMediaSites): the
+    /// navigation stops here and the tab's page opens again in that engine, at that address.
+    func browser(_ browser: CraBrowser, handsOffNavigationToURL url: String, method: String) -> Bool {
+        guard let id = tabID(of: browser), let engine = PageEngines.handoffTarget(from: browser, to: url, method: method, tab: id) else { return false }
+        log(id, "moves to \(engine == .webKit ? "WebKit" : "Chromium") for \(site(url, id, browser))")
+        // Not from inside Chromium's navigation callback: the page closes a turn later.
+        DispatchQueue.main.async { [weak self, weak browser] in
+            guard let self, let browser else { return }
+            self.reopen(id, at: url, replacing: browser)
+        }
+        return true
+    }
+
+    /// The Site Control Center's Safari's Engine switch: the tab's page opens again at its address
+    /// in the engine it now gets (PageEngines.choose first), in its place on screen.
+    func reopenInItsEngine(_ id: UUID) {
+        guard let rt = runtimes[id] else { return }
+        let url = rt.browser.currentURL
+        guard PageEngines.engine(of: rt.browser) != PageEngines.engine(for: url, tab: id) else { return }
+        log(id, "moves to \(PageEngines.engine(of: rt.browser) == .webKit ? "Chromium" : "WebKit") for \(site(url, id, rt.browser)), as chosen")
+        reopen(id, at: url, replacing: rt.browser)
+    }
+
+    // MARK: Protected videos on mixed sites (docs/protected-media.md)
+
+    /// A page's address changed. A page switched to WebKit for one video goes back to Chromium
+    /// when it is no longer that video's (YouTube changes videos without a navigation, so the
+    /// address is what tells). A Chromium page of a mixed site is asked to tell when it wants Widevine.
+    private func protectedVideoPageChanged(_ id: UUID, _ browser: CraBrowser, url: String) {
+        guard runtimes[id]?.browser === browser else { return }
+        if PageEngines.engine(of: browser) == .webKit {
+            guard PageEngines.videoPages.leaves(tab: id, to: url, sites: PageEngines.sites) else { return }
+            log(id, "goes back to Chromium: \(site(url, id, browser)) is no longer the protected video's page")
+            // Not from inside WebKit's own callback: the page closes a turn later.
+            DispatchQueue.main.async { [weak self, weak browser] in
+                guard let self, let browser else { return }
+                self.reopen(id, at: url, replacing: browser)
+            }
+            return
+        }
+        PageEngines.videoPages.navigated(tab: id, to: url, sites: PageEngines.sites)
+        delegate?.browserManagerProtectedVideoPromptChanged(id)
+        watchProtectedVideo(id, browser)
+    }
+
+    /// Asks a mixed site's Chromium page to answer when it next asks for Widevine
+    /// (PageScript.protectedVideoRequest): an answer left waiting in the page, so nothing polls.
+    /// Asked again whenever the page's address changes or it finishes loading; a newer ask takes
+    /// an older one's place in the page, and a page that navigates away ends its own.
+    private func watchProtectedVideo(_ id: UUID, _ browser: CraBrowser) {
+        guard let rt = runtimes[id], rt.browser === browser, !(browser is NativePage), PageEngines.engine(of: browser) == .chromium,
+              PageEngines.sites.mixedSite(for: browser.currentURL) != nil else { return }
+        rt.protectedVideoWatch &+= 1
+        let watch = rt.protectedVideoWatch
+        let params = Self.jsonObjectString(["expression": PageScript.protectedVideoRequest, "returnByValue": true, "awaitPromise": true])
+        browser.evaluate(inIsolatedWorld: PageScript.world, params: params) { [weak self, weak browser] result, _ in
+            let asked = Self.stringResult(result) ?? ""
+            DispatchQueue.main.async {
+                guard let self, let browser, let rt = self.runtimes[id], rt.browser === browser, rt.protectedVideoWatch == watch,
+                      !asked.isEmpty else { return }
+                self.protectedVideoRequested(id, browser, at: asked)
+                self.watchProtectedVideo(id, browser)
+            }
+        }
+    }
+
+    /// The page asked for Widevine while at `asked`: the prompt, or with Always the move.
+    private func protectedVideoRequested(_ id: UUID, _ browser: CraBrowser, at asked: String) {
+        let url = browser.currentURL, sites = PageEngines.sites
+        // It moved on to another page since: that page asks for itself.
+        guard sites.pageKey(for: asked) == sites.pageKey(for: url) else { return }
+        switch PageEngines.videoPages.widevineRequested(tab: id, url: url, sites: sites, choices: PageEngines.choices) {
+        case .nothing: break
+        case .asks:
+            log(id, "asked for Widevine on \(site(url, id, browser)): offers Safari's engine")
+            delegate?.browserManagerProtectedVideoPromptChanged(id)
+        case .switches:
+            switchToSafariEngine(id, how: .always)
+        }
+    }
+
+    /// The prompt's Once or Always, or the Site Control Center's row: this page moves to WebKit at
+    /// its address, with the place in its video and the site's sign-in, in its split pane. Only
+    /// this page: `PageEngines.videoPages` holds it to its video.
+    func switchToSafariEngine(_ id: UUID, how: SwitchedPage.How) {
+        guard let rt = runtimes[id], !rt.movingToWebKit, PageEngines.engine(of: rt.browser) == .chromium,
+              let mixed = PageEngines.sites.mixedSite(for: rt.browser.currentURL) else { return }
+        let browser = rt.browser, from = browser.currentURL
+        rt.movingToWebKit = true
+        var seconds: Double?, waiting = 2, moved = false
+        let move = { [weak self, weak rt] in
+            waiting -= 1
+            guard waiting <= 0, !moved else { return }
+            moved = true
+            rt?.movingToWebKit = false
+            let sites = PageEngines.sites
+            // The page went elsewhere while its cookies were copied: it is another page now.
+            guard let self, self.runtimes[id]?.browser === browser, sites.pageKey(for: browser.currentURL) == sites.pageKey(for: from) else { return }
+            let target = ProtectedVideoHandoff.address(for: browser.currentURL, at: seconds, sites: sites)
+            guard PageEngines.videoPages.switching(tab: id, url: target.url, how: how, resumeAt: target.seek, sites: sites) != nil else { return }
+            self.log(id, "moves to WebKit for a protected video on \(self.site(from, id, browser)), \(how == .once ? "once" : "as always")")
+            self.reopen(id, at: target.url, replacing: browser)
+        }
+        playbackTime(of: browser) { time in
+            seconds = time
+            move()
+        }
+        copySignIn(of: mixed, from: browser, tab: id, then: move)
+        // A page that answers neither still moves: it starts over, and may ask to sign in.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            waiting = 0
+            move()
+        }
+    }
+
+    /// The Site Control Center's row turned off on a switched page: back to Chromium at its
+    /// address (and its time, where the address can carry one), and not asked about again.
+    func returnToChromium(_ id: UUID) {
+        guard let rt = runtimes[id], PageEngines.engine(of: rt.browser) == .webKit, let page = PageEngines.videoPages.switched[id] else { return }
+        let browser = rt.browser
+        var moved = false
+        let move = { [weak self] (seconds: Double?) in
+            guard let self, !moved else { return }
+            moved = true
+            guard self.runtimes[id]?.browser === browser, PageEngines.videoPages.switched[id] == page else { return }
+            // The address while the switch still holds: a mixed site's, so its time can go along.
+            let url = ProtectedVideoHandoff.address(for: browser.currentURL, at: seconds, sites: PageEngines.sites).url
+            PageEngines.videoPages.returning(tab: id)
+            self.log(id, "moves to Chromium for \(self.site(url, id, browser)), as chosen")
+            self.reopen(id, at: url, replacing: browser)
+        }
+        playbackTime(of: browser, then: move)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { move(nil) }
+    }
+
+    /// Where the page's video is, in seconds (ProtectedVideoHandoff.playbackTimeScript), nil without one.
+    private func playbackTime(of browser: CraBrowser, then: @escaping (Double?) -> Void) {
+        let params = Self.jsonObjectString(["expression": ProtectedVideoHandoff.playbackTimeScript, "returnByValue": true])
+        browser.evaluate(inIsolatedWorld: PageScript.world, params: params) { result, _ in
+            let value = result.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+                .flatMap { $0["result"] as? [String: Any] }?["value"] as? Double
+            DispatchQueue.main.async { then(value.flatMap { $0 >= 0 ? $0 : nil }) }
+        }
+    }
+
+    /// The site's own cookies (YouTube: youtube.com's; Fandango at Home: its own and fandango.com's)
+    /// go from the page's Chromium profile to the same profile's WebKit store, so the page opens
+    /// signed in. Google's own (google.com) stay in Chromium (ProtectedVideoHandoff.cookieDomains).
+    /// An incognito page's go to the incognito session's throwaway store and nowhere else. Which
+    /// cookies: ProtectedVideoHandoff.cookies. A copy that fails moves the page all the same.
+    private func copySignIn(of mixed: MixedMediaSite, from browser: CraBrowser, tab id: UUID, then: @escaping () -> Void) {
+        let incognito = browser.isIncognito
+        let profilePath = incognito ? nil : store.profilePath(item: id)
+        browser.sendDevToolsMethod("Network.getAllCookies", params: "{}") { [weak self] result, error in
+            DispatchQueue.main.async {
+                let cookies = ProtectedVideoHandoff.cookies(fromProtocolAnswer: result ?? "", for: mixed)
+                self?.log(id, "copies \(cookies.count) cookies of \(incognito ? "(incognito)" : mixed.host) to WebKit\(error.map { " (\($0))" } ?? "")")
+                WebKitStores.add(cookies, profilePath: profilePath, incognito: incognito, done: then)
+            }
+        }
+    }
+
+    /// The tab's page closes and opens again at `url`, in the engine the address gets, on screen
+    /// where it was (its split pane, the focus).
+    private func reopen(_ id: UUID, at url: String, replacing old: CraBrowser) {
+        guard runtimes[id]?.browser === old, store.item(id)?.isTab == true else { return }
+        let visible = visibleTabIDs
+        let focused = visibleTabID
+        let hadFocus = old.containerView.window?.firstResponder.map { r in (r as? NSView)?.isDescendant(of: old.containerView) ?? false } ?? false
+        store.updateTab(id, url: url)
+        unload(id)
+        ensureRuntime(for: id)
+        if visible.contains(id) { show(visible, focused: focused, focus: hadFocus || focused == id) }
+    }
+
+    func browser(_ browser: CraBrowser, opensPeekForURL url: String, shiftClick: Bool, newTab: Bool) -> Bool {
+        guard let id = tabID(of: browser), !browser.isIncognito else { return false }
+        return delegate?.browserManagerOpensPeek(url: url, fromTab: id, pageURL: browser.currentURL, shiftClick: shiftClick, newTab: newTab) ?? false
+    }
+
+    /// Arc's ⌥⌘-click (Settings ▸ Links, #373): a link clicked with ⌥⌘ opens in a Little Window when the switch is
+    /// on. The keys are the click's (LittleWindowTrigger); otherwise the click stays Chromium's (Split View).
+    func browser(_ browser: CraBrowser, opensLittleWindowForURL url: String, clickModifiers: UInt, clickAge: TimeInterval) -> Bool {
+        guard let id = tabID(of: browser), !browser.isIncognito,
+              LittleWindowTrigger.opens(url, clickModifiers: clickModifiers, clickAge: clickAge,
+                                        enabled: store.settings.littleWindowOnOptionCommandClick)
+        else { return false }
+        log(id, String(format: "link opens a Little Window (click keys %lu, %.2f s ago)", clickModifiers, clickAge))
+        return delegate?.browserManagerOpensLittleWindow(url: url, fromTab: id) ?? false
+    }
+
+    func devToolsHostView(for browser: CraBrowser) -> NSView? {
+        guard let id = tabID(of: browser) else { return nil }
+        return delegate?.browserManagerDevToolsHost(for: id)
+    }
+
+    private(set) var devToolsViews: [UUID: NSView] = [:]
+    var visibleTabHasDevTools: Bool { visibleTabID.flatMap { devToolsViews[$0] } != nil }
+
+    func browser(_ browser: CraBrowser, didCreateDevToolsView view: NSView) {
+        guard let id = tabID(of: browser) else { return }
+        devToolsViews[id] = view
+        runtimes[id]?.devTools.didOpen()
+        delegate?.browserManagerDevToolsChanged()
+    }
+
+    func browserDidCloseDevTools(_ browser: CraBrowser) {
+        guard let id = tabID(of: browser) else { return }
+        devToolsViews[id] = nil
+        devToolsPlaceholders[id] = nil
+        devToolsDockedState[id] = nil
+        delegate?.browserManagerDevToolsChanged()
+        if let rt = runtimes[id] { perform(rt.devTools.didClose(), on: rt) }
+    }
+
+    /// ⌥⌘I, ⌥⌘J, ⌥⌘C and the developer bar's Console, Network and Inspect on the focused page
+    /// (DevToolsToggle.Command).
+    func runDevTools(_ command: DevToolsToggle.Command) {
+        guard let rt = visibleRuntime else { return }
+        let (effect, frontend) = rt.devTools.run(command)
+        // A press made while DevTools close is done when they reopen (DevToolsToggle.didClose),
+        // one made while they open once the frontend is up.
+        rt.browser.devToolsAction = frontend
+        perform(effect, on: rt)
+    }
+
+    private func perform(_ effect: DevToolsToggle.Effect, on rt: TabRuntime) {
+        switch effect {
+        case .show: rt.browser.showDevTools()
+        case .close: rt.browser.closeDevTools()
+        case .frontend: rt.browser.applyDevToolsAction()
+        case .none: break
+        }
+    }
+
+    /// Chrome's docked frontend reported where the page goes (CraCore DevToolsPlaceholder): `bounds`
+    /// are points with a top-left origin inside a DevTools window whose content measured `frontendSize`.
+    private(set) var devToolsPlaceholders: [UUID: DevToolsPlaceholder] = [:]
+    /// False once the user undocked Chrome's frontend into its own window.
+    private(set) var devToolsDockedState: [UUID: Bool] = [:]
+
+    func browser(_ browser: CraBrowser, devToolsPageBounds bounds: NSRect) {
+        guard let id = tabID(of: browser) else { return }
+        // Undocked frontends still report bounds (device mode); only setIsDocked changes the dock state.
+        guard devToolsDockedState[id] != false else { return }
+        // The frontend's size: its card's area when the engine's frontend is in one (EmbeddedDevTools), else its window's.
+        let window = devToolsViews[id]?.window
+        let embedded = EmbeddedDevTools.holder(of: window).flatMap { $0.superview != nil ? $0 : nil }
+        let size = embedded?.bounds.size ?? window?.contentView?.bounds.size ?? NSSize(width: bounds.maxX, height: bounds.maxY)
+        devToolsPlaceholders[id] = DevToolsPlaceholder(bounds: bounds, frontendSize: size)
+        delegate?.browserManagerDevToolsPageBoundsChanged()
+    }
+
+    func browser(_ browser: CraBrowser, devToolsDocked docked: Bool) {
+        guard let id = tabID(of: browser) else { return }
+        if !docked { devToolsPlaceholders[id] = nil }
+        guard devToolsDockedState[id] != docked else { return }
+        devToolsDockedState[id] = docked
+        delegate?.browserManagerDevToolsChanged()
+    }
+
+    func browser(_ browser: CraBrowser, devToolsShowsPanel panel: String) {
+        guard let id = tabID(of: browser) else { return }
+        runtimes[id]?.devTools.didShowPanel(panel)
+    }
+
+    /// CEF's window for the visible tab's DevTools, if any.
+    var visibleDevToolsWindow: NSWindow? { visibleTabID.flatMap { devToolsViews[$0]?.window } }
+
+    /// DevTools windows on screen, by tab: every pane's Chrome-style frontend (it docks
+    /// inside its own pane), and an Alloy frontend only for the focused tab (the shell
+    /// has one dock).
+    var visibleDevToolsWindows: [UUID: NSWindow] {
+        var out: [UUID: NSWindow] = [:]
+        for id in visibleTabIDs {
+            guard let w = devToolsViews[id]?.window else { continue }
+            if id == visibleTabID || runtimes[id]?.hostWindow != nil || EmbeddedDevTools.applies(to: runtimes[id]?.browser) { out[id] = w }
+        }
+        return out
+    }
+
+    private func syncDevToolsVisibility() {
+        delegate?.browserManagerDevToolsChanged()
+    }
+
+    func browser(_ browser: CraBrowser, handleKeyEvent event: NSEvent) -> Bool {
+        delegate?.browserManagerHandleKey(event) ?? false
+    }
+
+    func browser(_ browser: CraBrowser, handleUnhandledKeyEvent event: NSEvent) -> Bool {
+        delegate?.browserManagerHandleUnhandledKey(event) ?? false
+    }
+
+    func browser(_ browser: CraBrowser, didUpdateDownload download: CraDownloadInfo) {
+        // The delegate reads it during the call: Tidy Downloads names the file from that tab.
+        downloadSourceTab = tabID(of: browser)
+        delegate?.browserManager(download: download)
+        downloadSourceTab = nil
+    }
+
+    /// A page asks for the camera, microphone, notifications… Chrome asks in the tab that wants
+    /// it while that tab is in front, so a request from a tab behind waits until its tab is
+    /// shown, and cards come one at a time (PermissionAsk, #286, #371).
+    func browser(_ browser: CraBrowser, requestsPermissionForOrigin origin: String, kinds: UInt, completion: @escaping (Bool) -> Void) {
+        guard let id = tabID(of: browser) else {
+            // A page Cra already closed: Chromium drops the request with it.
+            CraLog.note(PermissionAsk.outcomeLine(origin: browser.isIncognito ? "(incognito)" : origin, kinds: kinds, outcome: .tabGone))
+            return
+        }
+        let logName = site(origin, id, browser)
+        let shown = visibleTabIDs.contains(id)
+        let waits = PermissionAsk.waits(tabShown: shown, sheetUp: permissionSheet != nil)
+        CraLog.note(PermissionAsk.requestLine(origin: logName, kinds: kinds, tab: String(id.uuidString.prefix(8)), shown: shown, waits: waits,
+                                              camera: CaptureAccess.camera, microphone: CaptureAccess.microphone))
+        let request = PermissionRequest(tabID: id, browser: browser, origin: origin, logName: logName, kinds: kinds, completion: completion)
+        if waits { waitingPermissions.append(request) } else { askPermission(request) }
+    }
+
+    /// Chromium dropped the page's request (it navigated, or a newer request replaced it): its
+    /// sheet goes, or it no longer waits. Nothing is answered.
+    func browserWithdrewPermissionRequest(_ browser: CraBrowser) {
+        dropPermissions(.withdrawn) { $0.browser === browser }
+    }
+
+    /// Arc's permission card (#371) in the top left corner of the tab's page: it leaves the page
+    /// and the window usable, where Cra's sheet blocked the whole window until it was answered.
+    private func askPermission(_ request: PermissionRequest) {
+        let alert = PermissionPopover(title: PermissionPrompt.message(origin: request.origin, kinds: request.kinds),
+                                      actions: [DialogAction("Allow"), DialogAction("Not Now", role: .cancel)])
+        guard container.window != nil else { request.completion(false); return }
+        permissionSheet = (request, alert)
+        let page = paneHost?(request.tabID) ?? container
+        alert.present(relativeTo: page.bounds, of: page) { [weak self] resp in
+            // A card Cra took down (the request was withdrawn, its tab went behind) answers nothing.
+            guard let self, self.permissionSheet?.dialog === alert else { return }
+            self.permissionSheet = nil
+            guard resp != .abort else {
+                // Taken down unanswered by AppKit (the window closed): it waits again, and asks
+                // again only while the window still shows. A closing window drops it with its tabs.
+                self.waitingPermissions.insert(request, at: 0)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.container.window?.isVisible == true else { return }
+                    self.askNextPermission()
+                }
+                return
+            }
+            let allowed = resp == .alertFirstButtonReturn
+            CraLog.note(PermissionAsk.outcomeLine(origin: request.logName, kinds: request.kinds, outcome: allowed ? .allowed : .blocked))
+            request.completion(allowed)
+            self.askNextPermission()
+        }
+    }
+
+    /// The card's tab went behind (a tab switch, which the sheet never allowed): the card
+    /// goes, unanswered, and its request waits first in line for its tab, as Chrome's does.
+    private func stepAsideIfHidden() {
+        guard let up = permissionSheet, PermissionAsk.stepsAside(tabShown: visibleTabIDs.contains(up.request.tabID)) else { return }
+        permissionSheet = nil
+        up.dialog.close()
+        waitingPermissions.insert(up.request, at: 0)
+        CraLog.note(PermissionAsk.asideLine(origin: up.request.logName, kinds: up.request.kinds))
+    }
+
+    /// The oldest waiting request whose tab is on screen asks, once no card is up.
+    private func askNextPermission() {
+        guard permissionSheet == nil,
+              let i = waitingPermissions.firstIndex(where: { visibleTabIDs.contains($0.tabID) }) else { return }
+        let request = waitingPermissions.remove(at: i)
+        CraLog.note(PermissionAsk.shownLine(origin: request.logName, kinds: request.kinds))
+        askPermission(request)
+    }
+
+    /// The tab's page left this manager: it closed or slept, or it moved to another window or a
+    /// Little Window. Its requests go with the page to its new owner, once the move is done; a
+    /// page that is closing drops them unanswered, as Chromium does.
+    private func handOffPermissions(of tabID: UUID, browser: CraBrowser) {
+        var moving = waitingPermissions.filter { $0.tabID == tabID }
+        waitingPermissions.removeAll { $0.tabID == tabID }
+        if let sheet = permissionSheet, sheet.request.tabID == tabID {
+            permissionSheet = nil
+            sheet.dialog.close()
+            moving.insert(sheet.request, at: 0)
+        }
+        guard !moving.isEmpty else { return }
+        askNextPermission()
+        DispatchQueue.main.async { [weak self, weak browser] in
+            for r in moving {
+                guard let browser, let owner = browser.delegate, owner !== self || self?.tabID(of: browser) != nil else {
+                    CraLog.note(PermissionAsk.outcomeLine(origin: r.logName, kinds: r.kinds, outcome: .tabGone))
+                    continue
+                }
+                owner.browser(browser, requestsPermissionForOrigin: r.origin, kinds: r.kinds, completion: r.completion)
+            }
+        }
+    }
+
+    /// Requests that will never be answered: they leave the queue, and a sheet up for one goes.
+    private func dropPermissions(_ outcome: PermissionAsk.Outcome, where matches: (PermissionRequest) -> Bool) {
+        var dropped = waitingPermissions.filter(matches)
+        waitingPermissions.removeAll(where: matches)
+        if let sheet = permissionSheet, matches(sheet.request) {
+            permissionSheet = nil
+            sheet.dialog.close()
+            dropped.append(sheet.request)
+        }
+        guard !dropped.isEmpty else { return }
+        for r in dropped { CraLog.note(PermissionAsk.outcomeLine(origin: r.logName, kinds: r.kinds, outcome: outcome)) }
+        askNextPermission()
+    }
+
+    func browserDidReceiveFocus(_ browser: CraBrowser) {
+        guard let id = tabID(of: browser) else { return }
+        delegate?.browserManagerFocusedBrowser(id)
+    }
+
+    func browserRequestsActivation(_ browser: CraBrowser, byPage: Bool) {
+        guard let id = tabID(of: browser) else { return }
+        delegate?.browserManagerActivationRequested(id, byPage: byPage)
+    }
+
+    func browserDidClose(_ browser: CraBrowser) {
+        closingBrowsers[ObjectIdentifier(browser)] = nil
+        guard let id = tabID(of: browser) else { return }
+        _ = release(id)
+        delegate?.browserManagerDidUpdate(id)
+        delegate?.browserManagerPageWindowsChanged(focus: false)
+        // window.close() (a sign-in or payment popup finishing): the tab goes, like Chrome.
+        if browser.closedByPage { log(id, "closed by its page"); delegate?.browserManagerPageClosedTab(id) }
+    }
+}
+
+/// The last middle click (button 2's release) in any of Cra's windows: the view under it, the keys
+/// held and when (GitHub #498). Chromium opens a middle-clicked link as a tab behind the page, as it
+/// does a ⌘-click, and only a click on the left button is noted by the engine.
+@MainActor
+enum PageMiddleClick {
+    private static weak var view: NSView?
+    private static var time: TimeInterval = -1
+    private static var modifiers: UInt = 0
+    private static var monitor: Any?
+
+    static func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .otherMouseUp) { event in
+            guard event.buttonNumber == 2, let window = event.window else { return event }
+            let root = window.contentView?.superview ?? window.contentView
+            view = root?.hitTest(event.locationInWindow)
+            modifiers = event.modifierFlags.rawValue
+            time = event.timestamp
+            return event
+        }
+    }
+
+    /// Seconds since the last middle click and its keys, when it landed in `page` (a page's view);
+    /// age -1 when it didn't. Split panes share a window, so the pane is the page under the click.
+    static func last(in page: NSView) -> (age: TimeInterval, modifiers: UInt) {
+        guard time >= 0, let view, view.isDescendant(of: page) else { return (-1, 0) }
+        return (ProcessInfo.processInfo.systemUptime - time, modifiers)
+    }
+
+    /// One click, one pane.
+    static func taken() { time = -1 }
+}

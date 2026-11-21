@@ -1,0 +1,90 @@
+import Foundation
+
+/// What the performance recorder times, in milliseconds (GitHub #91). The raw values are the
+/// keys in perf.json, so renaming one changes the file's schema.
+public enum PerfMetric: String, Codable, CaseIterable, Sendable {
+    /// Putting other tabs on screen (BrowserManager.show), the part on the main thread, without
+    /// making a page for a tab that had none (that is `pageCreate`).
+    case tabSwitch
+    /// Making a tab's page: Chromium's view, its window and the browser object.
+    case pageCreate
+    /// A main-frame navigation, from loading to loaded.
+    case pageLoad
+    /// A tab that tab sleeping closed, shown again until its page finished loading.
+    case tabWake
+    /// A data-folder JSON file decoded at launch, or encoded and written. Saves run on the
+    /// persistence queue, so `jsonSave` is that queue's time, never a main-thread stall.
+    case jsonLoad
+    case jsonSave
+    /// Long tasks (50 ms or more) in the visible tab's page.
+    case longTask
+    /// Framing an extension's popup once Chrome shows it (ExtensionPopupWindow.present).
+    case extensionPopup
+}
+
+/// What the recorder counts. Some carry a key (`loadError` the error code, `sleepRefusal` the
+/// reason); perf.json lists those per key.
+public enum PerfCounter: String, Codable, CaseIterable, Sendable {
+    /// A main-frame load that failed; the key is Chromium's net error code.
+    case loadError
+    /// A page's renderer that crashed ("Aw, Snap!"); the key is how (crashed, killed, out of
+    /// memory…, one of `pageCrashes`). A clean end isn't one: PerfState drops it.
+    case rendererTerminated
+    /// Chromium's "Page Unresponsive" (about 15 s without handling input), and its recovery.
+    case rendererUnresponsive
+    case rendererResponsive
+    /// Tab sleeping closed a page; the key is why (the policy).
+    case tabSlept
+    /// A hidden page put to sleep because its process passed PerfRunawaySleep.bytes; the key is
+    /// its size ("9.1 GB"), and an event names the site.
+    case runawaySlept
+    /// A page that refused to sleep, once per page and reason (what cra.log says); the key is the
+    /// reason. `sleepRetry` counts the same page refusing again after the back-off (GitHub #214:
+    /// one page asked eight times read like eight pages).
+    case sleepRefusal
+    case sleepRetry
+    /// A candidate tab sleeping passed over without asking its page (loading, Picture in
+    /// Picture, DevTools…), once per page and reason; the key is TabSleepPolicy.Hold.
+    case sleepSkip
+    /// A data-folder JSON file written; the key is its name, so `jsonSave`'s count can be told
+    /// apart by file (GitHub #214).
+    case fileSaved
+}
+
+public extension PerfCounter {
+    /// How a renderer ended, as the engine (bridge.mm) and CEF (CraCEF.mm) name the statuses that
+    /// end a page in "Aw, Snap!". Everything else arrives as "unknown": on the Mac that is a clean
+    /// end (Chromium's NORMAL_TERMINATION or STILL_RUNNING), which is how tab sleep's discard ends
+    /// a page's renderer (FastShutdown), and Chrome shows nothing for it.
+    static let pageCrashes: Set<String> = ["abnormal termination", "killed", "crashed", "out of memory",
+                                           "launch failed", "integrity failure"]
+}
+
+/// The kinds of process Cra runs, from the name macOS gives each one.
+public enum PerfProcessKind: String, Codable, CaseIterable, Sendable {
+    case browser, renderer, gpu, utility, other
+
+    /// Named renderer/GPU helpers already identify their role. Only generic helpers need
+    /// a process-argument lookup; avoid reading every renderer's full argument/environment buffer.
+    public static func needsType(name: String) -> Bool {
+        name.contains("Helper") && !name.hasSuffix("(Renderer)") && !name.hasSuffix("(GPU)")
+    }
+
+    /// Chromium's `--type=` argument says what a helper is: CEF runs its GPU process from the plain
+    /// `Cra Helper` app, so the app's name alone would call it a utility. Without one (it couldn't
+    /// be read), the name decides: `Cra Helper (Renderer)`, `(GPU)`, other helpers are utilities, and
+    /// anything that isn't a helper (`sample` at a hang) is other.
+    public static func of(name: String, isSelf: Bool, type: String? = nil) -> PerfProcessKind {
+        if isSelf { return .browser }
+        switch type {
+        case "renderer": return .renderer
+        case "gpu-process": return .gpu
+        case .some: return .utility
+        case nil: break
+        }
+        guard name.contains("Helper") else { return .other }
+        if name.hasSuffix("(Renderer)") { return .renderer }
+        if name.hasSuffix("(GPU)") { return .gpu }
+        return .utility
+    }
+}

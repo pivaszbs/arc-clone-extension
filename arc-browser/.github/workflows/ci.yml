@@ -1,0 +1,133 @@
+name: CI
+
+# A change to docs alone runs nothing (and so doesn't cancel the run in progress).
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    # No Chromium download: Packages/CraCore and the harnesses compile only the files they test.
+    runs-on: macos-26
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Lint
+        run: scripts/lint.py
+
+      # Every test once, compiled with coverage; a failing test fails this step with its output.
+      # Gates: changed lines under test >= 70 %, CraCore >= 85 % (docs/testing.md).
+      - name: CraCore, harnesses and coverage
+        if: github.event_name == 'pull_request' || github.event.before != '0000000000000000000000000000000000000000'
+        run: |
+          set -o pipefail
+          scripts/coverage.py --base "${{ github.event.pull_request.base.sha || github.event.before }}" | tee coverage.md
+
+      # A new branch's first push has no base to measure changed lines against.
+      - name: CraCore and harnesses
+        if: github.event_name != 'pull_request' && github.event.before == '0000000000000000000000000000000000000000'
+        run: scripts/test.sh
+
+      # Fork pull requests get a read-only token: the job summary has the same table.
+      - name: Coverage comment
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          [ -s coverage.md ] || exit 0
+          { echo "### Coverage"; echo; cat coverage.md; } > comment.md
+          gh pr comment "$PR" --body-file comment.md --edit-last 2>/dev/null || gh pr comment "$PR" --body-file comment.md
+
+  iphone:
+    name: Build the iPhone app
+    # No Chromium and no signing: the app, its widgets and share extension for the simulator.
+    # Its UI tests (docs/ios.md) take over ten minutes and run on a Mac, not here.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build for the iOS simulator
+        run: |
+          set -o pipefail
+          xcodebuild -project iOS/Cra.xcodeproj -scheme Cra -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build/ios \
+            CODE_SIGNING_ALLOWED=NO build | tail -20
+
+  build:
+    name: Build Cra.app
+    # Same runner as release.yml, so CI builds what ships.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache the engine
+        uses: actions/cache@v6
+        with:
+          path: vendor/engine
+          key: engine-${{ runner.arch }}-${{ hashFiles('scripts/fetch-engine.sh') }}
+
+      - name: Build (debug, ad-hoc signed)
+        run: scripts/build.sh debug
+
+      - name: Verify bundle
+        run: |
+          codesign --verify --deep --strict --verbose=2 build/Cra.app
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' build/Cra.app/Contents/Info.plist
+
+      # Launches the app three times and quits it; fails on a crash, hang or crash report.
+      # Not blocking until it has proved steady on the hosted runners.
+      - name: Smoke test
+        continue-on-error: true
+        timeout-minutes: 5
+        run: Tests/smoke-launch.sh build/Cra.app
+
+      # One short journey on every pull request (thirty tabs put to sleep); the full set and the
+      # component snapshots run nightly (nightly.yml). Not blocking until steady on these runners.
+      - name: Scenario
+        continue-on-error: true
+        timeout-minutes: 5
+        run: scripts/scenario.sh sleep-tabs
+
+      - name: Keep scenario logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scenario-logs
+          path: build/scenarios
+          if-no-files-found: ignore
+
+  build-intel:
+    name: Build Cra.app (Intel)
+    # Every release ships an Intel copy too (scripts/release.sh), cross-compiled on this runner.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache the engine
+        uses: actions/cache@v6
+        with:
+          path: vendor/engine-x86_64
+          key: engine-x86_64-${{ hashFiles('scripts/fetch-engine.sh') }}
+
+      - name: Build (debug, ad-hoc signed)
+        run: CRA_ARCH=x86_64 scripts/build.sh debug
+
+      - name: Verify bundle
+        run: |
+          codesign --verify --deep --strict --verbose=2 build/x86_64/Cra.app
+          lipo -archs build/x86_64/Cra.app/Contents/MacOS/Cra

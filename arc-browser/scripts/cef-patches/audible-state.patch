@@ -1,0 +1,147 @@
+diff --git a/cef/libcef/browser/browser_contents_delegate.cc b/cef/libcef/browser/browser_contents_delegate.cc
+index fc99b7df6..15643f863 100644
+--- a/cef/libcef/browser/browser_contents_delegate.cc
++++ b/cef/libcef/browser/browser_contents_delegate.cc
+@@ -12,9 +12,11 @@
+ #include "cef/libcef/browser/native/cursor_util.h"
+ #include "cef/libcef/common/api_version_util.h"
+ #include "cef/libcef/common/frame_util.h"
++#include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
+ #include "chrome/common/chrome_result_codes.h"
+ #include "components/input/native_web_keyboard_event.h"
++#include "content/browser/media/session/media_session_impl.h"
+ #include "content/browser/renderer_host/render_widget_host_impl.h"
+ #include "content/public/browser/focused_node_details.h"
+ #include "content/public/browser/keyboard_event_processing_result.h"
+@@ -87,7 +89,14 @@ class CefWidgetHostInterceptor
+ 
+ CefBrowserContentsDelegate::CefBrowserContentsDelegate(
+     scoped_refptr<CefBrowserInfo> browser_info)
+-    : browser_info_(browser_info) {}
++    : browser_info_(browser_info) {
++  // Cra: Chrome's tab recording indicator. CEF's OnMediaAccessChange only
++  // fires for streams CEF's own permission flow allowed; Chrome-style pages
++  // that get the camera or microphone through Chrome's flow never report it.
++  capture_observation_.Observe(MediaCaptureDevicesDispatcher::GetInstance()
++                                   ->GetMediaStreamCaptureIndicator()
++                                   .get());
++}
+ 
+ void CefBrowserContentsDelegate::ObserveWebContents(
+     content::WebContents* new_contents) {
+@@ -620,6 +629,61 @@ void CefBrowserContentsDelegate::DidFinishLoad(
+   OnLoadEnd(frame, validated_url, http_status_code);
+ }
+ 
++// Cra: Chromium's audible state (Chrome's tab speaker icon), which CEF has no
++// callback for. Delivered as a "Cra.audible" message from PID_BROWSER with the
++// new state, then whether the page's media session is one Chrome's global
++// media controls offer (MediaSessionImpl::IsControllable): a sound under 5 s,
++// such as a notification ding, or Web Audio alone is not.
++void CefBrowserContentsDelegate::OnAudioStateChanged(bool audible) {
++  auto c = client();
++  auto b = browser();
++  if (!c || !b) {
++    return;
++  }
++  auto* session = static_cast<content::MediaSessionImpl*>(
++      content::MediaSession::GetIfExists(web_contents()));
++  CefRefPtr<CefProcessMessage> message =
++      CefProcessMessage::Create("Cra.audible");
++  message->GetArgumentList()->SetBool(0, audible);
++  message->GetArgumentList()->SetBool(1, session && session->IsControllable());
++  c->OnProcessMessageReceived(b, b->GetMainFrame(), PID_BROWSER, message);
++}
++
++// Cra: whether the page uses the camera and the microphone, as Chrome's tab
++// recording indicator (MediaStreamCaptureIndicator) counts them. Delivered as a
++// "Cra.capture" message from PID_BROWSER with the camera and microphone states.
++void CefBrowserContentsDelegate::OnIsCapturingVideoChanged(
++    content::WebContents* web_contents,
++    bool is_capturing_video) {
++  if (web_contents == this->web_contents()) {
++    SendCaptureState();
++  }
++}
++
++void CefBrowserContentsDelegate::OnIsCapturingAudioChanged(
++    content::WebContents* web_contents,
++    bool is_capturing_audio) {
++  if (web_contents == this->web_contents()) {
++    SendCaptureState();
++  }
++}
++
++void CefBrowserContentsDelegate::SendCaptureState() {
++  auto c = client();
++  auto b = browser();
++  auto wc = web_contents();
++  if (!c || !b || !wc) {
++    return;
++  }
++  auto indicator =
++      MediaCaptureDevicesDispatcher::GetInstance()->GetMediaStreamCaptureIndicator();
++  CefRefPtr<CefProcessMessage> message =
++      CefProcessMessage::Create("Cra.capture");
++  message->GetArgumentList()->SetBool(0, indicator->IsCapturingVideo(wc));
++  message->GetArgumentList()->SetBool(1, indicator->IsCapturingAudio(wc));
++  c->OnProcessMessageReceived(b, b->GetMainFrame(), PID_BROWSER, message);
++}
++
+ void CefBrowserContentsDelegate::TitleWasSet(content::NavigationEntry* entry) {
+   // |entry| may be NULL if a popup is created via window.open and never
+   // navigated.
+diff --git a/cef/libcef/browser/browser_contents_delegate.h b/cef/libcef/browser/browser_contents_delegate.h
+index ae50fee..1e99f05 100644
+--- a/cef/libcef/browser/browser_contents_delegate.h
++++ b/cef/libcef/browser/browser_contents_delegate.h
+@@ -10,7 +10,9 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/observer_list.h"
++#include "base/scoped_observation.h"
+ #include "cef/libcef/browser/frame_host_impl.h"
++#include "chrome/browser/media/webrtc/media_stream_capture_indicator.h"
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "content/public/browser/web_contents_observer.h"
+ 
+@@ -45,8 +47,10 @@ constexpr inline CefBrowserContentsState operator|(
+ // Tracks state and executes client callbacks based on WebContents callbacks.
+ // Includes functionality that is shared by Alloy and Chrome styles. Only
+ // accessed on the UI thread.
+-class CefBrowserContentsDelegate : public content::WebContentsDelegate,
+-                                   public content::WebContentsObserver {
++class CefBrowserContentsDelegate
++    : public content::WebContentsDelegate,
++      public content::WebContentsObserver,
++      public MediaStreamCaptureIndicator::Observer {
+  public:
+   using State = CefBrowserContentsState;
+ 
+@@ -134,6 +138,14 @@ class CefBrowserContentsDelegate : public content::WebContentsDelegate,
+   void PrimaryMainDocumentElementAvailable() override;
+   void LoadProgressChanged(double progress) override;
+   void DidStopLoading() override;
++  void OnAudioStateChanged(bool audible) override;
++
++  // MediaStreamCaptureIndicator::Observer methods (Cra: camera and microphone
++  // use, see SendCaptureState).
++  void OnIsCapturingVideoChanged(content::WebContents* web_contents,
++                                 bool is_capturing_video) override;
++  void OnIsCapturingAudioChanged(content::WebContents* web_contents,
++                                 bool is_capturing_audio) override;
+   void DidFinishNavigation(
+       content::NavigationHandle* navigation_handle) override;
+   void DidFailLoad(content::RenderFrameHost* render_frame_host,
+@@ -177,6 +189,10 @@ class CefBrowserContentsDelegate : public content::WebContentsDelegate,
+   bool OnSetFocus(cef_focus_source_t source);
+ 
+  private:
++  void SendCaptureState();
++  base::ScopedObservation<MediaStreamCaptureIndicator,
++                          MediaStreamCaptureIndicator::Observer>
++      capture_observation_{this};
+   CefRefPtr<CefClient> client() const;
+   CefRefPtr<CefBrowser> browser() const;
+   CefBrowserPlatformDelegate* platform_delegate() const;

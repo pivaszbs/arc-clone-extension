@@ -1,0 +1,3153 @@
+import AppKit
+import SwiftUI
+
+// The rows of a space's tab list, drawn by AppKit (see SpaceListView). Each row is a plain
+// layer-backed view: hover comes from the list's one tracking area, clicks and drags from the
+// row's own mouse events. Rows draw what their model says and nothing else; the list rebuilds
+// the models when the store changes and hands a row a new one only when it differs.
+
+/// The palette's colours as AppKit colours, converted once per list update.
+struct SidebarColors: Equatable {
+    var isDark = false
+    var textPrimary = NSColor.labelColor
+    var textSecondary = NSColor.secondaryLabelColor
+    var textTertiary = NSColor.tertiaryLabelColor
+    var hoverFill = NSColor.clear
+    var selectedFill = NSColor.clear
+    var separator = NSColor.separatorColor
+    var pillFill = NSColor.clear
+    var pillHoverFill = NSColor.clear
+    var countBadgeFill = NSColor.clear
+
+    init() {}
+
+    init(_ p: SpacePalette) {
+        isDark = p.isDark
+        textPrimary = NSColor(p.textPrimary)
+        textSecondary = NSColor(p.textSecondary)
+        textTertiary = NSColor(p.textTertiary)
+        hoverFill = NSColor(p.hoverFill)
+        selectedFill = NSColor(p.selectedFill)
+        separator = NSColor(p.separator)
+        pillFill = NSColor(p.pillFill)
+        pillHoverFill = NSColor(p.pillHoverFill)
+        countBadgeFill = NSColor(p.countBadgeFill)
+    }
+
+    /// SidebarIconButton's glyph tone outside the header (no active state).
+    var glyph: NSColor { isDark ? NSColor.white.withAlphaComponent(0.55) : NSColor.black.withAlphaComponent(0.26) }
+    /// The space header's title and a tab group's name, dimmer than other secondary text: white 0.45
+    /// on dark themes (1 Nov), black 0.46 on light ones (Arc 1.172.1 at 1x, 9 Nov, GitHub #293).
+    var sectionTitle: NSColor {
+        let t = SidebarTones.sectionTitle(dark: isDark)
+        return (t.white ? NSColor.white : NSColor.black).withAlphaComponent(t.alpha)
+    }
+    /// A one-colour favicon or GitHub's mark on the sidebar.
+    var monoGlyph: NSColor { isDark ? NSColor.white.withAlphaComponent(0.92) : NSColor.black.withAlphaComponent(0.85) }
+}
+
+enum SidebarSymbols {
+    static func image(_ name: String, size: CGFloat, weight: NSFont.Weight = .regular) -> NSImage? {
+        NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: size, weight: weight))
+    }
+
+    /// The tab row's ✕ (or − for a pinned tab that stays): Arc strokes two 2 pt round-capped lines
+    /// 4.25 pt out from a centre on a whole point, crisp at 1x. No SF Symbol size matches it, and an
+    /// NSImage drawn for it came out thinner and off-centre at 1x, so the button strokes this itself.
+    static func closeMark(minus: Bool = false, centre c: CGPoint) -> CGPath {
+        let d: CGFloat = 4.25
+        let p = CGMutablePath()
+        if minus {
+            p.move(to: CGPoint(x: c.x - d, y: c.y)); p.addLine(to: CGPoint(x: c.x + d, y: c.y))
+        } else {
+            p.move(to: CGPoint(x: c.x - d, y: c.y - d)); p.addLine(to: CGPoint(x: c.x + d, y: c.y + d))
+            p.move(to: CGPoint(x: c.x - d, y: c.y + d)); p.addLine(to: CGPoint(x: c.x + d, y: c.y - d))
+        }
+        return p
+    }
+}
+
+extension NSImageView {
+    /// Arc's refresh ⇄ stop swap, fitted frame by frame to a 120 fps capture of Arc 1.170 (30 Oct): over
+    /// ~90 ms the old glyph fades while shrinking to 0.7 and the new one fades in growing from 0.7,
+    /// both easing in and out. (The system's Replace transition un-draws arrow.clockwise over 0.8 s.)
+    func swapSymbol(_ image: NSImage?) {
+        guard let superview, window != nil, let old = self.image, image != nil else { self.image = image; return }
+        let ghost = NSImageView(frame: frame)
+        ghost.wantsLayer = true
+        ghost.imageScaling = imageScaling
+        ghost.image = old
+        ghost.contentTintColor = contentTintColor
+        superview.addSubview(ghost, positioned: .above, relativeTo: self)
+        self.image = image
+        guard let layer, let ghostLayer = ghost.layer else { ghost.removeFromSuperview(); return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock { ghost.removeFromSuperview() }
+        // A press turn still settling goes out with the old glyph; the new one starts square.
+        ghostLayer.transform = layer.transform
+        for key in layer.animationKeys() ?? [] where key.hasPrefix("turn") {
+            if let turn = layer.animation(forKey: key) { ghostLayer.add(turn, forKey: key) }
+            layer.removeAnimation(forKey: key)
+        }
+        layer.transform = CATransform3DIdentity
+        layer.setValue(nil, forKey: "turn")
+        ghostLayer.opacity = 0
+        ghostLayer.add(Self.swapAnimation(ghostLayer, fadeIn: false), forKey: "swap")
+        layer.add(Self.swapAnimation(layer, fadeIn: true), forKey: "swap")
+        CATransaction.commit()
+    }
+
+    private static func swapAnimation(_ layer: CALayer, fadeIn: Bool) -> CAAnimationGroup {
+        let c = centre(of: layer)
+        var small = CATransform3DMakeTranslation(c.x, c.y, 0)
+        small = CATransform3DScale(small, 0.7, 0.7, 1)
+        small = CATransform3DTranslate(small, -c.x, -c.y, 0)
+        // Added to whatever turn the glyph has.
+        let scale = CABasicAnimation(keyPath: "transform")
+        scale.isAdditive = true
+        scale.fromValue = NSValue(caTransform3D: fadeIn ? small : CATransform3DIdentity)
+        scale.toValue = NSValue(caTransform3D: fadeIn ? CATransform3DIdentity : small)
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = fadeIn ? 0 : 1
+        fade.toValue = fadeIn ? 1 : 0
+        let group = CAAnimationGroup()
+        group.animations = [scale, fade]
+        group.duration = 0.09
+        group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        return group
+    }
+
+    /// Arc's press on the refresh arrow (same capture): a quarter turn clockwise about the arrow's
+    /// circle while the button is down, back on release, 0.15 s ease-in-out each way. As in SwiftUI a
+    /// turn is added on top of one still running, so a quick click only nudges the arrow.
+    func pressTurn(_ down: Bool) {
+        guard let layer else { return }
+        let to: CGFloat = down ? .pi / 2 : 0
+        let from = layer.value(forKey: "turn") as? CGFloat ?? 0
+        guard to != from else { return }
+        layer.setValue(to, forKey: "turn")
+        let flipped = layer.contentsAreFlipped()
+        // arrow.clockwise's circle sits 1/16 of the image's height below the image's centre.
+        var c = Self.centre(of: layer)
+        c.y += (flipped ? 1 : -1) * (image?.size.height ?? 0) / 16
+        func turned(_ angle: CGFloat) -> CATransform3D {
+            var t = CATransform3DMakeTranslation(c.x, c.y, 0)
+            t = CATransform3DRotate(t, flipped ? angle : -angle, 0, 0, 1)
+            return CATransform3DTranslate(t, -c.x, -c.y, 0)
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.transform = turned(to)
+        if window != nil {
+            // Even steps of angle, eased as a whole: a single matrix tween would swing the pivot.
+            let steps = 30
+            let turn = CAKeyframeAnimation(keyPath: "transform")
+            turn.values = (0...steps).map { NSValue(caTransform3D: turned((from - to) * CGFloat(steps - $0) / CGFloat(steps))) }
+            turn.isAdditive = true
+            turn.duration = 0.15
+            turn.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            turn.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil)
+            layer.add(turn, forKey: "turn\(turn.beginTime)")
+        }
+        CATransaction.commit()
+    }
+
+    /// The layer's centre relative to its anchor: AppKit keeps a view layer's anchor where it likes.
+    private static func centre(of layer: CALayer) -> CGPoint {
+        CGPoint(x: layer.bounds.width * (0.5 - layer.anchorPoint.x), y: layer.bounds.height * (0.5 - layer.anchorPoint.y))
+    }
+}
+
+enum SidebarText {
+    /// NSTextField draws its text this far in from its frame; labels are placed that much
+    /// further left so the text lands where SwiftUI's Text put it.
+    static let inset: CGFloat = 2
+}
+
+extension NSTextField {
+    static func sidebarLabel(size: CGFloat, weight: NSFont.Weight = .regular) -> NSTextField {
+        let l = NSTextField(labelWithString: "")
+        l.font = .systemFont(ofSize: size, weight: weight)
+        l.lineBreakMode = .byTruncatingTail
+        l.usesSingleLineMode = true
+        l.maximumNumberOfLines = 1
+        l.cell?.truncatesLastVisibleLine = true
+        return l
+    }
+}
+
+/// SidebarIconButton for AppKit rows: a glyph with a rounded hover fill and an Arc tooltip.
+final class SidebarGlyphButton: NSView {
+    var action: () -> Void
+    let size: NSSize
+    private let glyph = NSImageView()
+    /// The + that opens the creation menu, turned 45° into an × while it is open (Arc's PlusMenuIcon).
+    private var plusMark: CAShapeLayer?
+    private var shownSymbol: String?
+    /// Arc turns the refresh arrow while it is pressed (NSImageView.pressTurn).
+    private var turnsOnPress = false
+    /// Stroked instead of the image (SidebarSymbols.closeMark).
+    private var mark: CAShapeLayer?
+    private var markMinus = false
+    private var tip: ArcTooltipAnchorView?
+    private var hovering = false { didSet { refresh() } }
+    var colors: SidebarColors { didSet { if colors != oldValue { refresh() } } }
+
+    /// Header buttons follow the app's active state (nil: the plain sidebar tone).
+    var active: Bool? { didSet { if active != oldValue { refresh() } } }
+    var enabled = true { didSet { if enabled != oldValue { refresh() } } }
+    /// Drawn in this colour instead of the sidebar's glyph tone.
+    var tint: NSColor? { didSet { if tint != oldValue { refresh() } } }
+    /// Keeps the hover fill while what it opened is open (the player's volume drawer).
+    var highlighted = false { didSet { if highlighted != oldValue { refresh() } } }
+    /// Right-click, ⌃-click or a held press (ButtonHold): Back and Forward's history (#416).
+    var secondaryAction: ((NSView) -> Void)?
+    private let hold = ButtonHold()
+
+    init(symbol: String, size: CGFloat, height: CGFloat? = nil, iconSize: CGFloat, weight: NSFont.Weight = .medium, help: String,
+         optionHelp: String? = nil, colors: SidebarColors, action: @escaping () -> Void) {
+        self.size = NSSize(width: size, height: height ?? min(size, 28))
+        self.colors = colors
+        self.action = action
+        super.init(frame: NSRect(origin: .zero, size: self.size))
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.cornerCurve = .continuous
+        glyph.image = SidebarSymbols.image(symbol, size: iconSize, weight: weight)
+        shownSymbol = symbol
+        glyph.imageScaling = .scaleNone
+        glyph.frame = bounds
+        glyph.autoresizingMask = [.width, .height]
+        addSubview(glyph)
+        if !help.isEmpty {
+            tip = ArcTooltipAnchorView.attach(to: self, help: help)
+            tip?.optionText = optionHelp
+        }
+        refresh()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Shows Arc's 14 × 14 pt menu + in place of the image; `open` turns it into an × on a spring.
+    func setMenuOpen(_ open: Bool, animated: Bool = true) {
+        let m: CAShapeLayer
+        if let plusMark {
+            m = plusMark
+        } else {
+            m = CAShapeLayer()
+            m.fillColor = nil
+            m.lineWidth = 2
+            m.lineCap = .round
+            m.actions = ["path": NSNull(), "strokeColor": NSNull(), "hidden": NSNull(), "bounds": NSNull(), "position": NSNull(), "transform": NSNull()]
+            layer?.addSublayer(m)
+            plusMark = m
+            needsLayout = true
+            refresh()
+        }
+        glyph.isHidden = true
+        mark?.isHidden = true
+        m.isHidden = false
+        SidebarPlusMark.turn(m, open: open, animated: animated && window != nil)
+    }
+
+    /// `animated` swaps another symbol in the way Arc swaps refresh and stop.
+    func setSymbol(_ symbol: String, iconSize: CGFloat, weight: NSFont.Weight = .medium, help: String, animated: Bool = false) {
+        let image = SidebarSymbols.image(symbol, size: iconSize, weight: weight)
+        if animated, shownSymbol != nil, shownSymbol != symbol {
+            glyph.swapSymbol(image)
+            setHelp(help)
+        } else {
+            setGlyph(image, help: help)
+        }
+        shownSymbol = symbol
+        turnsOnPress = animated && symbol == "arrow.clockwise"
+    }
+
+    /// Arc's link → checkmark → link after a click on Copy Link (GitHub #361).
+    func playCopyCheck(glyphSize: CGFloat) { glyph.playCopyCheck(glyphSize: glyphSize) }
+
+    func setGlyph(_ image: NSImage?, help: String) {
+        shownSymbol = nil
+        glyph.image = image
+        glyph.isHidden = false
+        plusMark?.isHidden = true
+        mark?.isHidden = true
+        setHelp(help)
+    }
+
+    /// Shows the tab row's ✕ / − (SidebarSymbols.closeMark) in place of the image.
+    func setCloseMark(minus: Bool, help: String) {
+        if mark == nil {
+            let m = CAShapeLayer()
+            m.fillColor = nil
+            m.lineWidth = 2
+            m.lineCap = .round
+            m.actions = ["path": NSNull(), "strokeColor": NSNull(), "hidden": NSNull()]
+            layer?.addSublayer(m)
+            mark = m
+        }
+        markMinus = minus
+        shownSymbol = nil
+        glyph.isHidden = true
+        plusMark?.isHidden = true
+        mark?.isHidden = false
+        needsLayout = true
+        refresh()
+        setHelp(help)
+    }
+
+    /// cra://debug?glyphs=: the symbol it shows and its tip, as `symbol "tip"`.
+    var debugReadout: String { "\(shownSymbol ?? "none") \"\(tip?.text ?? "")\"" }
+
+    func setHelp(_ help: String) {
+        if let tip { (tip.text, tip.keys) = ArcTooltipLabel.split(help) } else if !help.isEmpty { tip = ArcTooltipAnchorView.attach(to: self, help: help) }
+    }
+
+    /// Arc 1.170 draws these glyphs at roughly 26% black while the app is in the background; with
+    /// the app active its header glyphs darken to ~59% black, disabled ones stay at ~24%.
+    private func refresh() {
+        let tint: NSColor
+        if colors.isDark {
+            // Arc's row ✕ is a touch brighter than its other glyphs (white 0.6 over the hover fill, 1x).
+            tint = enabled ? NSColor.white.withAlphaComponent(mark != nil ? 0.6 : 0.55) : colors.textTertiary.withAlphaComponent(colors.textTertiary.alphaComponent * 0.55)
+        } else if let active {
+            tint = NSColor.black.withAlphaComponent(enabled && active ? 0.59 : 0.24)
+        } else {
+            tint = enabled ? colors.glyph : colors.textTertiary.withAlphaComponent(colors.textTertiary.alphaComponent * 0.55)
+        }
+        glyph.contentTintColor = self.tint ?? tint
+        plusMark?.strokeColor = (self.tint ?? tint).cgColor
+        mark?.strokeColor = (self.tint ?? tint).cgColor
+        layer?.backgroundColor = ((hovering || highlighted) && enabled ? colors.hoverFill : .clear).cgColor
+    }
+
+    override func layout() {
+        super.layout()
+        // The centre on a whole point of the window: a dragged sidebar width is fractional.
+        let mid = convert(CGPoint(x: bounds.midX, y: bounds.midY), to: nil)
+        let centre = convert(CGPoint(x: mid.x.rounded(), y: mid.y.rounded()), from: nil)
+        if let plusMark {
+            // Turned about its own centre, so the layer sits on the glyph, not on the button.
+            plusMark.bounds = CGRect(x: 0, y: 0, width: 14, height: 14)
+            plusMark.position = centre
+            plusMark.path = SidebarPlusMark.path
+            plusMark.contentsScale = window?.backingScaleFactor ?? 2
+        }
+        guard let mark else { return }
+        mark.frame = bounds
+        mark.path = SidebarSymbols.closeMark(minus: markMinus, centre: centre)
+        mark.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        mark?.contentsScale = window?.backingScaleFactor ?? 2
+        plusMark?.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { takesClickFromChildWindow }
+    // Rows hide their buttons rather than remove them: a hidden one must not take the row's
+    // clicks or run the action it had when it last showed (AppKit's hitTest skips hidden views).
+    override func hitTest(_ point: NSPoint) -> NSView? { !isHiddenOrHasHiddenAncestor && frame.contains(point) ? self : nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas where t.owner === self { removeTrackingArea(t) }
+        // A new area under the pointer gets no mouseEntered, so without assumeInside it never sends
+        // the mouseExited either and the hover fill sticks (buttons moved under a resting pointer).
+        let inside = window.map { visibleRect.contains(convert($0.mouseLocationOutsideOfEventStream, from: nil)) } ?? false
+        var options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
+        if inside { options.insert(.assumeInside) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil))
+        if hovering != inside { hovering = inside }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // A button that appears under a resting pointer (a row's hover buttons) is hovered at once.
+        if let w = window { hovering = bounds.contains(convert(w.mouseLocationOutsideOfEventStream, from: nil)) }
+    }
+
+    // Rows hide their buttons rather than remove them; a button shown again under the pointer is hovered.
+    override func viewDidHide() { hovering = false }
+    override func viewDidUnhide() {
+        viewDidMoveToWindow()
+        if mark != nil { needsLayout = true }   // the row may have scrolled while hidden
+    }
+
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        if mark != nil { needsLayout = true }
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseDown(with event: NSEvent) {
+        if hold.down(event, enabled: enabled, secondary: secondaryAction.map { f in { [weak self] in if let self { f(self) } } }) { return }
+        if turnsOnPress, enabled { glyph.pressTurn(true) }
+    }
+    override func mouseDragged(with event: NSEvent) {
+        if turnsOnPress, enabled { glyph.pressTurn(bounds.contains(convert(event.locationInWindow, from: nil))) }
+    }
+    override func mouseUp(with event: NSEvent) {
+        if turnsOnPress { glyph.pressTurn(false) }
+        if hold.up() { return }
+        if enabled, bounds.contains(convert(event.locationInWindow, from: nil)) { action() }
+    }
+    override func rightMouseDown(with event: NSEvent) {
+        guard enabled, let secondaryAction else { return super.rightMouseDown(with: event) }
+        secondaryAction(self)
+    }
+}
+
+/// FaviconView for AppKit rows: the cached favicon, one-colour glyphs flipped to suit the fill,
+/// a globe while there is none.
+final class SidebarFaviconView: NSImageView {
+    private var shown: (NSImage?, Bool, Bool)?
+
+    init(size: CGFloat = CraMetrics.favicon) {
+        super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
+        imageScaling = .scaleProportionallyUpOrDown
+        wantsLayer = true
+        layer?.cornerCurve = .continuous
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func show(_ icon: NSImage?, flip: Bool, colors: SidebarColors) {
+        if let s = shown, s.0 === icon, s.1 == flip, s.2 == colors.isDark { return }
+        shown = (icon, flip, colors.isDark)
+        let size = frame.width
+        if let icon {
+            imageScaling = .scaleProportionallyUpOrDown
+            if flip {
+                let t = icon.copy() as! NSImage
+                t.isTemplate = true
+                image = t
+                contentTintColor = colors.monoGlyph
+            } else {
+                image = icon
+                contentTintColor = nil
+            }
+            layer?.cornerRadius = size * 0.22
+            layer?.masksToBounds = true
+        } else {
+            imageScaling = .scaleNone
+            image = SidebarSymbols.image("globe", size: size * 0.8)
+            contentTintColor = colors.textTertiary
+            layer?.masksToBounds = false
+        }
+    }
+
+    func showPluginMark(_ mark: NSImage, colors: SidebarColors, color: NSColor? = nil) {
+        shown = nil
+        imageScaling = .scaleProportionallyUpOrDown
+        image = mark
+        contentTintColor = color ?? colors.monoGlyph
+        layer?.masksToBounds = false
+    }
+}
+
+/// Arc's keyboard-focus ring: 2 pt systemYellow with black 6/6 dashes, inside the edge.
+final class FocusRingLayer: CALayer {
+    private let yellow = CAShapeLayer()
+    private let dashes = CAShapeLayer()
+    private var radius = CraMetrics.rowCorner
+    /// Arc's ring round the open tab of a site in developer mode (TabHighlightView,
+    /// TabHighlightState.developerTab, GitHub #139): systemYellow under black dashes at 80 %, a
+    /// radius of 11, and dashes cut to the edge's length (1/60, 1/80 or 1/100 of it by width).
+    private(set) var developer = false
+
+    convenience init(radius: CGFloat) {
+        self.init()
+        self.radius = radius
+    }
+
+    convenience init(developer: Bool) {
+        self.init()
+        guard developer else { return }
+        self.developer = true
+        radius = 11
+        yellow.strokeColor = NSColor.systemYellow.cgColor
+        dashes.strokeColor = NSColor.black.cgColor
+        dashes.opacity = 0.8
+    }
+
+    override init() {
+        super.init()
+        for l in [yellow, dashes] {
+            l.fillColor = nil
+            l.lineWidth = 2
+            addSublayer(l)
+        }
+        yellow.strokeColor = NSColor(red: 1, green: 0.8, blue: 0, alpha: 1).cgColor
+        dashes.strokeColor = NSColor.black.withAlphaComponent(0.92).cgColor
+        dashes.lineDashPattern = [6, 6]
+    }
+
+    override init(layer: Any) { super.init(layer: layer) }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSublayers() {
+        super.layoutSublayers()
+        let rect = bounds.insetBy(dx: 1, dy: 1)
+        let r = developer ? min(radius, rect.width / 2, rect.height / 2) : radius - 1
+        let path = CGPath(roundedRect: rect, cornerWidth: r, cornerHeight: r, transform: nil)
+        for l in [yellow, dashes] {
+            l.frame = bounds
+            l.path = path
+        }
+        if developer, rect.width > 0 {
+            let edge = 2 * rect.width + 2 * rect.height - 8 * r + 2 * .pi * r
+            let d = edge / (rect.width < 210 ? 60 : rect.width < 346 ? 80 : 100)
+            dashes.lineDashPattern = [NSNumber(value: Double(d)), NSNumber(value: Double(d))]
+        }
+    }
+}
+
+/// Arc's SlashView: between a pinned tab's favicon and its name once the tab has left its
+/// pinned page (GitHub #139). A 2 pt round-capped stroke corner to corner of a 4 × 15 pt box,
+/// in TabCellSlash (black or white at 30 %).
+final class SidebarSlashView: NSView {
+    static let size = NSSize(width: 4, height: 15)
+    var color: NSColor = .gray { didSet { if color != oldValue { needsDisplay = true } } }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let p = NSBezierPath()
+        p.move(to: NSPoint(x: 1, y: 1))
+        p.line(to: NSPoint(x: bounds.width - 1, y: bounds.height - 1))
+        p.lineWidth = 2
+        p.lineCapStyle = .round
+        color.setStroke()
+        p.stroke()
+    }
+}
+
+/// What a drag over the list does to one row (SidebarDropPreview).
+struct DropDecor: Equatable {
+    var dimmed = false
+    var nudge: CGFloat = 0
+    /// "Move to Folder" / "Add to Split" on a folder or split the drop goes into.
+    var badge: Badge?
+    /// The row turns into what the drop makes.
+    var combine: CombineDropPreview.Kind?
+    var combineDragged: UUID?
+
+    struct Badge: Equatable {
+        let symbol: String
+        let label: String
+    }
+}
+
+@MainActor
+extension NSView {
+    /// Arc moves the layer's anchor to its centre; AppKit owns a layer-backed view's anchor, so the
+    /// transform carries the centre instead.
+    func springPress(_ down: Bool, scale s: Double) {
+        guard let layer else { return }
+        var to = CATransform3DIdentity
+        if down {
+            let a = layer.anchorPoint
+            let c = CGPoint(x: bounds.width * (0.5 - a.x), y: bounds.height * (0.5 - a.y))
+            to = CATransform3DTranslate(CATransform3DScale(CATransform3DMakeTranslation(c.x, c.y, 0), s, s, 1), -c.x, -c.y, 0)
+        }
+        let spring = CASpringAnimation(keyPath: "transform")
+        spring.fromValue = NSValue(caTransform3D: layer.presentation()?.transform ?? CATransform3DIdentity)
+        spring.toValue = NSValue(caTransform3D: to)
+        spring.mass = 1
+        spring.stiffness = SidebarRowPress.stiffness
+        spring.damping = SidebarRowPress.damping
+        spring.duration = spring.settlingDuration
+        spring.fillMode = .forwards
+        spring.isRemovedOnCompletion = !down
+        layer.add(spring, forKey: "press_bounce")
+    }
+}
+
+// MARK: - Row base
+
+@MainActor
+class SidebarRowView: NSView {
+    weak var list: SpaceListView?
+    let key: SpaceListView.RowKey
+    var colors: SidebarColors
+    var isHovered = false { didSet { if isHovered != oldValue { hoverChanged() } } }
+    private(set) var decor = DropDecor()
+    private var badgeView: DropBadgeView?
+    private var combineView: NSView?
+    private var press: (event: NSEvent, point: NSPoint)?
+    /// The hover/selection fill. Arc 1.170 draws it 36 pt tall on the 41 pt row pitch, so two
+    /// filled rows keep a 5 pt gap (GitHub #10: Cra filled all 40 pt and rows touched).
+    private let fillLayer = CALayer()
+    static let fillInset: CGFloat = 2
+    /// Arc starts a nested row's fill after its indent, so the gutter by a folder's tabs stays
+    /// empty (GitHub #139). The fill, shadow, drop badge and focus ring all follow it.
+    var fillLeading: CGFloat { 0 }
+    var fillRect: CGRect {
+        CGRect(x: fillLeading, y: Self.fillInset, width: max(0, bounds.width - fillLeading), height: max(0, bounds.height - 2 * Self.fillInset))
+    }
+
+    init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        self.key = key
+        self.list = list
+        self.colors = colors
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = CraMetrics.rowCorner
+        layer?.cornerCurve = .continuous
+        fillLayer.cornerRadius = CraMetrics.rowCorner
+        fillLayer.cornerCurve = .continuous
+        // Changes show at once, as the view's own layer background did.
+        fillLayer.actions = ["backgroundColor": NSNull(), "position": NSNull(), "bounds": NSNull()]
+        layer?.insertSublayer(fillLayer, at: 0)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    func hoverChanged() { refreshBackground() }
+    /// The row's resting fill (hover, selection).
+    func baseFill() -> NSColor { .clear }
+    /// Pointer moved within a hovered row (split rows track which pane it is over).
+    func hoverMoved(to point: NSPoint) {}
+    /// The item a press at `point` drags; nil when the row can't be dragged.
+    func dragItemID(at point: NSPoint) -> UUID? { nil }
+    func click(_ event: NSEvent, at point: NSPoint) {}
+    func contextMenu(at point: NSPoint) -> NSMenu? { nil }
+    /// The tooltip owner under the pointer.
+    func tooltipTarget(at point: NSPoint) -> (any ArcTooltipTarget)? { nil }
+    func setColors(_ c: SidebarColors) {
+        guard c != colors else { return }
+        colors = c
+        refreshBackground()
+    }
+
+    func refreshBackground() {
+        var fill = baseFill()
+        if decor.combine != nil { fill = .clear } else if decor.badge != nil, fill == .clear { fill = colors.selectedFill }
+        fillLayer.backgroundColor = fill.cgColor
+    }
+
+    /// Arc's bounce when a close button keeps the item (TabCellView, `deselect`): the row jumps to
+    /// 90 % and springs back in ~0.24 s without overshoot (critically damped, recorded at 100 fps).
+    func bounce() {
+        guard let layer else { return }
+        let a = layer.anchorPoint
+        let c = CGPoint(x: bounds.width * (0.5 - a.x), y: bounds.height * (0.5 - a.y))
+        var t = CATransform3DMakeTranslation(c.x, c.y, 0)
+        t = CATransform3DScale(t, 0.9, 0.9, 1)
+        t = CATransform3DTranslate(t, -c.x, -c.y, 0)
+        let spring = CASpringAnimation(keyPath: "sublayerTransform")
+        spring.fromValue = NSValue(caTransform3D: t)
+        spring.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        // Critically damped; tuned against a Cra recording to Arc's curve (half way at ~0.12 s).
+        spring.mass = 1
+        spring.stiffness = 119
+        spring.damping = 21.8
+        spring.duration = spring.settlingDuration
+        layer.add(spring, forKey: "bounce")
+    }
+
+    /// The open row's soft shadow under its fill, on light themes only.
+    func setLifted(_ selected: Bool) {
+        let lifted = selected && !colors.isDark && decor.combine == nil
+        layer?.shadowOpacity = lifted ? 0.06 : 0
+        if lifted {
+            layer?.shadowColor = NSColor.black.cgColor
+            layer?.shadowRadius = 3
+            layer?.shadowOffset = CGSize(width: 0, height: -1)
+            layer?.shadowPath = CGPath(roundedRect: fillRect, cornerWidth: CraMetrics.rowCorner, cornerHeight: CraMetrics.rowCorner, transform: nil)
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        fillLayer.frame = fillRect
+        if layer?.shadowOpacity ?? 0 > 0 {
+            layer?.shadowPath = CGPath(roundedRect: fillRect, cornerWidth: CraMetrics.rowCorner, cornerHeight: CraMetrics.rowCorner, transform: nil)
+        }
+    }
+
+    func applyDecor(_ d: DropDecor, animated: Bool) {
+        guard d != decor else { return }
+        let old = decor
+        decor = d
+        let alpha: CGFloat = d.combine != nil ? 0 : (d.dimmed ? 0.4 : 1)
+        for v in subviews where v !== combineView { animated ? (v.animator().alphaValue = alpha) : (v.alphaValue = alpha) }
+        if let badge = d.badge {
+            let v = badgeView ?? DropBadgeView()
+            if badgeView == nil {
+                badgeView = v
+                v.frame = fillRect
+                v.autoresizingMask = [.width, .height]
+                addSubview(v)
+            }
+            v.show(badge, colors: colors)
+            v.alphaValue = alpha
+        } else if let v = badgeView {
+            badgeView = nil
+            v.removeFromSuperview()
+        }
+        if d.combine != old.combine || d.combineDragged != old.combineDragged {
+            combineView?.removeFromSuperview()
+            combineView = nil
+            if let kind = d.combine, let dragged = d.combineDragged, let list, let target = list.store.item(itemIDForCombine),
+               let draggedItem = list.store.item(dragged) {
+                let depth = list.depth(of: key)
+                let host = CombineDropPreview(kind: kind, target: target, dragged: draggedItem, depth: depth,
+                                              palette: list.palette, favicons: list.favicons)
+                host.frame = bounds
+                host.autoresizingMask = [.width, .height]
+                addSubview(host)
+                combineView = host
+            }
+        }
+        refreshBackground()
+    }
+
+    /// The item a combine preview draws as the drop's target.
+    var itemIDForCombine: UUID { if case .item(let id) = key { return id }; return UUID() }
+
+    var pressRow: SidebarRowPress.Row { .other }
+    private var pushedIn = false
+
+    private func push(in down: Bool) {
+        guard down != pushedIn else { return }
+        pushedIn = down
+        springPress(down, scale: SidebarRowPress.scale(pressRow))
+    }
+
+    /// Whether the press already did what the click would (a tab switches on the press, as in Arc).
+    private var actedOnPress = false
+
+    /// A row that acts on the press does so here and returns true; the release then does nothing.
+    func pressDown(_ event: NSEvent, at point: NSPoint) -> Bool { false }
+
+    // Clicks act on release (SwiftUI's tap), a tab's switch on the press (pressDown); a press that
+    // moves 3 pt starts the row's drag.
+    override func mouseDown(with event: NSEvent) {
+        // A pinned tab's Previews card goes at once, as a favorite's does.
+        FavoritePreviewCard.shared.cancel(self)
+        let point = convert(event.locationInWindow, from: nil)
+        press = (event, point)
+        if SidebarRowPress.pushesIn(pressRow, clickCount: event.clickCount) { push(in: true) }
+        actedOnPress = pressDown(event, at: point)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let p = press else { return }
+        let q = convert(event.locationInWindow, from: nil)
+        guard hypot(q.x - p.point.x, q.y - p.point.y) > 3 else { return }
+        press = nil
+        push(in: false)
+        if let id = dragItemID(at: p.point) { list?.beginDrag(id, from: self, event: p.event) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        push(in: false)
+        guard let p = press else { return }
+        press = nil
+        if actedOnPress { actedOnPress = false; return }
+        click(event, at: p.point)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        contextMenu(at: convert(event.locationInWindow, from: nil))
+    }
+}
+
+/// The badge a folder or split shows while a drop would go into it.
+private final class DropBadgeView: NSView {
+    private let pill = NSView()
+    private let icon = NSImageView()
+    private let label = NSTextField.sidebarLabel(size: 11, weight: .semibold)
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = CraMetrics.rowCorner
+        layer?.cornerCurve = .continuous
+        layer?.borderWidth = 1.5
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 11
+        pill.shadow = NSShadow()
+        pill.layer?.shadowOpacity = 0.08
+        pill.layer?.shadowRadius = 2
+        pill.layer?.shadowOffset = CGSize(width: 0, height: -1)
+        addSubview(pill)
+        pill.addSubview(icon)
+        pill.addSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func show(_ badge: DropDecor.Badge, colors: SidebarColors) {
+        layer?.borderColor = colors.textPrimary.withAlphaComponent(0.3).cgColor
+        pill.layer?.backgroundColor = NSColor.white.withAlphaComponent(colors.isDark ? 0.14 : 0.9).cgColor
+        icon.image = SidebarSymbols.image(badge.symbol, size: 10, weight: .semibold)
+        icon.contentTintColor = colors.textPrimary
+        label.stringValue = badge.label
+        label.textColor = colors.textPrimary
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let ls = label.intrinsicContentSize
+        let w = 8 + 12 + 4 + ls.width + 8
+        pill.frame = NSRect(x: bounds.width - 8 - w, y: (bounds.height - 22) / 2, width: w, height: 22)
+        icon.frame = NSRect(x: 8, y: 5, width: 12, height: 12)
+        label.frame = NSRect(x: 24, y: (22 - ls.height) / 2, width: ls.width, height: ls.height)
+    }
+}
+
+// MARK: - Tab row
+
+struct TabRowModel: Equatable {
+    var id: UUID
+    var depth: Int
+    var pinned: Bool
+    var title: String
+    var customTitle: Bool
+    var renameText: String
+    var subtitle: String?
+    var icon: NSImage?
+    var flipIcon: Bool
+    var liveIcon: NSImage?
+    var editing: Bool
+    var selected: Bool
+    var highlighted: Bool
+    var capturing: Bool
+    /// A call shares the tab (TabSharing): Arc's yellow ring on the row.
+    var shared: Bool = false
+    /// A call shares another tab and can switch to this one: "Share this tab instead" on hover.
+    var canShareInstead: Bool = false
+    /// An MCP agent works in the tab: its face sits where the close button shows on hover.
+    var agent: Bool = false
+    var audible: Bool
+    var muted: Bool
+    var unread: Bool
+    var navigatedAway: Bool
+    var focusRing: Bool
+    /// The page's site is in developer mode: Arc rings the open tab (TabHighlightState.developerTab).
+    var developerMode: Bool
+    /// Shown under a closed folder (FolderPeek): its close button keeps it pinned.
+    var peeked: Bool
+    /// The pinned page's favicon (Arc: resetTabIcon), shown on the icon while it would go back there.
+    var homeIcon: NSImage?
+    var homeFlipIcon: Bool
+    /// The favicon of a Peek opened from this tab (Arc: modalIcon), in the close button's place.
+    var peekIcon: NSImage?
+    /// Tidy Tab Titles just renamed it: the row plays Arc's rename once.
+    var tidyRename: TidyTitlesService.Effect? = nil
+}
+
+final class TabRowView: SidebarRowView, ArcTooltipTarget, NSTextFieldDelegate {
+    private(set) var model: TabRowModel?
+    private let favicon = SidebarFaviconView()
+    private let titleLabel = NSTextField.sidebarLabel(size: 14)
+    private let subtitleLabel = NSTextField.sidebarLabel(size: 11)
+    private var renameField: NSTextField?
+    private var accessories: [NSView] = []
+    private var focusRing: FocusRingLayer?
+    /// Arc's ring round a tab a call shares (TabSharing): 2 pt systemYellow along the fill's edge.
+    private var sharedRing: CALayer?
+    /// `cra://debug?tabSharing`: the row shows the yellow ring.
+    var showsSharedRing: Bool { sharedRing != nil && sharedRing?.isHidden == false }
+    /// `cra://debug?tabSharing`: the row shows "Share this tab instead".
+    private(set) var showsShareInsteadButton = false
+    /// `cra://debug?tabSharing=…&press=1`: the button's own action, as a click on it runs it. NO when it isn't shown.
+    func pressShareInsteadButton() -> Bool {
+        guard showsShareInsteadButton else { return false }
+        shareInsteadButton.action()
+        return true
+    }
+    private let slash = SidebarSlashView(frame: NSRect(origin: .zero, size: SidebarSlashView.size))
+    /// The pointer is on the favicon of a pinned tab away from its page (Arc's icon region):
+    /// a click there goes back, and the line under the name says so.
+    private var overIcon = false
+    /// Bumped by each hover-subtitle fade, so a finished fade-out only hides the label it faded.
+    private var subtitleFade = 0
+    /// ⌘ is down while `overIcon`: a click separates the page from the pinned tab instead.
+    private var separating = false
+    private var flagsMonitor: Any?
+    /// Arc's regional hover background for a tab that can go back: the icon's square or the body.
+    private let regionLayer = CALayer()
+    /// The Tidy Tab Titles rename this row last played, and what it is drawing for it.
+    private var playedRename: UUID?
+    private let renameSweep = TidyTitleSweep()
+
+    override var pressRow: SidebarRowPress.Row { .tab }
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        addSubview(favicon)
+        addSubview(slash)
+        addSubview(titleLabel)
+        addSubview(subtitleLabel)
+        regionLayer.cornerRadius = CraMetrics.rowCorner
+        regionLayer.cornerCurve = .continuous
+        regionLayer.actions = ["backgroundColor": NSNull(), "position": NSNull(), "bounds": NSNull(), "hidden": NSNull()]
+        layer?.insertSublayer(regionLayer, at: 1)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    var tidyTitleLayout: TidyTitleLayout {
+        layoutSubtreeIfNeeded()
+        return TidyTitleLayout(label: titleLabel, inset: SidebarText.inset)
+    }
+
+    func apply(_ m: TabRowModel) {
+        guard m != model else { return }
+        // A subtitle coming or going moves the title (developer mode on a live tab, GitHub #88).
+        if (m.subtitle == nil) != (model?.subtitle == nil) || m.depth != model?.depth || m.navigatedAway != model?.navigatedAway {
+            needsLayout = true
+        }
+        model = m
+        renameSweep.update(effectToken: m.tidyRename?.token, editing: m.editing)
+        if overIcon, !canReset { overIcon = false; stopWatchingFlags(); needsLayout = true }
+        refreshIcon()
+        slash.color = (colors.isDark ? NSColor.white : .black).withAlphaComponent(0.3)
+        titleLabel.stringValue = m.title
+        titleLabel.textColor = colors.textPrimary
+        refreshSubtitle()
+        setAccessibilityLabel(m.title)
+        if m.editing != (renameField != nil) { m.editing ? beginRename(m.renameText) : endRename() }
+        // The keyboard's ring wins over developer mode's; they differ in tone and dash length.
+        let ring: Bool? = m.focusRing ? false : (m.developerMode && m.selected ? true : nil)
+        if ring != focusRing.map(\.developer) {
+            focusRing?.removeFromSuperlayer()
+            focusRing = nil
+            if let developer = ring {
+                let r = FocusRingLayer(developer: developer)
+                r.frame = fillRect
+                r.zPosition = 10
+                layer?.addSublayer(r)
+                focusRing = r
+            }
+        }
+        if m.shared != (sharedRing != nil) {
+            sharedRing?.removeFromSuperlayer()
+            sharedRing = nil
+            if m.shared {
+                let r = CALayer()
+                r.borderWidth = TabSharing.ringWidth
+                r.borderColor = NSColor.systemYellow.cgColor
+                r.cornerRadius = CraMetrics.rowCorner
+                r.cornerCurve = .continuous
+                r.actions = ["bounds": NSNull(), "position": NSNull()]
+                r.frame = fillRect
+                r.zPosition = 9  // under the keyboard's ring
+                layer?.addSublayer(r)
+                sharedRing = r
+            }
+        }
+        rebuildAccessories()
+        refreshBackground()
+        // A rename that just happened plays once; a row rebuilt later shows only the subtitle.
+        if let e = m.tidyRename, e.token != playedRename {
+            playedRename = e.token
+            if !m.editing, window != nil, Date().timeIntervalSince(e.start) < 0.3 { playTidyRename(from: e.oldTitle, token: e.token) }
+        }
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        guard c != colors else { return }
+        super.setColors(c)
+        if let m = model { model = nil; apply(m) }
+    }
+
+    /// Arc's rename (TabCellView: animatedGradientView over the old and new title, sparksView;
+    /// measured at 120 fps on Arc 1.171, 4 Nov 2026): one soft front 72 pt wide crosses the row
+    /// left to right at ~1,180 pt/s, fading the old title out and the new title and its "Double-click
+    /// to rename" in, the subtitle bright meanwhile; sparkles rise along a band that crosses the row in
+    /// 0.55 s, and everything stops at once when it has.
+    private func playTidyRename(from old: String, token: UUID) {
+        layoutSubtreeIfNeeded()
+        let total = TidyTitlesService.sweep
+        let fade: CGFloat = 72, speed: CGFloat = 1180
+        let start = titleLabel.frame.minX + SidebarText.inset + 20
+        let oldLabel = NSTextField.sidebarLabel(size: 14)
+        oldLabel.stringValue = old
+        oldLabel.textColor = colors.textPrimary
+        oldLabel.lineBreakMode = .byClipping
+        oldLabel.cell?.truncatesLastVisibleLine = false
+        oldLabel.frame = NSRect(x: titleLabel.frame.minX, y: titleLabel.frame.minY,
+                                width: max(titleLabel.frame.width, bounds.width - 8 - titleLabel.frame.minX), height: titleLabel.frame.height)
+        oldLabel.wantsLayer = true
+        addSubview(oldLabel)
+        titleLabel.wantsLayer = true
+        subtitleLabel.wantsLayer = true
+        let sparkles = Self.sparkles(in: bounds, dark: colors.isDark, duration: total)
+        renameSweep.begin(token: token, oldTitle: oldLabel, sparkles: sparkles,
+                          title: titleLabel, subtitle: subtitleLabel, row: layer, duration: total) { [weak self] in
+            self?.refreshSubtitle()
+        }
+        let end = oldLabel.frame.maxX + fade / 2
+        let sweep = min(total, Double((end - start) / speed))
+        for (view, reveal) in [(titleLabel as NSView, true), (subtitleLabel, true), (oldLabel, false)] {
+            view.layer?.mask = Self.frontMask(reveal: reveal, fade: fade, height: view.bounds.height,
+                                              from: start - view.frame.minX, to: end - view.frame.minX, duration: sweep)
+        }
+        refreshSubtitle()
+        layer?.addSublayer(sparkles)
+        layer?.zPosition = 50
+    }
+
+    /// A horizontal mask whose soft edge (`fade` wide) travels `from` → `to`: opaque behind the front
+    /// when it reveals, opaque ahead of it when it hides.
+    private static func frontMask(reveal: Bool, fade: CGFloat, height: CGFloat, from: CGFloat, to: CGFloat, duration: Double) -> CALayer {
+        let span: CGFloat = 4000
+        let g = CAGradientLayer()
+        g.startPoint = CGPoint(x: 0, y: 0.5)
+        g.endPoint = CGPoint(x: 1, y: 0.5)
+        let on = NSColor.black.cgColor, off = NSColor.clear.cgColor
+        g.colors = reveal ? [on, on, off, off] : [off, off, on, on]
+        let half = Double(fade / 2 / (2 * span))
+        g.locations = [0, NSNumber(value: 0.5 - half), NSNumber(value: 0.5 + half), 1]
+        g.bounds = CGRect(x: 0, y: 0, width: 2 * span, height: height + 40)
+        g.position = CGPoint(x: to, y: height / 2)
+        g.actions = ["position": NSNull(), "bounds": NSNull()]
+        let move = CABasicAnimation(keyPath: "position.x")
+        move.fromValue = from
+        move.toValue = to
+        move.duration = duration
+        move.timingFunction = CAMediaTimingFunction(name: .linear)
+        g.add(move, forKey: "front")
+        return g
+    }
+
+    /// Arc's sparks: small dots that come up along a band crossing the row, scattered up to ~28 pt
+    /// above and below it, most staying lit until the sweep ends, a few going out early.
+    private static func sparkles(in rect: CGRect, dark: Bool, duration: Double) -> CALayer {
+        let box = CALayer()
+        box.frame = rect
+        box.actions = ["sublayers": NSNull()]
+        var rng = SystemRandomNumberGenerator()
+        let count = 46
+        let now = CACurrentMediaTime()
+        for i in 0..<count {
+            let born = duration * (Double(i) + Double.random(in: 0...1, using: &rng)) / Double(count)
+            let x = rect.width * CGFloat(born / duration) + CGFloat.random(in: -14...14, using: &rng)
+            let spread = CGFloat((0..<3).map { _ in Double.random(in: -1...1, using: &rng) }.reduce(0, +) / 3) * 28
+            let r = CGFloat.random(in: 0.6...1.5, using: &rng)
+            let dot = CALayer()
+            dot.frame = CGRect(x: min(max(x, 2), rect.width - 2) - r, y: rect.midY + spread - r, width: 2 * r, height: 2 * r)
+            dot.cornerRadius = r
+            dot.backgroundColor = (dark ? NSColor.white : NSColor.black.withAlphaComponent(0.55)).cgColor
+            dot.opacity = 0
+            let life = Bool.random(using: &rng) && i % 3 == 0 ? Double.random(in: 0.15...0.3, using: &rng) : duration - born
+            let blink = CAKeyframeAnimation(keyPath: "opacity")
+            let peak = Float.random(in: 0.55...1, using: &rng)
+            blink.values = [0, peak, peak * 0.6, peak, 0]
+            blink.keyTimes = [0, 0.12, 0.5, 0.85, 1]
+            blink.beginTime = now + born
+            blink.duration = max(0.05, life)
+            blink.fillMode = .both
+            blink.isRemovedOnCompletion = false
+            dot.add(blink, forKey: "spark")
+            box.addSublayer(dot)
+        }
+        return box
+    }
+
+    override var fillLeading: CGFloat { CGFloat(model?.depth ?? 0) * CraMetrics.indent }
+
+    override func baseFill() -> NSColor {
+        guard let m = model else { return .clear }
+        if m.highlighted { return colors.selectedFill }
+        // A tab that can go back fills only the hovered region (regionLayer), as Arc does.
+        return isHovered && !canReset ? colors.hoverFill : .clear
+    }
+
+    override func refreshBackground() {
+        super.refreshBackground()
+        setLifted(model?.highlighted == true)
+        refreshRegion()
+    }
+
+    override func hoverChanged() {
+        super.hoverChanged()
+        if !isHovered { setOverIcon(false) }
+        refreshIcon()
+        rebuildAccessories()
+    }
+
+    override func hoverMoved(to point: NSPoint) { setOverIcon(canReset && iconRegion.contains(point)) }
+
+    private var canReset: Bool { model.map { $0.navigatedAway && !$0.editing } ?? false }
+    /// Arc's icon region (TabCellView.BackgroundRegion.icon): the 36 pt square at the fill's left.
+    private var iconRegion: NSRect {
+        NSRect(x: fillLeading, y: 0, width: Self.iconRegionWidth, height: bounds.height)
+    }
+    private static let iconRegionWidth: CGFloat = 36
+    /// The body region starts this far into the fill (it overlaps the icon's square by 6 pt).
+    private static let bodyRegionInset: CGFloat = 30
+
+    private func setOverIcon(_ on: Bool) {
+        guard on != overIcon else { return }
+        let hadLine = shownSubtitle != nil, oldText = subtitleLabel.stringValue
+        titleLabel.wantsLayer = true
+        layoutSubtreeIfNeeded()
+        let oldTitle = titleLabel.layer?.position
+        overIcon = on
+        if on { watchFlags() } else { stopWatchingFlags() }
+        refreshIcon()
+        refreshSubtitle()
+        rebuildAccessories()
+        refreshBackground()
+        needsLayout = true
+        if hadLine != (shownSubtitle != nil) { slideSubtitle(appearing: !hadLine, titleFrom: oldTitle, leavingText: oldText) }
+    }
+
+    /// Arc's hover subtitle comes in as a transition, not a cut (GitHub #189): the title slides
+    /// between its centred and two-line places while "Back to Pinned URL" fades in under it, and
+    /// back out the same way. layout() still sets both end states; the slide is an additive
+    /// offset on the title's layer that settles to zero, so a relayout mid-way can't fight it.
+    private func slideSubtitle(appearing: Bool, titleFrom old: CGPoint?, leavingText: String) {
+        layoutSubtreeIfNeeded()
+        let duration = 0.16
+        guard window != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let layer = titleLabel.layer, let old else { return }
+        let move = CABasicAnimation(keyPath: "position")
+        move.isAdditive = true
+        move.fromValue = NSValue(point: NSPoint(x: old.x - layer.position.x, y: old.y - layer.position.y))
+        move.toValue = NSValue(point: .zero)
+        move.duration = duration
+        move.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(move, forKey: "hoverSubtitle")
+        subtitleFade += 1
+        let token = subtitleFade
+        if appearing {
+            subtitleLabel.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = duration
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                subtitleLabel.animator().alphaValue = 1
+            }
+        } else {
+            // The label stays where it was, with its text, until it has faded.
+            subtitleLabel.stringValue = leavingText
+            subtitleLabel.isHidden = false
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = duration
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                subtitleLabel.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                guard let self, self.subtitleFade == token else { return }
+                self.subtitleLabel.alphaValue = 1
+                self.refreshSubtitle()
+            })
+        }
+    }
+
+    private func watchFlags() {
+        separating = NSEvent.modifierFlags.contains(.command)
+        guard flagsMonitor == nil else { return }
+        flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            if let self, self.overIcon {
+                let cmd = event.modifierFlags.contains(.command)
+                if cmd != self.separating {
+                    self.separating = cmd
+                    self.refreshIcon()
+                    self.refreshSubtitle()
+                }
+            }
+            return event
+        }
+    }
+
+    private func stopWatchingFlags() {
+        separating = false
+        if let m = flagsMonitor { NSEvent.removeMonitor(m) }
+        flagsMonitor = nil
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil { stopWatchingFlags() }
+    }
+
+    /// On the icon the pinned page's favicon stands in (⌘: the page's own, which separates);
+    /// the slash hides on the icon and, on a background row, on the body too.
+    private func refreshIcon() {
+        guard let m = model else { return }
+        if overIcon && !separating {
+            favicon.show(m.homeIcon, flip: m.homeFlipIcon, colors: colors)
+        } else if let icon = m.liveIcon {
+            favicon.showPluginMark(icon, colors: colors)
+        } else {
+            favicon.show(m.icon, flip: m.flipIcon, colors: colors)
+        }
+        slash.isHidden = !m.navigatedAway || overIcon || (isHovered && !m.highlighted)
+    }
+
+    private func refreshRegion() {
+        guard let m = model, canReset, isHovered else { regionLayer.isHidden = true; return }
+        let fill = fillRect
+        if overIcon {
+            // Over the open row's white fill only the icon's left corners round.
+            regionLayer.frame = CGRect(x: fill.minX, y: fill.minY, width: Self.iconRegionWidth, height: fill.height)
+            regionLayer.maskedCorners = m.highlighted ? [.layerMinXMinYCorner, .layerMinXMaxYCorner]
+                : [.layerMinXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMinYCorner, .layerMaxXMaxYCorner]
+        } else if !m.highlighted {
+            regionLayer.frame = CGRect(x: fill.minX + Self.bodyRegionInset, y: fill.minY,
+                                       width: max(0, fill.width - Self.bodyRegionInset), height: fill.height)
+            regionLayer.maskedCorners = [.layerMinXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMinYCorner, .layerMaxXMaxYCorner]
+        } else {
+            regionLayer.isHidden = true
+            return
+        }
+        regionLayer.backgroundColor = colors.hoverFill.cgColor
+        regionLayer.isHidden = false
+    }
+
+    /// Arc's hover subtitle (HoverSubtitleState.reset, ⌘: resetAndSeparate) stands in for the
+    /// line under the title while the pointer is on the icon.
+    private var shownSubtitle: String? {
+        overIcon ? (separating ? "Separate From Pinned Tab" : "Back to Pinned URL") : model?.subtitle
+    }
+
+    private func refreshSubtitle() {
+        // A fade-out still running ends here: the label shows what it should, fully.
+        if subtitleLabel.alphaValue < 1, shownSubtitle != nil { subtitleFade += 1; subtitleLabel.alphaValue = 1 }
+        subtitleLabel.stringValue = shownSubtitle ?? ""
+        // Arc draws the subtitle bright while the rename sweeps in.
+        subtitleLabel.textColor = renameSweep.isActive ? colors.textPrimary : colors.textTertiary
+        subtitleLabel.isHidden = shownSubtitle == nil || renameField != nil
+    }
+
+    /// Arc's recording dot (RecordingDot): before the favicon, pulsing. Made once per row and shown or hidden.
+    private lazy var captureDot: NSView = {
+        let d = CGFloat(RecordingDot.diameter)
+        let dot = NSView(frame: NSRect(x: 0, y: 0, width: d, height: d))
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = d / 2
+        dot.layer?.backgroundColor = NSColor.systemRed.cgColor
+        _ = ArcTooltipAnchorView.attach(to: dot, help: "This tab is using your camera or microphone")
+        addSubview(dot)
+        return dot
+    }()
+    private var showsCaptureDot = false
+    /// `cra://debug?recordingDot`: the dot shows, and where it and the favicon are in the row.
+    var recordingDotReadout: String {
+        guard showsCaptureDot else { return "dot=0 icon=\(Int(favicon.frame.minX))" }
+        let pulsing = captureDot.layer?.animation(forKey: "pulse") != nil
+        return "dot=1 x=\(Int(captureDot.frame.minX)) w=\(Int(captureDot.frame.width)) icon=\(Int(favicon.frame.minX)) pulse=\(pulsing ? 1 : 0)"
+    }
+
+    /// Arc's pulse: the red toward white and back, forever; still under Reduce Motion.
+    private func syncCapturePulse() {
+        guard let layer = captureDot.layer else { return }
+        let pulse = showsCaptureDot && window != nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        guard pulse != (layer.animation(forKey: "pulse") != nil) else { return }
+        guard pulse else { layer.removeAnimation(forKey: "pulse"); return }
+        let red = NSColor.systemRed
+        let a = CABasicAnimation(keyPath: "backgroundColor")
+        a.fromValue = red.cgColor
+        a.toValue = (red.blended(withFraction: CGFloat(RecordingDot.pulseWhite), of: .white) ?? red).cgColor
+        a.duration = RecordingDot.pulseHalfPeriod
+        a.autoreverses = true
+        a.repeatCount = .infinity
+        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(a, forKey: "pulse")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if showsCaptureDot { syncCapturePulse() }
+    }
+    /// Arc 1.171: a playing or muted tab shows a speaker between the favicon and the title (17.5 pt
+    /// wide, 8 pt before the title, in the glyph tone); clicking it mutes or unmutes the tab
+    /// (31 Oct 2026, issue #28).
+    private lazy var soundButton = SidebarGlyphButton(symbol: Self.soundSymbol, size: 20, iconSize: 13, weight: .regular,
+                                                     help: "Mute Tab", colors: colors) { [weak self] in
+        guard let self, let m = self.model, let list = self.list else { return }
+        list.store.setMuted(m.id, !m.muted)
+        list.actions.performAction("muteTab:\(m.id)")
+    }
+    private static let soundSymbol = "speaker.wave.3"
+    private static let soundGlyphWidth: CGFloat = 17.5
+    private var showsSound = false
+    private lazy var peekBadge = SidebarFaviconView()
+    private lazy var agentFace = AgentFaceView()
+    private lazy var unreadDot: NSView = {
+        let dot = NSView(frame: NSRect(x: 0, y: 0, width: 6, height: 6))
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        return dot
+    }()
+    private lazy var closeButton: SidebarGlyphButton = {
+        let b = SidebarGlyphButton(symbol: "xmark", size: Self.closeSize, iconSize: 13, help: "", colors: colors) {}
+        b.setCloseMark(minus: false, help: "")
+        return b
+    }()
+    /// Arc's close button: a 24 pt square (TabCellView, GitHub #139).
+    private static let closeSize: CGFloat = 24
+    /// Arc's "Share this tab instead", against the close button while a call can switch to the tab (TabSharing).
+    private lazy var shareInsteadButton: SidebarGlyphButton = {
+        SidebarGlyphButton(symbol: TabSharing.shareInsteadSymbol, size: Self.closeSize, iconSize: 13,
+                           help: TabSharing.shareInsteadHelp, colors: colors) { [weak self] in
+            guard let self, let m = self.model, let list = self.list else { return }
+            list.actions.shareTabInstead(m.id)
+        }
+    }()
+    private var closeKind: SidebarClose.Button?
+
+    private func rebuildAccessories() {
+        guard let m = model, list != nil else { return }
+        let id = m.id
+        var shown: [NSView] = []
+        if m.capturing != showsCaptureDot {
+            showsCaptureDot = m.capturing
+            captureDot.isHidden = !m.capturing
+            needsLayout = true
+        }
+        if showsCaptureDot { syncCapturePulse() }
+        let sound = (m.muted || m.audible) && !m.editing
+        if sound {
+            if soundButton.superview == nil { addSubview(soundButton) }
+            soundButton.colors = colors
+            soundButton.setSymbol(m.muted ? "speaker.slash" : Self.soundSymbol, iconSize: 13, weight: .regular,
+                                  help: m.muted ? "Unmute Tab" : "Mute Tab")
+        }
+        soundButton.isHidden = !sound
+        if sound != showsSound { showsSound = sound; needsLayout = true }
+        if m.agent && !isHovered && !m.editing {
+            agentFace.show(fill: colors.textPrimary)
+            shown.append(agentFace)
+        }
+        if let peek = m.peekIcon, !isHovered {
+            peekBadge.show(peek, flip: false, colors: colors)
+            shown.append(peekBadge)
+        }
+        if m.unread && !m.selected && !isHovered {
+            unreadDot.layer?.backgroundColor = colors.textPrimary.withAlphaComponent(0.55).cgColor
+            shown.append(unreadDot)
+        }
+        showsShareInsteadButton = TabSharing.showsShareInstead(hovered: isHovered, editing: m.editing,
+                                                               canShareInstead: m.canShareInstead, shared: m.shared)
+        if showsShareInsteadButton {
+            shareInsteadButton.colors = colors
+            shown.append(shareInsteadButton)
+        }
+        // Arc hides the button while the pointer is on the icon of a tab it can take back.
+        if isHovered && !m.editing && !overIcon {
+            // SidebarClose: a minus keeps the tab pinned (it unloads and goes back to its page), an
+            // ✕ archives it. Either acts on this row only, picked tabs or not; ⌘W takes them all.
+            let button = SidebarClose.tab(pinned: m.pinned, current: m.selected, navigatedAway: m.navigatedAway, peeked: m.peeked)
+            if button != closeKind {
+                closeKind = button
+                closeButton.setCloseMark(minus: button.minus, help: button.help)
+                closeButton.action = { [weak self] in
+                    guard let self, let list = self.list else { return }
+                    if button.minus {
+                        self.bounce()
+                        list.actions.closeTab(id)
+                    } else {
+                        list.store.archiveTab(id, reason: .manual)
+                    }
+                    list.ui.multiSelection.remove(id)
+                }
+            }
+            closeButton.colors = colors
+            shown.append(closeButton)
+        }
+        guard shown.map(ObjectIdentifier.init) != accessories.map(ObjectIdentifier.init) else { return }
+        for v in accessories where !shown.contains(where: { $0 === v }) { v.isHidden = true }
+        for v in shown {
+            if v.superview == nil { addSubview(v) }
+            v.isHidden = false
+        }
+        accessories = shown
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        guard let m = model else { return }
+        let h = bounds.height
+        let lead = RecordingDot.leading(iconX: Double(CraMetrics.rowLeading + CGFloat(m.depth) * CraMetrics.indent), recording: showsCaptureDot)
+        if let dx = lead.dotX {
+            let d = CGFloat(RecordingDot.diameter)
+            captureDot.frame = NSRect(x: CGFloat(dx), y: (h - d) / 2, width: d, height: d)
+        }
+        var x = CGFloat(lead.iconX)
+        favicon.frame = NSRect(x: x, y: (h - CraMetrics.favicon) / 2, width: CraMetrics.favicon, height: CraMetrics.favicon)
+        if m.navigatedAway {
+            // Arc: 4 pt, the slash, then the name 5 pt on (2 pt later than without it).
+            x += CraMetrics.favicon + 4
+            let s = SidebarSlashView.size
+            slash.frame = NSRect(x: x, y: ((h - s.height) / 2).rounded(), width: s.width, height: s.height)
+            x += s.width + 5
+        } else {
+            x += CraMetrics.favicon + 11
+        }
+        if showsSound {
+            let s = soundButton.size
+            soundButton.frame = NSRect(x: x - (s.width - Self.soundGlyphWidth) / 2, y: (h - s.height) / 2, width: s.width, height: s.height)
+            x += Self.soundGlyphWidth + 8
+        }
+        // The unread dot and a peek badge are centred where the close button shows on hover, which
+        // is also under a live folder's refresh button (FolderRowView, Arc lines them up too).
+        let trailing = TabRowTrailing.layout(rowWidth: bounds.width, textX: x, controls: accessories.map {
+            TabRowTrailing.Control(width: $0.frame.width, slot: $0 === unreadDot || $0 === peekBadge || $0 === agentFace ? Self.closeSize : nil,
+                                   gapAfter: $0 === shareInsteadButton ? 0 : TabRowTrailing.controlGap)
+        })
+        for (v, vx) in zip(accessories, trailing.controlX) {
+            let s = v.frame.size
+            v.frame = NSRect(x: vx, y: (h - s.height) / 2, width: s.width, height: s.height)
+        }
+        let textWidth = trailing.textWidth
+        let th = titleLabel.intrinsicContentSize.height
+        if shownSubtitle != nil {
+            let sh = subtitleLabel.intrinsicContentSize.height
+            let top = (h - th - 1 - sh) / 2
+            titleLabel.frame = NSRect(x: x - SidebarText.inset, y: top, width: textWidth + 2 * SidebarText.inset, height: th)
+            subtitleLabel.frame = NSRect(x: x - SidebarText.inset, y: top + th + 1, width: textWidth + 2 * SidebarText.inset, height: sh)
+        } else {
+            titleLabel.frame = NSRect(x: x - SidebarText.inset, y: (h - th) / 2, width: textWidth + 2 * SidebarText.inset, height: th)
+        }
+        if let f = renameField {
+            let fh = f.intrinsicContentSize.height
+            f.frame = NSRect(x: x - SidebarText.inset, y: (h - fh) / 2, width: max(0, bounds.width - 6 - x + SidebarText.inset), height: fh)
+        }
+        focusRing?.frame = fillRect
+        sharedRing?.frame = fillRect
+        refreshRegion()
+    }
+
+    // MARK: Rename
+
+    private func beginRename(_ text: String) {
+        let f = NSTextField(string: text)
+        f.isBordered = false
+        f.drawsBackground = false
+        f.focusRingType = .none
+        f.font = .systemFont(ofSize: 14)
+        f.textColor = colors.textPrimary
+        f.delegate = self
+        f.cell?.isScrollable = true
+        renameField = f
+        addSubview(f)
+        titleLabel.isHidden = true
+        subtitleLabel.isHidden = true
+        needsLayout = true
+        DispatchQueue.main.async { [weak self, weak f] in
+            guard let f, let w = self?.window else { return }
+            // The sidebar sliding out at the edge is a panel that becomes key only when a click needs
+            // it, and a click on a row doesn't: the field showed selected while keys went to the page (#424).
+            w.makeKey()
+            w.makeFirstResponder(f)
+        }
+    }
+
+    private func endRename() {
+        guard let f = renameField else { return }
+        renameField = nil
+        f.delegate = nil
+        if let w = window, let editor = f.currentEditor(), w.firstResponder === editor { w.makeFirstResponder(nil) }
+        f.removeFromSuperview()
+        titleLabel.isHidden = false
+        refreshSubtitle()
+    }
+
+    private func commitRename() {
+        guard let m = model, let list, list.ui.renamingID == m.id, let f = renameField else { return }
+        let typed = f.stringValue
+        list.store.rename(m.id, to: typed)
+        list.ui.renamingID = nil
+        // Whether typed keys reached the field (#424), without the name itself.
+        CraLog.note(typed == m.renameText ? "sidebar rename: name unchanged" : "sidebar rename: new name, \(typed.count) characters")
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        if sel == #selector(NSResponder.cancelOperation(_:)) { list?.ui.renamingID = nil; return true }
+        if sel == #selector(NSResponder.insertNewline(_:)) { commitRename(); return true }
+        return false
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) { commitRename() }
+
+    // MARK: Events
+
+    override func dragItemID(at point: NSPoint) -> UUID? { model?.editing == true ? nil : model?.id }
+
+    /// Arc switches tabs on the press (SidebarRowPress.selectsOnPress): a plain single press on the
+    /// row, not on a pinned tab's icon away from home (that one goes back or separates on release).
+    override func pressDown(_ event: NSEvent, at point: NSPoint) -> Bool {
+        guard let m = model, let list, !m.editing,
+              SidebarRowPress.selectsOnPress(pressRow, clickCount: event.clickCount,
+                                             modified: !event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty),
+              !(canReset && iconRegion.contains(point)) else { return false }
+        list.ui.iconWentBack = nil
+        list.ui.tabBeforePress = list.store.selectedTabID(window: list.ui.windowID)
+        list.clickTab(m.id, event: event)
+        return true
+    }
+
+    override func click(_ event: NSEvent, at point: NSPoint) {
+        guard let m = model, let list else { return }
+        // A click on the row (not the field) ends a rename, so it can never get stuck.
+        if m.editing { commitRename() }
+        // Arc: the favicon of a pinned tab away from its page takes it back there and opens it;
+        // with ⌘ the page moves out to a new Today tab first (GitHub #139). A double-click there
+        // goes back once and doesn't rename the tab now at home (#345).
+        let action = PinnedIconClick.action(clickCount: event.clickCount, onIcon: iconRegion.contains(point), navigatedAway: canReset,
+                                            command: event.modifierFlags.contains(.command), previousWentBack: list.ui.iconWentBack == m.id)
+        list.ui.iconWentBack = action.wentBack ? m.id : nil
+        switch action {
+        case .separateFromPinnedTab:
+            setOverIcon(false)
+            list.actions.separatePinnedTab(m.id)
+        case .backToPinnedPage:
+            setOverIcon(false)
+            CraLog.note("pinned icon: back to pinned URL")
+            list.actions.resetPinnedTab(m.id)
+            list.ui.clearPicks(anchor: m.id)
+            list.store.selectTab(m.id, window: list.ui.windowID)
+        case .nothing:
+            CraLog.note("pinned icon: a double-click's second press stays home")
+        case .row:
+            list.clickTab(m.id, event: event)
+        }
+    }
+
+    override func contextMenu(at point: NSPoint) -> NSMenu? {
+        guard let m = model, let list else { return nil }
+        return SidebarMenus.tab(m, list: list)
+    }
+
+    override func tooltipTarget(at point: NSPoint) -> (any ArcTooltipTarget)? { self }
+
+    // ArcTooltipTarget: the title by the pointer; like Arc (didShowRenameHint),
+    // "Double-click to rename" rides along once.
+    var text: String { model.map { $0.editing ? "" : $0.title } ?? "" }
+    var keys: [String] { [] }
+    var followsCursor: Bool { true }
+    var subtitle: String? {
+        UserDefaults.standard.bool(forKey: "didShowRenameHint") || model?.customTitle != false ? nil : "Double-click to rename"
+    }
+    var optionText: String? { nil }
+    var onShow: (() -> Void)? {
+        { [weak self] in
+            if self?.model?.customTitle == false { UserDefaults.standard.set(true, forKey: "didShowRenameHint") }
+        }
+    }
+    var screenFrame: NSRect { window?.convertToScreen(convert(bounds, to: nil)) ?? .zero }
+    var hostWindow: NSWindow? { window }
+}
+
+// MARK: - Folder row
+
+struct FolderRowModel: Equatable {
+    var id: UUID
+    var depth: Int
+    var title: String
+    var renameText: String
+    var editing: Bool
+    var expanded: Bool
+    /// Closed with tabs kept in sight under it (FolderPeek): Arc draws three dots in the glyph.
+    var peeked: Bool
+    var live: Bool
+    var tint: NSColor
+    var fill: NSColor
+    var back: NSColor
+    var tabCount: Int
+    var liveBusy: Bool
+    /// The warning button after a failed refresh or while single sign-on hides some of the folder.
+    var liveWarning: LiveFolderWarning?
+    var liveHelp: String
+    var liveIcon: NSImage? = nil
+    var symbol: FolderSymbol? = nil
+}
+
+final class FolderRowView: SidebarRowView, NSTextFieldDelegate {
+    private(set) var model: FolderRowModel?
+    private let glyph = FolderGlyphView(frame: NSRect(x: 0, y: 0, width: CraMetrics.favicon, height: 20))
+    private let titleLabel = NSTextField.sidebarLabel(size: 14, weight: .medium)
+    private var renameField: NSTextField?
+    private var accessory: NSView?
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        addSubview(glyph)
+        addSubview(titleLabel)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func apply(_ m: FolderRowModel) {
+        guard m != model else { return }
+        // The same folder opening or closing turns its glyph; a row taking another folder doesn't.
+        let toggled = model.map { $0.id == m.id && $0.expanded != m.expanded } ?? false
+        model = m
+        let emblem: FolderEmblem? = m.live
+            ? m.liveIcon.map { FolderEmblem(image: $0, coloring: .template) }
+            : m.symbol.map { FolderEmblem(image: $0.image, coloring: .template) }
+        glyph.show(expanded: m.expanded, peeked: m.peeked, emblem: emblem,
+                   tint: m.tint, fillColor: m.fill, backColor: m.back, animated: toggled && window != nil)
+        titleLabel.stringValue = m.title
+        titleLabel.textColor = colors.textPrimary
+        setAccessibilityLabel(m.title)
+        if m.editing != (renameField != nil) { m.editing ? beginRename(m.renameText) : endRename() }
+        rebuildAccessory()
+        refreshBackground()
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        guard c != colors else { return }
+        super.setColors(c)
+        if let m = model { model = nil; apply(m) }
+    }
+
+    override var fillLeading: CGFloat { CGFloat(model?.depth ?? 0) * CraMetrics.indent }
+    var iconRect: NSRect { glyph.frame }
+    override func baseFill() -> NSColor { isHovered ? colors.hoverFill : .clear }
+
+    override func hoverChanged() {
+        super.hoverChanged()
+        rebuildAccessory()
+    }
+
+    /// A live folder's refresh button (spinner while it runs, warning after a failure);
+    /// a closed folder's tab count on hover.
+    private func rebuildAccessory() {
+        accessory?.removeFromSuperview()
+        accessory = nil
+        guard let m = model, let list else { return }
+        let id = m.id
+        let hover = isHovered && !m.editing
+        if m.live {
+            if m.liveBusy {
+                // A spinner fills its frame: the glyph's size, centred where the refresh button sits.
+                let slot = NSView(frame: NSRect(x: 0, y: 0, width: 26, height: 26))
+                let p = NSProgressIndicator(frame: NSRect(x: 7, y: 7, width: 12, height: 12))
+                p.style = .spinning
+                p.controlSize = .mini
+                p.isIndeterminate = true
+                p.startAnimation(nil)
+                slot.addSubview(p)
+                accessory = slot
+            } else if let warning = m.liveWarning {
+                // Arc keeps the warning on hover too ("Sign back in to GitHub.", or a key for "Login with
+                // SSO to unlock this folder"): a click signs in, or tries again.
+                let signIn = warning.signInURL
+                accessory = SidebarGlyphButton(symbol: warning.symbol, size: 26, iconSize: 13, weight: .regular,
+                                               help: warning.help, colors: colors) { [weak list] in
+                    if let signIn { list?.actions.openURL(signIn) } else { LiveFolderManager.shared.refresh(id) }
+                }
+            } else if hover {
+                accessory = SidebarGlyphButton(symbol: "arrow.clockwise", size: 26, iconSize: 12, help: m.liveHelp, colors: colors) {
+                    LiveFolderManager.shared.refresh(id)
+                }
+            }
+        } else if hover && !m.expanded {
+            let l = NSTextField.sidebarLabel(size: 11, weight: .medium)
+            l.stringValue = "\(m.tabCount)"
+            l.textColor = colors.textTertiary
+            l.sizeToFit()
+            accessory = l
+        }
+        _ = list
+        if let a = accessory { addSubview(a) }
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        guard let m = model else { return }
+        let h = bounds.height
+        var x = CraMetrics.rowLeading + CGFloat(m.depth) * CraMetrics.indent
+        glyph.frame = NSRect(x: x, y: (h - 20) / 2, width: CraMetrics.favicon, height: 20)
+        x += CraMetrics.favicon + 11
+        var right = bounds.width
+        if let a = accessory {
+            let s = a.frame.size
+            // A live folder's button is centred over its tabs' unread dots and close buttons (17 pt in).
+            right -= (m.live ? 4 : 8) + s.width
+            a.frame = NSRect(x: right, y: (h - s.height) / 2, width: s.width, height: s.height)
+            right -= 11
+        }
+        let th = titleLabel.intrinsicContentSize.height
+        titleLabel.frame = NSRect(x: x - SidebarText.inset, y: (h - th) / 2, width: max(0, right - 8 - 11 - x) + 2 * SidebarText.inset, height: th)
+        if let f = renameField {
+            let fh = f.intrinsicContentSize.height
+            f.frame = NSRect(x: x - SidebarText.inset, y: (h - fh) / 2, width: max(0, bounds.width - 8 - x + SidebarText.inset), height: fh)
+        }
+    }
+
+    private func beginRename(_ text: String) {
+        let f = NSTextField(string: text)
+        f.isBordered = false
+        f.drawsBackground = false
+        f.focusRingType = .none
+        f.font = .systemFont(ofSize: 14, weight: .medium)
+        f.textColor = colors.textPrimary
+        f.delegate = self
+        f.cell?.isScrollable = true
+        renameField = f
+        addSubview(f)
+        titleLabel.isHidden = true
+        needsLayout = true
+        DispatchQueue.main.async { [weak self, weak f] in
+            guard let f, let w = self?.window else { return }
+            // The sidebar sliding out at the edge is a panel that becomes key only when a click needs
+            // it, and a click on a row doesn't: the field showed selected while keys went to the page (#424).
+            w.makeKey()
+            w.makeFirstResponder(f)
+        }
+    }
+
+    private func endRename() {
+        guard let f = renameField else { return }
+        renameField = nil
+        f.delegate = nil
+        if let w = window, let editor = f.currentEditor(), w.firstResponder === editor { w.makeFirstResponder(nil) }
+        f.removeFromSuperview()
+        titleLabel.isHidden = false
+    }
+
+    private func commitRename() {
+        guard let m = model, let list, list.ui.renamingID == m.id, let f = renameField else { return }
+        list.store.rename(m.id, to: f.stringValue.isEmpty ? "Folder" : f.stringValue)
+        list.ui.renamingID = nil
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        if sel == #selector(NSResponder.cancelOperation(_:)) { list?.ui.renamingID = nil; return true }
+        if sel == #selector(NSResponder.insertNewline(_:)) { commitRename(); return true }
+        return false
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) { commitRename() }
+
+    override func dragItemID(at point: NSPoint) -> UUID? { model?.editing == true ? nil : model?.id }
+
+    // Every click toggles, however fast they come: double-click-to-rename made quick
+    // open/close clicks start a rename that then swallowed the clicks. Rename is in the menu.
+    override func click(_ event: NSEvent, at point: NSPoint) {
+        guard let m = model, let list else { return }
+        if m.editing { commitRename() }
+        list.store.setExpanded(m.id, FolderPeek.clickOpens(expanded: m.expanded))
+    }
+
+    override func contextMenu(at point: NSPoint) -> NSMenu? {
+        guard let m = model, let list, let item = list.store.item(m.id) else { return nil }
+        return item.isLiveFolder ? SidebarMenus.liveFolder(item, list: list) : SidebarMenus.folder(item, list: list)
+    }
+}
+
+// MARK: - Split row
+
+struct SplitRowModel: Equatable {
+    struct Cell: Equatable {
+        var id: UUID
+        var title: String
+        var icon: NSImage?
+        var flipIcon: Bool
+    }
+    var id: UUID
+    var depth: Int
+    var today: Bool
+    /// The name given with Rename…; the row shows it in place of the panes.
+    var title: String?
+    var renameText: String
+    var editing: Bool
+    var selected: Bool
+    /// Filled as the open row; not while the ⌘T bar's New Tab row stands in for it.
+    var highlighted: Bool
+    var focusRing: Bool
+    var cells: [Cell]
+    /// Arc's Change Icon… on a split (#600): its emoji or glyph, shown where the pane count goes.
+    var icon: NSImage? = nil
+
+    /// Arc's customInfo layout for a renamed split, or one with an icon: the pane count (or the
+    /// icon) and the name, "N Tabs" when it has none, one row.
+    var named: Bool { title != nil || editing || icon != nil }
+    var shownTitle: String { title ?? "\(cells.count) Tabs" }
+}
+
+/// Arc's split cell (SplitViewCellView): the panes side by side, hairlines between them, each
+/// pane a pill while the split is open. Its close buttons follow SidebarClose.split: one at the
+/// row's end for a pinned split or a Today split in the background, one in every pane of an
+/// open Today split (GitHub #139). A renamed split shows its name instead of the panes.
+final class SplitRowView: SidebarRowView, NSTextFieldDelegate, ArcTooltipTarget {
+    private(set) var model: SplitRowModel?
+    private var cells: [SplitCellView] = []
+    private var separators: [NSView] = []
+    private var focusRing: FocusRingLayer?
+    private let countBadge = SplitCountBadgeView()
+    private let iconView = NSImageView()
+    private let titleLabel = NSTextField.sidebarLabel(size: 14)
+    private var renameField: NSTextField?
+    private lazy var closeButton: SidebarGlyphButton = {
+        let b = SidebarGlyphButton(symbol: "xmark", size: SplitRowMetrics.button, iconSize: 13, help: "", colors: colors) {}
+        b.setCloseMark(minus: false, help: "")
+        b.isHidden = true
+        addSubview(b)
+        return b
+    }()
+    private var shownButtons: SidebarClose.SplitButtons?
+
+    override var pressRow: SidebarRowPress.Row { .split }
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        addSubview(countBadge)
+        iconView.imageScaling = .scaleNone
+        addSubview(iconView)
+        addSubview(titleLabel)
+    }
+
+    /// Where the pane count or the icon sits, for the icon picker's arrow.
+    var iconRect: NSRect { countBadge.frame }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func apply(_ m: SplitRowModel) {
+        guard m != model else { return }
+        if m.named != model?.named { needsLayout = true }
+        model = m
+        if cells.map(\.cellID) != m.cells.map(\.id) {
+            cells.forEach { $0.removeFromSuperview() }
+            separators.forEach { $0.removeFromSuperview() }
+            cells = m.cells.map { SplitCellView(cellID: $0.id, row: self) }
+            separators = (0..<max(0, m.cells.count - 1)).map { _ in
+                let v = NSView()
+                v.wantsLayer = true
+                return v
+            }
+            cells.forEach { addSubview($0) }
+            separators.forEach { addSubview($0) }
+        }
+        for (c, cm) in zip(cells, m.cells) {
+            c.apply(cm, colors: colors, pill: m.highlighted)
+            c.isHidden = m.named
+        }
+        for s in separators {
+            s.layer?.backgroundColor = colors.separator.cgColor
+            s.isHidden = m.highlighted || m.named
+        }
+        countBadge.show(m.cells.count, colors: colors)
+        countBadge.isHidden = !m.named || m.icon != nil
+        iconView.image = m.icon
+        iconView.contentTintColor = colors.textSecondary
+        iconView.isHidden = !m.named || m.icon == nil
+        titleLabel.stringValue = m.named ? m.shownTitle : ""
+        titleLabel.textColor = colors.textPrimary
+        titleLabel.isHidden = !m.named || m.editing
+        if m.editing != (renameField != nil) { m.editing ? beginRename(m.renameText) : endRename() }
+        if m.focusRing != (focusRing != nil) {
+            if m.focusRing {
+                let r = FocusRingLayer()
+                r.zPosition = 10
+                layer?.addSublayer(r)
+                focusRing = r
+            } else {
+                focusRing?.removeFromSuperlayer()
+                focusRing = nil
+            }
+        }
+        refreshButtons()
+        refreshBackground()
+        needsLayout = true
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        guard c != colors else { return }
+        super.setColors(c)
+        if let m = model { model = nil; apply(m) }
+    }
+
+    override var fillLeading: CGFloat { CGFloat(model?.depth ?? 0) * CraMetrics.indent }
+
+    override func baseFill() -> NSColor {
+        guard let m = model else { return .clear }
+        return m.highlighted ? colors.selectedFill : (isHovered ? colors.hoverFill : .clear)
+    }
+
+    override func refreshBackground() {
+        super.refreshBackground()
+        setLifted(model?.highlighted == true)
+    }
+
+    override func hoverChanged() {
+        super.hoverChanged()
+        if !isHovered { cells.forEach { $0.hovering = false } }
+        refreshButtons()
+    }
+
+    override func hoverMoved(to point: NSPoint) {
+        for c in cells { c.hovering = c.frame.contains(point) }
+    }
+
+    /// The buttons show while the row is hovered, as on a tab's row.
+    private func refreshButtons() {
+        guard let m = model, let list else { return }
+        var buttons: SidebarClose.SplitButtons? = isHovered && !m.editing ? SidebarClose.split(pinned: !m.today, current: m.selected) : nil
+        // A renamed split shows no panes to put them on: one at the row's end archives the whole split.
+        if m.named, case .perPane(let b)? = buttons { buttons = .row(b) }
+        guard buttons != shownButtons else { return }
+        shownButtons = buttons
+        let panes = m.cells.map(\.id)
+        if case .row(let b)? = buttons {
+            closeButton.setCloseMark(minus: b.minus, help: b.help)
+            closeButton.colors = colors
+            closeButton.action = { [weak self, weak list] in
+                guard let self, let list else { return }
+                // Keep: the whole split unloads and stays pinned; archive: the whole split goes.
+                if b.minus {
+                    self.bounce()
+                    if let first = panes.first { list.actions.closeTab(first) }
+                } else {
+                    for p in panes { list.store.archiveTab(p, reason: .manual) }
+                }
+            }
+            closeButton.isHidden = false
+        } else {
+            closeButton.isHidden = true
+        }
+        let perPane: SidebarClose.Button?
+        if case .perPane(let b)? = buttons { perPane = b } else { perPane = nil }
+        for c in cells { c.setClose(perPane) }
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        guard let m = model, !cells.isEmpty else { return }
+        let fill = fillRect
+        let gap = SplitRowMetrics.cellGap
+        let n = CGFloat(cells.count)
+        let w = (fill.width - 2 * SplitRowMetrics.cellInset - (n - 1) * gap) / n
+        let button = closeButton.isHidden ? nil
+            : NSRect(x: fill.maxX - SplitRowMetrics.buttonInset - SplitRowMetrics.button, y: (bounds.height - SplitRowMetrics.button) / 2,
+                     width: SplitRowMetrics.button, height: SplitRowMetrics.button)
+        if let button { closeButton.frame = button }
+        focusRing?.frame = fillRect
+        if m.named {
+            // Laid out as a tab's row: the badge where the favicon goes, the name 11 pt on.
+            let h = bounds.height
+            var x = CraMetrics.rowLeading + CGFloat(m.depth) * CraMetrics.indent
+            countBadge.frame = NSRect(x: x, y: (h - CraMetrics.favicon) / 2, width: CraMetrics.favicon, height: CraMetrics.favicon)
+            iconView.frame = countBadge.frame
+            x += CraMetrics.favicon + 11
+            let right = button?.minX ?? bounds.width - 6
+            let th = titleLabel.intrinsicContentSize.height
+            titleLabel.frame = NSRect(x: x - SidebarText.inset, y: (h - th) / 2, width: max(0, right - 4 - x) + 2 * SidebarText.inset, height: th)
+            if let f = renameField {
+                let fh = f.intrinsicContentSize.height
+                f.frame = NSRect(x: x - SidebarText.inset, y: (h - fh) / 2, width: max(0, bounds.width - 6 - x + SidebarText.inset), height: fh)
+            }
+            return
+        }
+        var x = fill.minX + SplitRowMetrics.cellInset
+        for (i, c) in cells.enumerated() {
+            if i > 0 {
+                separators[i - 1].frame = NSRect(x: x - gap / 2 - 0.5, y: SplitRowMetrics.separatorInset, width: 1,
+                                                 height: bounds.height - 2 * SplitRowMetrics.separatorInset)
+            }
+            var cw = w
+            // The row's button takes the end of the last pane (Arc shortens its pill to 5 pt before it).
+            if let button, i == cells.count - 1 { cw = max(0, button.minX - SplitRowMetrics.cellToButton - x) }
+            c.frame = NSRect(x: x, y: fill.minY, width: cw, height: fill.height)
+            x += w + gap
+        }
+    }
+
+    private func cell(at point: NSPoint) -> SplitCellView? {
+        model?.named == true ? nil : cells.first { $0.frame.contains(point) }
+    }
+
+    // The split moves as one (into Pinned, a folder, another space); a pane leaves it through
+    // the menu or ⌥ on its close button, as in Arc.
+    override func dragItemID(at point: NSPoint) -> UUID? { model?.editing == true ? nil : model?.id }
+
+    override func click(_ event: NSEvent, at point: NSPoint) {
+        guard let m = model, let list else { return }
+        // A click on the row (not the field) ends a rename, so it can never get stuck.
+        if m.editing { commitRename() }
+        // A renamed split opens on the pane that had focus last.
+        let panes = m.cells.map(\.id)
+        let focus = list.store.item(m.id)?.split?.focusTabID.flatMap { panes.contains($0) ? $0 : nil }
+        guard let pane = m.named ? focus ?? panes.first : cell(at: point)?.cellID else { return }
+        list.store.selectTab(pane, window: list.ui.windowID)
+    }
+
+    // MARK: Rename (Arc: CustomInfo.isEditingTitle)
+
+    private func beginRename(_ text: String) {
+        let f = NSTextField(string: text)
+        f.isBordered = false
+        f.drawsBackground = false
+        f.focusRingType = .none
+        f.font = .systemFont(ofSize: 14)
+        f.textColor = colors.textPrimary
+        f.delegate = self
+        f.cell?.isScrollable = true
+        renameField = f
+        addSubview(f)
+        needsLayout = true
+        DispatchQueue.main.async { [weak self, weak f] in
+            guard let f, let w = self?.window else { return }
+            // The sidebar sliding out at the edge is a panel that becomes key only when a click needs
+            // it, and a click on a row doesn't: the field showed selected while keys went to the page (#424).
+            w.makeKey()
+            w.makeFirstResponder(f)
+        }
+    }
+
+    private func endRename() {
+        guard let f = renameField else { return }
+        renameField = nil
+        f.delegate = nil
+        if let w = window, let editor = f.currentEditor(), w.firstResponder === editor { w.makeFirstResponder(nil) }
+        f.removeFromSuperview()
+    }
+
+    /// An empty name gives the split its panes back.
+    private func commitRename() {
+        guard let m = model, let list, list.ui.renamingID == m.id, let f = renameField else { return }
+        list.store.rename(m.id, to: f.stringValue)
+        list.ui.renamingID = nil
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        if sel == #selector(NSResponder.cancelOperation(_:)) { list?.ui.renamingID = nil; return true }
+        if sel == #selector(NSResponder.insertNewline(_:)) { commitRename(); return true }
+        return false
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) { commitRename() }
+
+    // Arc shows the split's menu over any pane; each pane's own items are a submenu in it.
+    override func contextMenu(at point: NSPoint) -> NSMenu? {
+        guard let m = model, let list else { return nil }
+        return SidebarMenus.split(m, list: list)
+    }
+
+    override func tooltipTarget(at point: NSPoint) -> (any ArcTooltipTarget)? {
+        model?.named == true ? self : cell(at: point)
+    }
+
+    // ArcTooltipTarget, for a renamed split: its name by the pointer (Arc 1.171).
+    var text: String { model.map { $0.editing ? "" : $0.title ?? "" } ?? "" }
+    var keys: [String] { [] }
+    var followsCursor: Bool { true }
+    var subtitle: String? { nil }
+    var optionText: String? { nil }
+    var onShow: (() -> Void)? { nil }
+    var screenFrame: NSRect { window?.convertToScreen(convert(bounds, to: nil)) ?? .zero }
+    var hostWindow: NSWindow? { window }
+}
+
+/// Arc 1.171, measured at 1x (GitHub #139): panes 4 pt inside the fill and 4 pt apart, buttons 24 pt.
+enum SplitRowMetrics {
+    static let separatorInset: CGFloat = 9
+    static let cellInset: CGFloat = 4
+    static let cellGap: CGFloat = 4
+    static let button: CGFloat = 24
+    /// The row's button ends this far before the fill's end; a pane's 2 pt before the pane's.
+    static let buttonInset: CGFloat = 6
+    static let paneButtonInset: CGFloat = 2
+    static let cellToButton: CGFloat = 5
+    /// An open split's pane pill: 4 pt inside the fill top and bottom.
+    static let pillInset: CGFloat = 4
+    static let pillRadius: CGFloat = 7
+    /// The favicon sits this far into its pane.
+    static let favicon: CGFloat = 6
+}
+
+/// A renamed split's icon: how many panes it holds (Arc: SplitViewCellItemCountIconView). Arc 1.171
+/// live: a 16 pt rounded square in the favicon's place, the digit bold, 7.5 pt tall, centred.
+final class SplitCountBadgeView: NSView {
+    private let label = NSTextField.sidebarLabel(size: 10, weight: .bold)
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: CraMetrics.favicon, height: CraMetrics.favicon))
+        wantsLayer = true
+        layer?.cornerRadius = CraMetrics.favicon * 0.22
+        layer?.cornerCurve = .continuous
+        label.alignment = .center
+        addSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func show(_ count: Int, colors: SidebarColors) {
+        label.stringValue = "\(count)"
+        label.textColor = colors.textPrimary
+        layer?.backgroundColor = colors.countBadgeFill.cgColor
+    }
+
+    override func layout() {
+        super.layout()
+        let h = label.intrinsicContentSize.height
+        label.frame = NSRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
+    }
+}
+
+/// One pane inside the split row (Arc: SplitViewCellChildItemView).
+final class SplitCellView: NSView, ArcTooltipTarget {
+    let cellID: UUID
+    private weak var row: SplitRowView?
+    private let favicon = SidebarFaviconView()
+    private let titleLabel = NSTextField.sidebarLabel(size: 14)
+    private let pill = CALayer()
+    private var close: SidebarGlyphButton?
+    private var title = ""
+    var hovering = false
+
+    init(cellID: UUID, row: SplitRowView) {
+        self.cellID = cellID
+        self.row = row
+        super.init(frame: .zero)
+        wantsLayer = true
+        pill.cornerRadius = SplitRowMetrics.pillRadius
+        pill.cornerCurve = .continuous
+        pill.actions = ["backgroundColor": NSNull(), "position": NSNull(), "bounds": NSNull(), "hidden": NSNull()]
+        layer?.addSublayer(pill)
+        addSubview(favicon)
+        addSubview(titleLabel)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+    // Presses go to the row, which knows which pane they are on; the close button keeps its own.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if let close, close.frame.contains(convert(point, from: superview)) { return close }
+        return nil
+    }
+
+    func apply(_ m: SplitRowModel.Cell, colors: SidebarColors, pill shown: Bool) {
+        title = m.title
+        favicon.show(m.icon, flip: m.flipIcon, colors: colors)
+        titleLabel.stringValue = m.title
+        titleLabel.textColor = colors.textPrimary
+        close?.colors = colors
+        // Arc's open split: each pane a pill a shade darker than the white fill (224 on 241).
+        pill.backgroundColor = (colors.isDark ? NSColor.white : .black).withAlphaComponent(0.07).cgColor
+        pill.isHidden = !shown
+        needsLayout = true
+    }
+
+    /// An open Today split's ✕ in this pane, or none.
+    func setClose(_ button: SidebarClose.Button?) {
+        close?.removeFromSuperview()
+        close = nil
+        guard let button, let row, let list = row.list else { needsLayout = true; return }
+        let id = cellID
+        let b = SidebarGlyphButton(symbol: "xmark", size: SplitRowMetrics.button, iconSize: 13, help: button.help,
+                                   optionHelp: "Separate from Split View", colors: row.colors) { [weak list] in
+            // Option-click un-splits instead of closing (Arc flag option-click-split-tab-close-button-to-unsplit).
+            if NSEvent.modifierFlags.contains(.option) { list?.store.separateFromSplit(id) } else { list?.actions.closePane(id) }
+        }
+        b.setCloseMark(minus: false, help: button.help)
+        addSubview(b)
+        close = b
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        pill.frame = bounds.insetBy(dx: 0, dy: SplitRowMetrics.pillInset)
+        CATransaction.commit()
+        let fx = SplitRowMetrics.favicon
+        favicon.frame = NSRect(x: fx, y: (h - CraMetrics.favicon) / 2, width: CraMetrics.favicon, height: CraMetrics.favicon)
+        var right = bounds.width
+        if let close {
+            let s = SplitRowMetrics.button
+            close.frame = NSRect(x: right - SplitRowMetrics.paneButtonInset - s, y: (h - s) / 2, width: s, height: s)
+            right = close.frame.minX
+        }
+        let th = titleLabel.intrinsicContentSize.height
+        let x = fx + CraMetrics.favicon + 11
+        titleLabel.frame = NSRect(x: x - SidebarText.inset, y: (h - th) / 2, width: max(0, right - 4 - x) + 2 * SidebarText.inset, height: th)
+    }
+
+    var text: String { title }
+    var keys: [String] { [] }
+    var followsCursor: Bool { true }
+    var subtitle: String? { nil }
+    var optionText: String? { nil }
+    var onShow: (() -> Void)? { nil }
+    var screenFrame: NSRect { window?.convertToScreen(convert(bounds, to: nil)) ?? .zero }
+    var hostWindow: NSWindow? { window }
+}
+
+// MARK: - Small rows
+
+struct LiveStatusModel: Equatable {
+    var text: String
+    var url: String?
+    var depth: Int
+}
+
+/// A line inside an open live folder with nothing to show, or when GitHub can't be read.
+final class LiveStatusRowView: SidebarRowView {
+    private(set) var model: LiveStatusModel?
+    private let label: NSTextField = {
+        let l = NSTextField(wrappingLabelWithString: "")
+        l.font = .systemFont(ofSize: 12)
+        l.maximumNumberOfLines = 3
+        // Truncating the tail would make the field one line high inside a row measured for
+        // the wrapped text; the last of the three lines gets the ellipsis instead.
+        l.lineBreakMode = .byWordWrapping
+        l.cell?.truncatesLastVisibleLine = true
+        return l
+    }()
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        addSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    static func leading(depth: Int) -> CGFloat { CraMetrics.rowLeading + CGFloat(depth) * CraMetrics.indent + CraMetrics.favicon + 11 }
+
+    static func height(_ m: LiveStatusModel, width: CGFloat) -> CGFloat {
+        let w = max(1, width - leading(depth: m.depth) - 10)
+        let font = NSFont.systemFont(ofSize: 12)
+        let line = ceil(font.ascender - font.descender + font.leading)
+        let r = (m.text as NSString).boundingRect(with: NSSize(width: w, height: line * 3), options: [.usesLineFragmentOrigin],
+                                                  attributes: [.font: font])
+        return ceil(min(r.height, line * 3)) + 16
+    }
+
+    func apply(_ m: LiveStatusModel) {
+        guard m != model else { return }
+        model = m
+        label.stringValue = m.text
+        refreshColors()
+        needsLayout = true
+    }
+
+    private func refreshColors() {
+        label.textColor = model?.url != nil && isHovered ? colors.textSecondary : colors.textTertiary
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        super.setColors(c)
+        refreshColors()
+    }
+
+    override func baseFill() -> NSColor { model?.url != nil && isHovered ? colors.hoverFill : .clear }
+    override var fillLeading: CGFloat { CGFloat(model?.depth ?? 0) * CraMetrics.indent }
+
+    override func hoverChanged() {
+        super.hoverChanged()
+        refreshColors()
+    }
+
+    override func layout() {
+        super.layout()
+        guard let m = model else { return }
+        let x = Self.leading(depth: m.depth)
+        label.frame = NSRect(x: x - SidebarText.inset, y: 8, width: max(0, bounds.width - x - 10) + 2 * SidebarText.inset, height: max(0, bounds.height - 16))
+    }
+
+    override func click(_ event: NSEvent, at point: NSPoint) {
+        if let url = model?.url { list?.actions.openURL(url) }
+    }
+}
+
+struct InstantLinksRowModel: Equatable {
+    var id: UUID
+    var failed: Bool
+    /// Drawn as the open row, with the selected row's fill (the run started from ⌘T's new-tab bar).
+    var current = false
+}
+
+/// Instant Links' row (#407, Arc Max): "Searching the web for you…" at the top of Today as tall as a tab,
+/// Arc Max's flower where the favicon goes, turning once a second until the results replace the row.
+/// When the search fails it reads "Oops, something went wrong.", stops, and has a ✕ that removes it.
+final class InstantLinksRowView: SidebarRowView {
+    private(set) var model: InstantLinksRowModel?
+    private let spinner = CALayer()
+    private let flower = CAShapeLayer()
+    private let titleLabel = NSTextField.sidebarLabel(size: 14)
+    private lazy var closeButton: SidebarGlyphButton = {
+        let b = SidebarGlyphButton(symbol: "xmark", size: 24, iconSize: 13, help: "", colors: colors) { [weak self] in
+            guard let id = self?.model?.id else { return }
+            InstantLinksService.shared.dismiss(id)
+        }
+        b.setCloseMark(minus: false, help: "")
+        return b
+    }()
+    private var showsClose = false
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        spinner.bounds = CGRect(x: 0, y: 0, width: CraMetrics.favicon, height: CraMetrics.favicon)
+        flower.frame = spinner.bounds
+        flower.fillColor = nil
+        flower.lineWidth = 1.5
+        flower.lineJoin = .round
+        flower.path = Self.flowerPath(in: spinner.bounds)
+        flower.actions = ["strokeColor": NSNull()]
+        spinner.addSublayer(flower)
+        layer?.addSublayer(spinner)
+        addSubview(titleLabel)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Arc Max's flower, as drawn in its 30 fps capture: one line of four teardrop petals that start at
+    /// the centre, round out and cross the next petal's line on the way back, leaving a small diamond
+    /// in the middle.
+    static func flowerPath(in rect: CGRect) -> CGPath {
+        let path = CGMutablePath()
+        let reach = rect.width * 0.47
+        let belly = reach * 0.44
+        for k in 0..<4 {
+            let turn = CGAffineTransform(translationX: rect.midX, y: rect.midY)
+                .rotated(by: CGFloat(k) * .pi / 2 + .pi / 9)
+            let petal = CGMutablePath()
+            petal.move(to: .zero)
+            petal.addCurve(to: CGPoint(x: 0, y: reach), control1: CGPoint(x: -belly * 1.7, y: reach * 0.05), control2: CGPoint(x: -belly * 1.2, y: reach))
+            petal.addCurve(to: .zero, control1: CGPoint(x: belly * 1.2, y: reach), control2: CGPoint(x: belly * 1.7, y: reach * 0.05))
+            path.addPath(petal, transform: turn)
+        }
+        return path
+    }
+
+    func apply(_ m: InstantLinksRowModel) {
+        guard m != model else { return }
+        model = m
+        titleLabel.stringValue = m.failed ? InstantLinks.errorTitle : InstantLinks.searchingTitle
+        setAccessibilityLabel(titleLabel.stringValue)
+        refreshColors()
+        refreshBackground()
+        refreshSpin()
+        rebuildClose()
+        needsLayout = true
+    }
+
+    private func refreshColors() {
+        titleLabel.textColor = colors.textPrimary
+        flower.strokeColor = colors.textPrimary.cgColor
+    }
+
+    override func baseFill() -> NSColor { model?.current == true ? colors.selectedFill : .clear }
+
+    override func refreshBackground() {
+        super.refreshBackground()
+        setLifted(model?.current == true)
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        guard c != colors else { return }
+        super.setColors(c)
+        refreshColors()
+        closeButton.colors = c
+    }
+
+    /// One turn a second, linear, for as long as it works; Reduce Motion leaves it still.
+    private func refreshSpin() {
+        let spins = model?.failed == false && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if !spins { spinner.removeAnimation(forKey: "spin"); return }
+        guard spinner.animation(forKey: "spin") == nil else { return }
+        let turn = CABasicAnimation(keyPath: "transform.rotation.z")
+        turn.fromValue = 0
+        turn.toValue = 2 * Double.pi
+        turn.duration = 1
+        turn.timingFunction = CAMediaTimingFunction(name: .linear)
+        turn.repeatCount = .infinity
+        turn.isRemovedOnCompletion = false
+        spinner.add(turn, forKey: "spin")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Core Animation drops a layer's animations when its view leaves a window.
+        spinner.removeAnimation(forKey: "spin")
+        refreshSpin()
+    }
+
+    private func rebuildClose() {
+        let shown = model?.failed == true && isHovered
+        guard shown != showsClose else { return }
+        showsClose = shown
+        if shown { addSubview(closeButton) } else { closeButton.removeFromSuperview() }
+        needsLayout = true
+    }
+
+    override func hoverChanged() {
+        super.hoverChanged()
+        rebuildClose()
+    }
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        let x = CraMetrics.rowLeading
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        spinner.position = CGPoint(x: x + CraMetrics.favicon / 2, y: h / 2)
+        CATransaction.commit()
+        let textX = x + CraMetrics.favicon + 11
+        var right = bounds.width - TabRowTrailing.endInset
+        if showsClose {
+            let s = closeButton.size
+            closeButton.frame = NSRect(x: right - s.width, y: (h - s.height) / 2, width: s.width, height: s.height)
+            right = closeButton.frame.minX - TabRowTrailing.controlGap
+        } else {
+            right = bounds.width - TabRowTrailing.restingTail
+        }
+        let th = titleLabel.intrinsicContentSize.height
+        titleLabel.frame = NSRect(x: textX - SidebarText.inset, y: (h - th) / 2, width: max(0, right - textX) + 2 * SidebarText.inset, height: th)
+    }
+}
+
+final class NewTabRowView: SidebarRowView {
+    private let plus = NSImageView()
+    private let label = NSTextField.sidebarLabel(size: 14)
+    /// Zen's ⌘ + New Tab: the clipboard's text under "Paste and Search", in Arc's 11 pt second line.
+    private let preview = NSTextField.sidebarLabel(size: 11)
+    private var flagsMonitor: Any?
+    /// What a click opens while ⌘ is held over the row with text on the clipboard; nil reads New Tab.
+    private var paste: ClipboardPaste?
+    private var pasteCheck: Task<Void, Never>?
+
+    override var pressRow: SidebarRowPress.Row { .newTab }
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        // Arc's plus, fitted pixel by pixel at 1x and 2x.
+        plus.image = Self.plusImage
+        plus.imageScaling = .scaleNone
+        label.stringValue = "New Tab"
+        preview.lineBreakMode = .byTruncatingTail
+        preview.isHidden = true
+        addSubview(plus)
+        addSubview(label)
+        addSubview(preview)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("New Tab")
+        refreshColors()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private static let plusImage = SidebarSymbols.image("plus", size: 14.5, weight: .medium)
+    private static let clipboardImage = SidebarSymbols.image("doc.on.clipboard", size: 13, weight: .medium)
+
+    /// While the ⌘T bar is open Arc draws this row as the open one: the selected tab's fill,
+    /// shadow and text.
+    private var active = false
+
+    func apply(active: Bool) {
+        guard active != self.active else { return }
+        self.active = active
+        refreshColors()
+        refreshBackground()
+    }
+
+    private func refreshColors() {
+        let c = isHovered || active ? colors.textPrimary : colors.textSecondary
+        plus.contentTintColor = c
+        label.textColor = c
+        preview.textColor = colors.textTertiary
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        super.setColors(c)
+        refreshColors()
+    }
+
+    override func baseFill() -> NSColor { isHovered || active ? colors.selectedFill : .clear }
+
+    override func refreshBackground() {
+        super.refreshBackground()
+        setLifted(active)
+    }
+
+    override func hoverChanged() {
+        super.hoverChanged()
+        refreshColors()
+        if isHovered, flagsMonitor == nil {
+            flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] e in
+                self?.checkClipboard(e.modifierFlags)
+                return e
+            }
+        } else if !isHovered {
+            stopWatchingKeys()
+        }
+        checkClipboard(NSEvent.modifierFlags)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { stopWatchingKeys() }
+    }
+
+    private func stopWatchingKeys() {
+        if let m = flagsMonitor { NSEvent.removeMonitor(m) }
+        flagsMonitor = nil
+    }
+
+    /// ⌘ alone over the row: what the clipboard holds, asked without reading it where reading
+    /// would raise macOS's paste alert.
+    private func checkClipboard(_ flags: NSEvent.ModifierFlags) {
+        pasteCheck?.cancel()
+        guard isHovered, flags.intersection([.command, .shift, .option, .control]) == .command else { return show(nil) }
+        pasteCheck = Task { [weak self] in
+            let found = await ClipboardPaste.peek()
+            guard !Task.isCancelled else { return }
+            self?.show(found)
+        }
+    }
+
+    private func show(_ p: ClipboardPaste?) {
+        guard p != paste else { return }
+        paste = p
+        plus.image = p == nil ? Self.plusImage : Self.clipboardImage
+        label.stringValue = p?.title ?? "New Tab"
+        preview.stringValue = p?.text?.replacingOccurrences(of: "\n", with: " ") ?? ""
+        preview.isHidden = preview.stringValue.isEmpty
+        setAccessibilityLabel(label.stringValue)
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        plus.frame = NSRect(x: CraMetrics.rowLeading, y: 0, width: CraMetrics.favicon, height: h)
+        let th = label.intrinsicContentSize.height
+        let x = CraMetrics.rowLeading + CraMetrics.favicon + 9
+        let w = max(0, bounds.width - 10 - x) + 2 * SidebarText.inset
+        guard !preview.isHidden else {
+            label.frame = NSRect(x: x - SidebarText.inset, y: (h - th) / 2, width: w, height: th)
+            return
+        }
+        let ph = preview.intrinsicContentSize.height
+        let top = (h - th - ph) / 2
+        label.frame = NSRect(x: x - SidebarText.inset, y: top, width: w, height: th)
+        preview.frame = NSRect(x: x - SidebarText.inset, y: top + th, width: w, height: ph)
+    }
+
+    override func click(_ event: NSEvent, at point: NSPoint) {
+        // Read on the click: the user asked for the paste, so macOS lets it through or asks once.
+        if paste != nil, event.modifierFlags.contains(.command), let text = ClipboardPaste.read() {
+            show(nil)
+            list?.actions.openTyped(text)
+        } else {
+            list?.actions.openCommandBar(.newTab)
+        }
+    }
+}
+
+/// The clipboard's text as a new tab (Zen's ⌘ + New Tab; Chrome's "Paste and Go" / "Paste and Search").
+struct ClipboardPaste: Equatable {
+    let isAddress: Bool
+    /// The text itself where it can be read without macOS's paste alert, else nil.
+    let text: String?
+
+    var title: String { isAddress ? "Paste and Go" : "Paste and Search" }
+
+    /// What the clipboard holds. Since macOS 15.4 reading it unasked raises an alert unless the user
+    /// allowed Cra always; asking what kind of text it is never does.
+    @MainActor static func peek() async -> ClipboardPaste? {
+        let board = NSPasteboard.general
+        guard board.types?.contains(.string) == true else { return nil }
+        if #available(macOS 15.4, *), board.accessBehavior != .alwaysAllow {
+            guard let found = try? await board.detectedPatterns(for: [\.probableWebURL, \.probableWebSearch]), !found.isEmpty else { return nil }
+            return ClipboardPaste(isAddress: found.contains(\.probableWebURL), text: nil)
+        }
+        return read().map { ClipboardPaste(isAddress: TypedURL.looksLikeURL($0), text: $0) }
+    }
+
+    /// The clipboard's text on one line, nil when it holds none.
+    @MainActor static func read() -> String? {
+        PasteAndGo.line(NSPasteboard.general.string(forType: .string))
+    }
+}
+
+/// Tidy on the divider: off, offered (shown on hover), or sorting (shown, squiggling).
+enum DividerTidy: Equatable {
+    case none, offered, running
+}
+
+/// The line between pinned and Today; "Clear" shows on hover, and "Tidy" before it once Tidy Tabs
+/// can sort Today (Arc 1.171: UnpinnedSectionHeaderCellView with SidebarTidyButton, a
+/// SquiggleDivider while it works).
+final class DividerRowView: SidebarRowView {
+    private let line = NSView()
+    private var clear: ClearButton?
+    private var tidyButton: TidyButton?
+    private let squiggle = SquiggleLayer()
+    private var hasToday = false
+    private var tidy = DividerTidy.none
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        line.wantsLayer = true
+        addSubview(line)
+        layer?.addSublayer(squiggle)
+        squiggle.onFlat = { [weak self] in self?.refresh() }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var mouseDownCanMoveWindow: Bool { true }
+    override func mouseDown(with event: NSEvent) { super.mouseDown(with: event) }
+
+    func apply(hasToday: Bool, tidy: DividerTidy) {
+        let wasRunning = self.tidy == .running
+        self.hasToday = hasToday
+        self.tidy = tidy
+        if (tidy == .running) != wasRunning {
+            squiggle.setRunning(tidy == .running, animated: window != nil)
+            tidyButton?.setSweeping(tidy == .running)
+        }
+        refresh()
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        super.setColors(c)
+        refresh()
+    }
+
+    override func hoverChanged() { refresh() }
+
+    private func refresh() {
+        line.layer?.backgroundColor = colors.separator.cgColor
+        squiggle.strokeColor = colors.separator.cgColor
+        // The squiggle stands in for the line while Tidy works.
+        line.alphaValue = hasToday && !squiggle.isShowing ? 1 : 0
+        let show = (isHovered || tidy == .running) && hasToday
+        if show, clear == nil, let list {
+            let b = ClearButton(colors: colors) { [weak list] in
+                guard let list else { return }
+                list.store.clearToday(list.spaceID, playing: list.ui.audibleTabIDs)
+            }
+            b.alphaValue = 0
+            addSubview(b)
+            clear = b
+            b.animator().alphaValue = 1
+        } else if !show, let b = clear {
+            clear = nil
+            fadeOut(b)
+        }
+        let showTidy = show && tidy != .none
+        if showTidy, tidyButton == nil, let list {
+            let b = TidyButton(colors: colors) { [weak list] in
+                guard let list else { return }
+                TidyTabsService.shared.tidy(list.spaceID, store: list.store)
+            }
+            b.alphaValue = 0
+            addSubview(b)
+            tidyButton = b
+            b.setSweeping(tidy == .running)
+            b.animator().alphaValue = 1
+        } else if !showTidy, let b = tidyButton {
+            tidyButton = nil
+            fadeOut(b)
+        }
+        clear?.colors = colors
+        tidyButton?.colors = colors
+        needsLayout = true
+    }
+
+    private func fadeOut(_ v: NSView) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            v.animator().alphaValue = 0
+        } completionHandler: { v.removeFromSuperview() }
+    }
+
+    override func layout() {
+        super.layout()
+        // Arc 1.171 at 1x (GitHub #139): the line runs 18 pt in from both edges; "Clear" ends 20 pt in.
+        var right = bounds.width - 18
+        if let clear {
+            let s = clear.fittingSize
+            clear.frame = NSRect(x: bounds.width - 20 - s.width, y: (bounds.height - s.height) / 2, width: s.width, height: s.height)
+            right = clear.frame.minX - 8
+            if let tidy = tidyButton {
+                // Arc 1.171, 2x capture of a 347 pt sidebar: the hairline 11 pt before "Clear", the
+                // line 9.5 pt before the broom.
+                let t = tidy.fittingSize
+                tidy.frame = NSRect(x: clear.frame.minX - TidyButton.trailingGap - t.width, y: (bounds.height - t.height) / 2,
+                                    width: t.width, height: t.height)
+                right = tidy.frame.minX + TidyButton.broomInkInset - 9.5
+            }
+        }
+        let y = (bounds.height - 1) / 2
+        line.frame = NSRect(x: 18, y: y, width: max(0, right - 18), height: 1)
+        squiggle.place(from: 18, to: max(18, right), midY: y + 0.5)
+    }
+
+    private final class ClearButton: NSView {
+        private let label = NSTextField.sidebarLabel(size: 11, weight: .semibold)
+        private let action: () -> Void
+        var colors: SidebarColors { didSet { label.textColor = colors.textSecondary } }
+
+        init(colors: SidebarColors, action: @escaping () -> Void) {
+            self.action = action
+            self.colors = colors
+            super.init(frame: .zero)
+            label.stringValue = "Clear"
+            label.textColor = colors.textSecondary
+            label.sizeToFit()
+            addSubview(label)
+            frame.size = label.frame.size
+            _ = ArcTooltipAnchorView.attach(to: self, help: "Clear Today tabs")
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override var fittingSize: NSSize { label.frame.size }
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+        override func mouseDown(with event: NSEvent) {}
+        override func mouseUp(with event: NSEvent) {
+            if bounds.contains(convert(event.locationInWindow, from: nil)) { action() }
+        }
+    }
+}
+
+/// Timings of Tidy on the divider, measured on Arc 1.171 (120 fps capture, 4 Nov 2026).
+enum SidebarTidyMetrics {
+    /// The squiggle: a sine of 12.75 pt period, 3 pt amplitude, travelling left at 5 periods a
+    /// second; the amplitude ramps in and out linearly over 0.4 s (SquiggleDivider's
+    /// amplitudeAnimationDuration).
+    static let period: CGFloat = 12.75
+    static let amplitude: CGFloat = 3
+    static let cyclesPerSecond: Double = 5
+    static let ramp: TimeInterval = 0.4
+    /// One sweep of the broom: tips 31° clockwise from the top of its handle in 0.2 s, holds,
+    /// swings 7° past upright and settles, 0.9 s in all.
+    static let sweep: TimeInterval = 0.9
+}
+
+/// The divider's squiggle (Arc's SquiggleDivider): the line becomes a travelling sine wave
+/// while Tidy works and flattens back when it is done.
+final class SquiggleLayer: CALayer {
+    private let wave = CAShapeLayer()
+    private(set) var isShowing = false
+    /// Called once the wave has flattened and the straight line can come back.
+    var onFlat: (() -> Void)?
+    private var width: CGFloat = 0
+    var strokeColor: CGColor? {
+        get { wave.strokeColor }
+        set { wave.strokeColor = newValue }
+    }
+
+    override init() {
+        super.init()
+        masksToBounds = true
+        isHidden = true
+        actions = ["position": NSNull(), "bounds": NSNull(), "hidden": NSNull()]
+        wave.fillColor = nil
+        wave.lineWidth = 1
+        wave.lineCap = .round
+        wave.actions = ["position": NSNull(), "bounds": NSNull(), "path": NSNull(), "strokeColor": NSNull()]
+        addSublayer(wave)
+    }
+
+    override init(layer: Any) { super.init(layer: layer) }
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Spans the line's run, centred on it.
+    func place(from x0: CGFloat, to x1: CGFloat, midY: CGFloat) {
+        let h = 2 * SidebarTidyMetrics.amplitude + 4
+        frame = CGRect(x: x0, y: midY - h / 2, width: x1 - x0, height: h)
+        if abs(width - (x1 - x0)) > 0.5 {
+            width = x1 - x0
+            wave.frame = CGRect(x: 0, y: 0, width: width + 2 * SidebarTidyMetrics.period, height: h)
+            if isShowing, wave.animation(forKey: "flatten") == nil { wave.path = path(amplitude: SidebarTidyMetrics.amplitude) }
+        }
+    }
+
+    /// One point per 0.5 pt, the same count flat or waving, so the path animates point by point.
+    private func path(amplitude: CGFloat) -> CGPath {
+        let p = CGMutablePath()
+        let mid = bounds.height / 2
+        let total = width + 2 * SidebarTidyMetrics.period
+        var x: CGFloat = 0
+        p.move(to: CGPoint(x: 0, y: mid))
+        while x <= total {
+            p.addLine(to: CGPoint(x: x, y: mid + amplitude * sin(2 * .pi * x / SidebarTidyMetrics.period)))
+            x += 0.5
+        }
+        return p
+    }
+
+    func setRunning(_ on: Bool, animated: Bool) {
+        let flat = path(amplitude: 0), full = path(amplitude: SidebarTidyMetrics.amplitude)
+        if on {
+            isShowing = true
+            isHidden = false
+            wave.removeAnimation(forKey: "flatten")
+            wave.path = full
+            if animated {
+                let grow = CABasicAnimation(keyPath: "path")
+                grow.fromValue = flat
+                grow.toValue = full
+                grow.duration = SidebarTidyMetrics.ramp
+                wave.add(grow, forKey: "grow")
+            }
+            // Leftward travel: the wave slides one period left, over and over. A translation, so the
+            // line growing shorter as the Tidy button comes in doesn't move it.
+            let travel = CABasicAnimation(keyPath: "transform.translation.x")
+            travel.fromValue = 0
+            travel.toValue = -SidebarTidyMetrics.period
+            travel.duration = 1 / SidebarTidyMetrics.cyclesPerSecond
+            travel.repeatCount = .infinity
+            wave.add(travel, forKey: "travel")
+        } else {
+            guard isShowing else { return }
+            let finish = { [weak self] in
+                guard let self else { return }
+                self.isShowing = false
+                self.isHidden = true
+                self.wave.removeAllAnimations()
+                self.onFlat?()
+            }
+            guard animated else { finish(); return }
+            let flatten = CABasicAnimation(keyPath: "path")
+            flatten.fromValue = wave.presentation()?.path ?? full
+            flatten.toValue = flat
+            flatten.duration = SidebarTidyMetrics.ramp
+            CATransaction.begin()
+            CATransaction.setCompletionBlock { finish() }
+            wave.path = flat
+            wave.add(flatten, forKey: "flatten")
+            CATransaction.commit()
+        }
+    }
+}
+
+/// Arc's SidebarTidyButton: a broom, "Tidy" and a hairline before "Clear". The broom sweeps while
+/// Tidy works.
+final class TidyButton: NSView {
+    /// From the hairline to "Clear"'s frame (Arc: 11 pt from the hairline to its first glyph).
+    static let trailingGap: CGFloat = 7.7
+    /// The broom's box is 14 pt; its ink starts 3 pt in.
+    static let broomInkInset: CGFloat = 3
+    /// Arc: the hairline 8.5 pt after "Tidy"'s last glyph.
+    private static let barOffset: CGFloat = 7
+    private let broom = CALayer()
+    private let broomMask = CALayer()
+    private let label = NSTextField.sidebarLabel(size: 11, weight: .semibold)
+    private let bar = CALayer()
+    private let action: () -> Void
+    private var hovering = false { didSet { tint() } }
+    private var sweeping = false
+    var colors: SidebarColors { didSet { if colors != oldValue { tint() } } }
+
+    init(colors: SidebarColors, action: @escaping () -> Void) {
+        self.colors = colors
+        self.action = action
+        super.init(frame: .zero)
+        wantsLayer = true
+        label.stringValue = "Tidy"
+        label.sizeToFit()
+        addSubview(label)
+        broomMask.contents = BroomGlyph.image
+        broom.mask = broomMask
+        broom.actions = ["backgroundColor": NSNull(), "position": NSNull(), "bounds": NSNull()]
+        bar.actions = ["backgroundColor": NSNull(), "position": NSNull(), "bounds": NSNull()]
+        layer?.addSublayer(broom)
+        layer?.addSublayer(bar)
+        frame.size = fittingSize
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("Tidy")
+        _ = ArcTooltipAnchorView.attach(to: self, help: "Organize Today Tabs")
+        tint()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Broom box, "Tidy" 5 pt after the broom's ink, then the hairline 8.5 pt after its last glyph.
+    override var fittingSize: NSSize {
+        let l = label.frame.size
+        return NSSize(width: Self.labelX + l.width - SidebarText.inset + Self.barOffset + 1, height: max(14, l.height))
+    }
+
+    /// The broom's ink ends 10.6 pt into its box; "Tidy"'s first glyph 5 pt later (Arc).
+    private static let labelX: CGFloat = 10.6 + 5 - SidebarText.inset
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        let l = label.frame.size
+        // The broom turns about the top of its handle, as a hand holds it.
+        let pivot = BroomGlyph.pivot
+        broom.anchorPoint = pivot
+        broom.bounds = CGRect(x: 0, y: 0, width: 14, height: 14)
+        broom.position = CGPoint(x: 14 * pivot.x, y: (h - 14) / 2 + 14 * (isFlipped ? 1 - pivot.y : pivot.y))
+        broomMask.frame = broom.bounds
+        label.frame = NSRect(x: Self.labelX, y: (h - l.height) / 2, width: l.width, height: l.height)
+        let scale = window?.backingScaleFactor ?? 2
+        bar.frame = CGRect(x: label.frame.maxX - SidebarText.inset + Self.barOffset, y: (h - 12.5) / 2, width: 1 / scale, height: 12.5)
+        broomMask.contentsScale = scale
+    }
+
+    private func tint() {
+        let c = hovering || sweeping ? colors.textPrimary : colors.textSecondary
+        label.textColor = c
+        broom.backgroundColor = c.cgColor
+        bar.backgroundColor = colors.separator.cgColor
+    }
+
+    /// Arc's broom while Tidy works: sweep after sweep until the answer is in.
+    func setSweeping(_ on: Bool) {
+        guard on != sweeping else { return }
+        sweeping = on
+        tint()
+        if on {
+            let a = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+            let tip = -31 * CGFloat.pi / 180, past = 7 * CGFloat.pi / 180
+            a.values = [0, tip, tip, past, 0]
+            a.keyTimes = [0, 0.22, 0.39, 0.72, 1]
+            a.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .linear),
+                                 CAMediaTimingFunction(name: .easeInEaseOut), CAMediaTimingFunction(name: .easeInEaseOut)]
+            a.duration = SidebarTidyMetrics.sweep
+            a.repeatCount = .infinity
+            broom.add(a, forKey: "sweep")
+        } else {
+            // Back to upright from wherever the sweep is.
+            let now = (broom.presentation()?.value(forKeyPath: "transform.rotation.z") as? CGFloat) ?? 0
+            broom.removeAnimation(forKey: "sweep")
+            let settle = CABasicAnimation(keyPath: "transform.rotation.z")
+            settle.fromValue = now
+            settle.toValue = 0
+            settle.duration = 0.25
+            settle.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            broom.add(settle, forKey: "settle")
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas where t.owner === self { removeTrackingArea(t) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)), !sweeping { action() }
+    }
+    override func accessibilityPerformPress() -> Bool {
+        if !sweeping { action() }
+        return true
+    }
+}
+
+/// Cra's own broom for Tidy, drawn after Arc's 14 pt template (2x capture): an almost upright
+/// handle leaning ~18° right, a band, and bristles fanning out to the bottom left, 8.5 × 12 pt of ink.
+enum BroomGlyph {
+    /// The top of the handle, in the image's unit square (y up): where a hand would hold it.
+    static let pivot = CGPoint(x: 9.8 / 14, y: 1 - 1.2 / 14)
+
+    static let image: NSImage = {
+        let img = NSImage(size: NSSize(width: 14, height: 14), flipped: true) { _ in
+            NSColor.black.set()
+            let handle = NSBezierPath()
+            handle.lineWidth = 1.15
+            handle.lineCapStyle = .round
+            handle.move(to: NSPoint(x: 9.8, y: 1.3))
+            handle.line(to: NSPoint(x: 8.1, y: 6.7))
+            handle.stroke()
+            let band = NSBezierPath()
+            band.move(to: NSPoint(x: 5.3, y: 6.9))
+            band.line(to: NSPoint(x: 8.8, y: 6.6))
+            band.line(to: NSPoint(x: 9.0, y: 7.5))
+            band.line(to: NSPoint(x: 5.0, y: 7.8))
+            band.close()
+            band.fill()
+            let head = NSBezierPath()
+            head.move(to: NSPoint(x: 4.6, y: 8.2))
+            head.line(to: NSPoint(x: 9.9, y: 8.0))
+            head.curve(to: NSPoint(x: 10.6, y: 12.3), controlPoint1: NSPoint(x: 10.4, y: 9.6), controlPoint2: NSPoint(x: 10.6, y: 11.0))
+            head.line(to: NSPoint(x: 7.6, y: 12.1))
+            head.curve(to: NSPoint(x: 3.0, y: 10.3), controlPoint1: NSPoint(x: 5.8, y: 11.6), controlPoint2: NSPoint(x: 4.2, y: 11.0))
+            head.curve(to: NSPoint(x: 4.6, y: 8.2), controlPoint1: NSPoint(x: 3.6, y: 9.4), controlPoint2: NSPoint(x: 4.1, y: 8.7))
+            head.close()
+            head.fill()
+            // Gaps between the bristles.
+            NSGraphicsContext.current?.compositingOperation = .clear
+            let cuts = NSBezierPath()
+            cuts.lineWidth = 0.4
+            cuts.move(to: NSPoint(x: 6.3, y: 10.0)); cuts.line(to: NSPoint(x: 7.3, y: 12.4))
+            cuts.move(to: NSPoint(x: 8.2, y: 9.8)); cuts.line(to: NSPoint(x: 8.9, y: 12.5))
+            cuts.stroke()
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }()
+}
+
+// MARK: - Tab group header
+
+struct GroupHeaderRowModel: Equatable {
+    var id: UUID
+    var title: String
+}
+
+/// Arc's TabGroupHeaderCellView: a group's name over its tabs in Today (13 pt semibold in the space
+/// header's tone, at the tabs' icon inset, a tab row's height). Hovered, it offers "Create Folder"
+/// and "Close tab group"; its menu has "Remove header". Arc 1.171, offline copy, 4 Nov 2026.
+final class GroupHeaderRowView: SidebarRowView {
+    private(set) var model: GroupHeaderRowModel?
+    private let titleLabel = NSTextField.sidebarLabel(size: 13, weight: .semibold)
+    private var buttons: [SidebarGlyphButton] = []
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        addSubview(titleLabel)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func apply(_ m: GroupHeaderRowModel) {
+        guard m != model else { return }
+        model = m
+        titleLabel.stringValue = m.title
+        titleLabel.textColor = colors.sectionTitle
+        setAccessibilityLabel(m.title)
+        needsLayout = true
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        guard c != colors else { return }
+        super.setColors(c)
+        for b in buttons { b.colors = c }
+        if let m = model { model = nil; apply(m) }
+    }
+
+    override func hoverChanged() {
+        super.hoverChanged()
+        if isHovered, buttons.isEmpty, let m = model, let list {
+            let id = m.id
+            let folder = SidebarGlyphButton(symbol: "folder.badge.plus", size: 26, iconSize: 13, weight: .regular,
+                                            help: "Create Folder", colors: colors) { [weak list] in
+                guard let list, let f = list.store.folderFromGroup(id) else { return }
+                list.store.setExpanded(f.id, true)
+            }
+            let close = SidebarGlyphButton(symbol: "xmark", size: 26, iconSize: 13, help: "", colors: colors) { [weak list] in
+                guard let list else { return }
+                list.closeTabs(list.store.tabs(under: id).map(\.id))
+            }
+            close.setCloseMark(minus: false, help: "Close tab group")
+            buttons = [folder, close]
+            buttons.forEach(addSubview)
+            needsLayout = true
+        } else if !isHovered {
+            buttons.forEach { $0.removeFromSuperview() }
+            buttons = []
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        // Arc: the ✕ ends 5 pt in from the row, the folder button right before it.
+        var right = bounds.width - 5
+        for b in buttons.reversed() {
+            b.frame = NSRect(x: right - b.size.width, y: (h - b.size.height) / 2, width: b.size.width, height: b.size.height)
+            right = b.frame.minX
+        }
+        let x = CraMetrics.rowLeading
+        let th = titleLabel.intrinsicContentSize.height
+        titleLabel.frame = NSRect(x: x - SidebarText.inset, y: (h - th) / 2, width: max(0, right - 8 - x) + 2 * SidebarText.inset, height: th)
+    }
+
+    override func contextMenu(at point: NSPoint) -> NSMenu? {
+        guard let m = model, let list else { return nil }
+        return SidebarMenus.tabGroup(m.id, list: list)
+    }
+}
+
+/// "Drop to Pin": an empty pinned list opens a target while a drag is on.
+final class PinPlaceholderRowView: SidebarRowView {
+    private let border = CAShapeLayer()
+    private let icon = NSImageView()
+    private let label = NSTextField.sidebarLabel(size: 12, weight: .medium)
+    private var active = false
+
+    override init(key: SpaceListView.RowKey, list: SpaceListView, colors: SidebarColors) {
+        super.init(key: key, list: list, colors: colors)
+        border.fillColor = nil
+        border.lineWidth = 1
+        border.lineDashPattern = [4, 3]
+        layer?.addSublayer(border)
+        icon.image = SidebarSymbols.image("pin", size: 11, weight: .semibold)
+        icon.imageScaling = .scaleNone
+        label.stringValue = "Drop to Pin"
+        addSubview(icon)
+        addSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func apply(active: Bool) {
+        self.active = active
+        refresh()
+    }
+
+    override func setColors(_ c: SidebarColors) {
+        super.setColors(c)
+        refresh()
+    }
+
+    override func baseFill() -> NSColor { active ? colors.hoverFill : .clear }
+
+    private func refresh() {
+        border.strokeColor = colors.textTertiary.withAlphaComponent(active ? 0.6 : 0.3).cgColor
+        icon.contentTintColor = colors.textSecondary
+        label.textColor = colors.textSecondary
+        refreshBackground()
+    }
+
+    override func layout() {
+        super.layout()
+        border.frame = bounds
+        border.path = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), cornerWidth: CraMetrics.rowCorner, cornerHeight: CraMetrics.rowCorner, transform: nil)
+        let ls = label.intrinsicContentSize
+        let w = 14 + 6 + ls.width
+        let x = (bounds.width - w) / 2
+        icon.frame = NSRect(x: x, y: 0, width: 14, height: bounds.height)
+        label.frame = NSRect(x: x + 20, y: (bounds.height - ls.height) / 2, width: ls.width, height: ls.height)
+    }
+}

@@ -1,0 +1,180 @@
+import CoreGraphics
+import Foundation
+
+/// The iPhone app's chrome, in points, measured from Arc Search on an iPhone 15 Pro
+/// (393 × 852 pt, 2.2545 px per point in the 886 × 1920 recording; docs/ios.md says how).
+public enum MobileSearchSheet {
+    /// Sheet top to the search field.
+    public static let topInset: CGFloat = 16
+    public static let fieldHeight: CGFloat = 48
+    /// The field's distance from each side of the sheet.
+    public static let fieldSideInset: CGFloat = 16
+    /// Field bottom to the first suggestion row.
+    public static let rowsTopGap: CGFloat = 6
+    public static let rowHeight: CGFloat = 56
+    /// Arc Search shows four suggestions, and keeps room for them while the field is empty.
+    public static let visibleRows = 4
+    /// More suggestions wait below the four: scrolling brings them up into the field one by one
+    /// (60fps.design's "Arc Search Scroll Morph" clip lists ten).
+    public static let listedRows = 10
+    /// Last row to the keyboard.
+    public static let bottomInset: CGFloat = 8
+    /// The sheet's top corners.
+    public static let cornerRadius: CGFloat = 38
+
+    /// The sheet's height above the keyboard: 302 pt, whatever is typed.
+    public static var height: CGFloat {
+        topInset + fieldHeight + rowsTopGap + CGFloat(visibleRows) * rowHeight + bottomInset
+    }
+
+    /// Where the sheet's top edge sits in a screen `screenHeight` tall with the keyboard up.
+    public static func top(screenHeight: CGFloat, keyboardHeight: CGFloat) -> CGFloat {
+        screenHeight - keyboardHeight - height
+    }
+
+    /// The sheet with `rows` suggestion rows in view.
+    public static func height(rows: Int) -> CGFloat {
+        topInset + fieldHeight + rowsTopGap + CGFloat(rows) * rowHeight + bottomInset
+    }
+
+    /// How many suggestion rows fit between the keyboard and the top of the screen: four in
+    /// portrait, fewer in landscape, where the keyboard leaves little room; the field always stays.
+    public static func rowsInView(screenHeight: CGFloat, keyboardHeight: CGFloat, safeTop: CGFloat) -> Int {
+        let room = screenHeight - keyboardHeight - safeTop - height(rows: 0)
+        guard room > 0 else { return 0 }
+        return min(visibleRows, Int(room / rowHeight))
+    }
+
+    /// The sheet's top edge with as many rows as fit.
+    public static func top(screenHeight: CGFloat, keyboardHeight: CGFloat, safeTop: CGFloat) -> CGFloat {
+        screenHeight - keyboardHeight - height(rows: rowsInView(screenHeight: screenHeight, keyboardHeight: keyboardHeight, safeTop: safeTop))
+    }
+
+    /// Where the sheet's top is while it opens. Pulled out of the pill and let go (#623), it stays
+    /// where the finger left it, `heldAt`, until the keyboard's own animation takes it up, as in
+    /// Arc Search (the reporter's 60 fps recording: straight up with the keyboard, settled in
+    /// about 0.28 s). Laid out for no keyboard in the meantime, it sank towards the bar first.
+    public static func openingTop(screenHeight: CGFloat, keyboardHeight: CGFloat, safeTop: CGFloat, heldAt: CGFloat?) -> CGFloat {
+        heldAt ?? top(screenHeight: screenHeight, keyboardHeight: keyboardHeight, safeTop: safeTop)
+    }
+
+    /// The field's button at its right end (clear, incognito): 44 pt square, its centre 29.5 pt
+    /// from the field's right end.
+    public static func accessoryFrame(field: CGRect) -> CGRect {
+        CGRect(x: field.maxX - 29.5 - 22, y: field.midY - 22, width: 44, height: 44)
+    }
+
+    /// The incognito toggle, whose glyph sits at its right edge: 18.5 pt from the field's right
+    /// end whether it is off (the glyph alone) or on (the glyph with "Incognito" to its left,
+    /// `labelledWidth` wide). Off, it used to end at the accessory's edge, 7.5 pt from the end,
+    /// so the glyph sat hard against the field's rim (#654).
+    public static func incognitoToggleFrame(field: CGRect, labelledWidth: CGFloat? = nil) -> CGRect {
+        let accessory = accessoryFrame(field: field)
+        let width = labelledWidth ?? accessory.width
+        return CGRect(x: field.maxX - 18.5 - width, y: accessory.minY, width: width, height: accessory.height)
+    }
+}
+
+/// The bar at the bottom of a page: tabs, the pill that opens search, and the menu.
+public enum MobileBottomBar {
+    /// The bar above the home indicator's safe area.
+    public static let height: CGFloat = 42
+    /// The controls' centre below the bar's top edge. They sit low: with a 34 pt safe area the
+    /// centre is 44.5 pt above the screen's bottom edge.
+    public static let controlsCenterY: CGFloat = 31.5
+    public static let pillSize = CGSize(width: 76, height: 39)
+    /// The round buttons either side of the pill.
+    public static let sideButtonDiameter: CGFloat = 35
+    /// A side button's centre from its edge of the screen.
+    public static let sideButtonCenterInset: CGFloat = 41
+
+    public struct Frames: Equatable {
+        public var bar: CGRect
+        public var tabs: CGRect
+        public var pill: CGRect
+        public var menu: CGRect
+    }
+
+    /// The bar and its three controls in a view of `size` whose bottom safe area is `safeBottom`.
+    public static func frames(in size: CGSize, safeBottom: CGFloat) -> Frames {
+        let barHeight = height + safeBottom
+        let bar = CGRect(x: 0, y: size.height - barHeight, width: size.width, height: barHeight)
+        let centerY = bar.minY + controlsCenterY
+        func circle(_ centerX: CGFloat) -> CGRect {
+            CGRect(x: centerX - sideButtonDiameter / 2, y: centerY - sideButtonDiameter / 2,
+                   width: sideButtonDiameter, height: sideButtonDiameter)
+        }
+        let pill = CGRect(x: (size.width - pillSize.width) / 2, y: centerY - pillSize.height / 2,
+                          width: pillSize.width, height: pillSize.height)
+        return Frames(bar: bar, tabs: circle(sideButtonCenterInset), pill: pill,
+                      menu: circle(size.width - sideButtonCenterInset))
+    }
+
+    /// Where a drag up brings back the previous tab rather than opening the tab row (#537): the
+    /// tab button and the bar round it, from the screen's edge to halfway to the pill, the bar's
+    /// whole height. The button's own 47 pt circle let a thumb that came down beside it open
+    /// the tab row instead.
+    public static func previousTabZone(in size: CGSize, safeBottom: CGFloat) -> CGRect {
+        let frames = frames(in: size, safeBottom: safeBottom)
+        return CGRect(x: 0, y: frames.bar.minY, width: (frames.tabs.maxX + frames.pill.minX) / 2, height: frames.bar.height)
+    }
+
+    /// Where a drag up pulls the search sheet out of the pill (#623), as in Arc Search: the pill
+    /// with a thumb's slop either side, the bar's whole height. The rest of the bar's right half
+    /// still drags the tab row up.
+    public static func searchPullZone(in size: CGSize, safeBottom: CGFloat) -> CGRect {
+        let frames = frames(in: size, safeBottom: safeBottom)
+        let slop: CGFloat = 14
+        return CGRect(x: frames.pill.minX - slop, y: frames.bar.minY, width: frames.pill.width + 2 * slop, height: frames.bar.height)
+    }
+
+    /// Where a tap brings the bar back after scrolling put it away: the home indicator's strip
+    /// along the bottom edge, which pages leave empty. A swipe up from there is the system's
+    /// and can open the app switcher, so a tap is the sure way back (#509). A phone without a
+    /// home indicator has no such strip; its page runs to the edge and scrolling up is enough.
+    public static func revealStrip(in size: CGSize, safeBottom: CGFloat) -> CGRect {
+        CGRect(x: 0, y: size.height - safeBottom, width: size.width, height: safeBottom)
+    }
+}
+
+/// Whether scrolling has put the bottom bar away. Site Settings ▸ Collapse Bottom Bar decides
+/// per site whether it ever does: with it off the bar stays, however far the page scrolls.
+public struct MobileBarCollapse: Equatable {
+    /// The bar leaves after this much scrolling down and returns after as much back up.
+    public static let travel: CGFloat = 24
+
+    public private(set) var isHidden = false
+    /// Scrolled since the direction last changed: down is positive.
+    private var travelled: CGFloat = 0
+
+    public init() {}
+
+    /// The page scrolled by `delta` points (down is positive) on a site whose Collapse Bottom
+    /// Bar is `collapses`. Says whether the bar moves.
+    @discardableResult
+    public mutating func scrolled(by delta: CGFloat, atTop: Bool, collapses: Bool) -> Bool {
+        travelled = delta * travelled < 0 ? delta : travelled + delta
+        let hide: Bool
+        if atTop || !collapses { hide = false } else if travelled > Self.travel { hide = true } else if travelled < -Self.travel { hide = false } else { return false }
+        guard hide != isHidden else { return false }
+        isHidden = hide
+        return true
+    }
+
+    /// The bar is back: a tap under the page, another tab, the tab row. Says whether it moves.
+    @discardableResult
+    public mutating func reveal() -> Bool {
+        travelled = 0
+        guard isHidden else { return false }
+        isHidden = false
+        return true
+    }
+
+    /// The page went to another address, on a site whose Collapse Bottom Bar is `collapses`.
+    /// Says whether the bar moves.
+    @discardableResult
+    public mutating func pageChanged(collapses: Bool) -> Bool {
+        guard !collapses else { return false }
+        return reveal()
+    }
+}

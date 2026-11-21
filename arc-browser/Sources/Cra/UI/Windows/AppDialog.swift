@@ -1,0 +1,333 @@
+import AppKit
+import Observation
+import SwiftUI
+
+@MainActor
+@Observable
+final class AppDialog {
+    enum Icon { case mark, application, envelope, none }
+
+    let title: String
+    let message: String
+    let actions: DialogActions
+    let icon: Icon
+    let width: CGFloat
+    let buttonSpacing: CGFloat
+    let buttonOutset: CGFloat
+    /// Arc's older dialog sheet (showDialogSheetDeprecated, the share warning): 48.5 pt margins
+    /// instead of 38.5, tighter rows, and Arc's own dark checkbox instead of the system one.
+    let older: Bool
+    var inset: CGFloat { older ? 48.5 : 38.5 }
+    var input: String?
+    let placeholder: String
+    let requiresInput: Bool
+    let suppressionTitle: String?
+    var isSuppressed = false
+    private var presentedWindow: DialogPanel?
+    private var completion: ((NSApplication.ModalResponse) -> Void)?
+    private var runningModal = false
+    private var result = NSApplication.ModalResponse.abort
+
+    init(title: String, message: String = "", actions: [DialogAction] = [DialogAction("OK")],
+         input: String? = nil, placeholder: String = "", requiresInput: Bool = false, suppressionTitle: String? = nil,
+         icon: Icon = .mark, width: CGFloat = 450, buttonSpacing: CGFloat = 38, buttonOutset: CGFloat = 10.5,
+         older: Bool = false) {
+        self.title = title
+        self.message = message
+        self.actions = DialogActions(actions)
+        self.icon = icon
+        self.width = width
+        self.buttonSpacing = buttonSpacing
+        self.buttonOutset = buttonOutset
+        self.older = older
+        self.input = input
+        self.placeholder = placeholder
+        self.requiresInput = requiresInput
+        self.suppressionTitle = suppressionTitle
+    }
+
+    convenience init(error: Error) {
+        let error = error as NSError
+        self.init(title: error.localizedDescription, message: error.localizedRecoverySuggestion ?? error.localizedFailureReason ?? "")
+    }
+
+    static func easelDeletion() -> AppDialog {
+        AppDialog(title: "Are you sure you want to delete this Easel?",
+                  message: "Doing so will delete the Easel permanently.",
+                  actions: [DialogAction("Delete", role: .destructive), .cancel])
+    }
+
+    /// Arc's privacy warning before a share link is made (Share Folder…, Share N Items…; #356,
+    /// #357), word for word: Arc 1.17x's Dialogs.SheetWindow, captured at 2x on 11 Nov 2026 (560 pt
+    /// card, the envelope 62 × 49.5 pt at 48.5, 44.5). Arc names the picked tabs a Folder too.
+    /// Arc's warning before a share link, worded for what is shared: "Folder", or "Split View" (#600).
+    static func shareLink(kind: String = "Folder") -> AppDialog {
+        AppDialog(title: "Send this \(kind) to anyone, on any browser.",
+                  message: "Anyone with this link can view your \(kind). Viewers won’t receive future updates and this permalink cannot be deleted.",
+                  actions: [DialogAction("Copy Link to \(kind)"), .cancel], suppressionTitle: "Never show me this again.",
+                  icon: .envelope, width: 560, buttonSpacing: 32, buttonOutset: 21, older: true)
+    }
+
+    static var parentWindow: NSWindow? { parentWindow(fitting: 0) }
+
+    /// The window a dialog `width` wide hangs from: the key or main window, else the frontmost, that is that wide.
+    /// A sheet wider than its window hangs off both sides (the 450 pt "Downloads in progress" over the 270 pt
+    /// updater window, X 17 Nov 2026). Without one that wide, the first that can hold a sheet.
+    static func parentWindow(fitting width: CGFloat) -> NSWindow? {
+        let candidates = [NSApp.keyWindow, NSApp.mainWindow].compactMap { $0 } + NSApp.orderedWindows
+        var narrower: NSWindow?
+        for candidate in candidates {
+            var window = candidate
+            while let parent = window.parent { window = parent }
+            guard window.isVisible && window.canBecomeMain else { continue }
+            if window.frame.width >= width { return window }
+            if narrower == nil { narrower = window }
+        }
+        return narrower
+    }
+
+    @discardableResult
+    func runModal() -> NSApplication.ModalResponse {
+        runModal(over: Self.parentWindow(fitting: width))
+    }
+
+    @discardableResult
+    func runModal(over parent: NSWindow?) -> NSApplication.ModalResponse {
+        if let parent, parent.attachedSheet != nil { return .abort }
+        let window = prepareWindow(over: parent)
+        runningModal = true
+        Self.presented = self
+        window.show()
+        let response = NSApp.runModal(for: window)
+        runningModal = false
+        window.close()
+        return response
+    }
+
+    /// The dialog's window while it shows, for scenario hooks.
+    var window: DialogPanel? { presentedWindow }
+    var isShowing: Bool { presentedWindow != nil }
+
+    func present(over parent: NSWindow, completion: @escaping (NSApplication.ModalResponse) -> Void) {
+        guard parent.attachedSheet == nil else {
+            completion(.abort)
+            return
+        }
+        self.completion = completion
+        Self.presented = self
+        prepareWindow(over: parent).show()
+    }
+
+    /// The dialog last presented, for `cra://debug?answerDialog=` and `updaterRelaunch=`.
+    static weak var presented: AppDialog?
+
+    /// Takes a presented sheet down as if nothing was chosen: its completion gets `.abort`.
+    func close() { presentedWindow?.close() }
+
+    func prepareWindow(over parent: NSWindow? = nil) -> DialogPanel {
+        if let window = presentedWindow { return window }
+        result = .abort
+        let window = DialogPanel(over: parent, content: AppDialogView(dialog: self))
+        window.title = title
+        window.onDismiss = { [self] in
+            presentedWindow = nil
+            let done = completion
+            completion = nil
+            if runningModal { NSApp.stopModal(withCode: result) }
+            done?(result)
+        }
+        window.handleKey = { [weak self] event in
+            guard let self, event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty else { return false }
+            if event.keyCode == 53 {
+                if let index = actions.cancelIndex { select(index) }
+                return true
+            }
+            if event.keyCode == 36 || event.keyCode == 76 {
+                if let index = actions.defaultIndex { select(index) }
+                return true
+            }
+            return false
+        }
+        presentedWindow = window
+        return window
+    }
+
+    func select(_ index: Int) {
+        guard let window = presentedWindow, !window.isDismissing, actions.buttons.indices.contains(index),
+              actions.isEnabled(at: index, input: input, requiresInput: requiresInput) else { return }
+        result = NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + index)
+        window.close()
+    }
+}
+
+private struct AppDialogView: View {
+    @Bindable var dialog: AppDialog
+    @FocusState private var inputFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            DialogScrollContent(width: dialog.width - 2 * dialog.inset, maximumHeight: max(140, (NSScreen.main?.visibleFrame.height ?? 800) - 250)) {
+                details
+            }
+            // Arc's extra choice ("Quit, and don’t ask again") sits at the card's left edge, the rest at its right.
+            HStack(spacing: 7) {
+                buttons(dialog.actions.leadingOrder)
+                Spacer(minLength: 0)
+                buttons(dialog.actions.trailingOrder)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, -dialog.buttonOutset)
+            .padding(.top, dialog.buttonSpacing)
+        }
+        .padding(.horizontal, dialog.inset)
+        .padding(.top, dialog.older ? 44 : 38.5)
+        .padding(.bottom, 28)
+        .frame(width: dialog.width)
+        .fixedSize(horizontal: false, vertical: true)
+        .modifier(DialogSurface(cornerRadius: 16))
+        .onAppear { inputFocused = dialog.input != nil }
+    }
+
+    private var details: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if dialog.icon == .envelope {
+                ShareEnvelopeIcon()
+                    .frame(width: 62, height: 49.5)
+                    .accessibilityHidden(true)
+            } else if dialog.icon != .none {
+                ZStack {
+                    if dialog.icon == .application {
+                        Image(nsImage: NSApp.applicationIconImage).resizable()
+                    } else {
+                        BrandMark(size: 56)
+                    }
+                }
+                // Arc 1.172.1 (7 Nov 2026, Quit and Delete Space sheets against Cra's, card edge to pixel): the app
+                // icon shows 50.5 pt across from 43.5 pt in, the title's caps start 120 pt down, the buttons end
+                // 26.5 pt from the card's right edge.
+                .frame(width: dialog.icon == .mark ? 61 : 62, height: dialog.icon == .mark ? 61 : 62)
+                .offset(y: dialog.icon == .application ? 0.75 : 0)
+                .padding(.top, dialog.icon == .application ? -1 : 0)
+                .accessibilityHidden(true)
+            }
+            Text(dialog.title)
+                .font(.system(size: 17.5, weight: .semibold))
+                .foregroundStyle(.white)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, dialog.icon == .none ? 0 : dialog.icon == .envelope ? 23.5 : dialog.icon == .application ? 18 : 17.5)
+            if !dialog.message.isEmpty {
+                Text(dialog.message)
+                    .font(.system(size: 14))
+                    .lineSpacing(0.7)
+                    .foregroundStyle(DialogTheme.body)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, dialog.older ? 8 : 16)
+            }
+            if dialog.input != nil {
+                TextField(dialog.placeholder, text: Binding(get: { dialog.input ?? "" }, set: { dialog.input = $0 }))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14))
+                    .foregroundStyle(.white)
+                    .focused($inputFocused)
+                    .padding(.horizontal, 12)
+                    .frame(height: 37)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#383E4F")))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(hex: "#737884"), lineWidth: 1))
+                    .padding(.top, 18)
+            }
+            if let title = dialog.suppressionTitle, dialog.older {
+                DialogCheckbox(title: title, isOn: $dialog.isSuppressed)
+                    .padding(.leading, 1)
+                    .padding(.top, 14)
+            } else if let title = dialog.suppressionTitle {
+                Toggle(title, isOn: $dialog.isSuppressed)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 13))
+                    .foregroundStyle(DialogTheme.body)
+                    .padding(.top, 18)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func buttons(_ order: [Int]) -> some View {
+        ForEach(order, id: \.self) { index in
+            let action = dialog.actions.buttons[index]
+            DialogButton(title: action.title, key: dialog.actions.key(at: index),
+                         enabled: dialog.actions.isEnabled(at: index, input: dialog.input, requiresInput: dialog.requiresInput),
+                         style: style(action.role)) { dialog.select(index) }
+        }
+    }
+
+    private func style(_ role: DialogAction.Role) -> DialogButton.Style {
+        switch role {
+        case .primary: return .accent
+        case .destructive: return .destructive
+        case .secondary, .cancel: return .secondary
+        }
+    }
+}
+
+/// The badge on Arc's share warning: a violet envelope with a postmark, drawn here to the 2x capture
+/// of Arc 1.17x (11 Nov 2026) rather than taken from Arc's assets. 62 × 49.5 pt, colours in Display P3
+/// as captured.
+struct ShareEnvelopeIcon: View {
+    private static func p3(_ hex: UInt32) -> Color {
+        Color(.displayP3, red: Double(hex >> 16 & 0xFF) / 255, green: Double(hex >> 8 & 0xFF) / 255, blue: Double(hex & 0xFF) / 255)
+    }
+
+    var body: some View {
+        Canvas { context, size in
+            let ink = Self.p3(0x6362A3)
+            let card = Path(roundedRect: CGRect(origin: .zero, size: size).insetBy(dx: 2, dy: 2), cornerRadius: 3.5)
+            context.fill(card, with: .color(Self.p3(0x302F5C)))
+            context.stroke(card, with: .color(ink), lineWidth: 4)
+            var flap = Path()
+            flap.move(to: CGPoint(x: 8.25, y: 9.5))
+            flap.addLine(to: CGPoint(x: 30.75, y: 22))
+            flap.addLine(to: CGPoint(x: 53.25, y: 9.5))
+            context.stroke(flap, with: .color(ink), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+            context.fill(Path(ellipseIn: CGRect(x: 40, y: 27.75, width: 15, height: 15)), with: .color(Self.p3(0x6D6C96)))
+            for dy in [0.0, 3.75] {
+                var wave = Path()
+                wave.move(to: CGPoint(x: 24.75, y: 28.5 + dy))
+                wave.addCurve(to: CGPoint(x: 43, y: 32.25 + dy), control1: CGPoint(x: 34, y: 27.75 + dy), control2: CGPoint(x: 37, y: 32 + dy))
+                wave.addLine(to: CGPoint(x: 50.75, y: 32.25 + dy))
+                context.stroke(wave, with: .color(.white.opacity(0.3)), style: StrokeStyle(lineWidth: 1.25, lineCap: .round))
+            }
+        }
+    }
+}
+
+/// Arc's checkbox on its older dialog sheet: a 16 pt dark rounded square, no border, and the label
+/// in near-white 13 pt, 14 pt to its right; ticked, Display P3 #397CF7 with a 2 pt white check (2x captures of
+/// the share warning in Arc 1.17x, 11 and 12 Nov 2026).
+struct DialogCheckbox: View {
+    let title: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button { isOn.toggle() } label: {
+            HStack(spacing: 13) {
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(isOn ? Color(.displayP3, red: 0x39 / 255, green: 0x7C / 255, blue: 0xF7 / 255) : Color(hex: "#2D3243"))
+                    .frame(width: 16, height: 16)
+                    .overlay {
+                        if isOn {
+                            Path { p in
+                                p.move(to: CGPoint(x: 3.75, y: 8.25))
+                                p.addLine(to: CGPoint(x: 6.75, y: 11.5))
+                                p.addLine(to: CGPoint(x: 12, y: 4.5))
+                            }
+                            .stroke(.white, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                        }
+                    }
+                Text(title).font(.system(size: 13)).foregroundStyle(Color(hex: "#DBDCDF"))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isOn ? [.isSelected] : [])
+    }
+}
